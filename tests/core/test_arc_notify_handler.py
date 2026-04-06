@@ -163,13 +163,14 @@ async def test_handler_builds_completed_message_with_result():
     ):
         await handle_arc_chat_notify(1, {"arc_id": arc_id})
 
-    # Check the system message was added
+    # Check the system message was added and is hidden
     msgs = conversation.get_messages(conv_id)
     system_msgs = [m for m in msgs if m["role"] == "system"]
     assert len(system_msgs) == 1
     assert "weather-check" in system_msgs[0]["content"]
     assert "15C and sunny" in system_msgs[0]["content"]
     assert "completed" in system_msgs[0]["content"]
+    assert system_msgs[0]["hidden"], "Arc notify messages should be hidden from UI"
 
 
 @pytest.mark.asyncio
@@ -206,6 +207,7 @@ async def test_handler_builds_failed_message():
     assert len(notify_msgs) == 1
     assert "broken-task" in notify_msgs[0]["content"]
     assert "failed" in notify_msgs[0]["content"]
+    assert notify_msgs[0]["hidden"], "Arc notify messages should be hidden from UI"
 
 
 @pytest.mark.asyncio
@@ -240,8 +242,9 @@ async def test_handler_truncates_long_result():
     assert len(system_msgs) == 1
     # Should be truncated with "..."
     assert "..." in system_msgs[0]["content"]
-    # Should not contain the full 1000 chars
-    assert len(system_msgs[0]["content"]) < 700
+    # Should not contain the full 5000 chars
+    assert len(system_msgs[0]["content"]) < 4200
+    assert system_msgs[0]["hidden"], "Arc notify messages should be hidden from UI"
 
 
 @pytest.mark.asyncio
@@ -267,6 +270,7 @@ async def test_handler_falls_back_to_last_conversation():
     system_msgs = [m for m in msgs if m["role"] == "system"]
     assert len(system_msgs) == 1
     assert "orphan-arc" in system_msgs[0]["content"]
+    assert system_msgs[0]["hidden"], "Arc notify messages should be hidden from UI"
 
 
 @pytest.mark.asyncio
@@ -288,12 +292,13 @@ async def test_handler_creates_conversation_when_none_exists():
     try:
         row = db.execute("SELECT COUNT(*) as cnt FROM conversations").fetchone()
         assert row["cnt"] >= 1
-        # Check message exists
+        # Check message exists and is hidden
         msg_row = db.execute(
             "SELECT * FROM messages WHERE role = 'system'"
         ).fetchone()
         assert msg_row is not None
         assert "first-arc" in msg_row["content"]
+        assert msg_row["hidden"], "Arc notify messages should be hidden from UI"
     finally:
         db.close()
 

@@ -1,8 +1,9 @@
 """Handler for arc completion/failure → chat conversation notification.
 
-When a root arc completes or fails, this handler injects a system message
-into the originating conversation and re-invokes the chat agent so the
-user sees the result.
+When a root arc completes or fails, this handler injects a *hidden*
+system message into the originating conversation and re-invokes the
+chat agent so it can relay the result to the user.  The hidden message
+is included in the LLM context but not rendered in the chat UI.
 """
 
 import logging
@@ -79,8 +80,10 @@ async def handle_arc_chat_notify(work_id: int, payload: dict) -> None:
     else:
         msg = f'[System notification: Arc "{name}" failed.]'
 
-    # Inject system message and invoke chat agent
-    conversation.add_message(conv_id, "system", msg, arc_id=arc_id)
+    # Inject system message as hidden — included in LLM context but
+    # not rendered in the chat UI.  The chat agent will relay the
+    # information to the user in its own response.
+    conversation.add_message(conv_id, "system", msg, arc_id=arc_id, hidden=True)
 
     await thread_pools.run_in_work_pool(
         invocation.invoke_for_chat,

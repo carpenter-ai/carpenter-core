@@ -96,6 +96,23 @@ def test_messages_accepts_c_param():
     assert "Unique message here" in response.text
 
 
+def test_hidden_messages_not_rendered():
+    """Hidden messages should not appear in the HTMX message fragment."""
+    conv_id = conversation.create_conversation()
+    conversation.add_message(conv_id, "user", "Ask me something")
+    conversation.add_message(
+        conv_id, "system", "Hidden arc notification", hidden=True
+    )
+    conversation.add_message(conv_id, "assistant", "Here is my reply")
+
+    client = _client()
+    response = client.get(f"/api/chat/messages?c={conv_id}")
+    assert response.status_code == 200
+    assert "Ask me something" in response.text
+    assert "Here is my reply" in response.text
+    assert "Hidden arc notification" not in response.text
+
+
 def test_messages_endpoint_returns_html():
     """GET /api/chat/messages returns 200 with HTML content."""
     client = _client()

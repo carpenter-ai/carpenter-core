@@ -227,7 +227,10 @@ async def chat_messages(request: Request):
     if not messages:
         return HTMLResponse(content="")
 
-    display_messages = [m for m in messages if m["role"] not in ("tool_result", "tool_call")]
+    display_messages = [
+        m for m in messages
+        if m["role"] not in ("tool_result", "tool_call") and not m.get("hidden")
+    ]
     fragments = [_render_message(msg) for msg in display_messages]
     return HTMLResponse(content="\n".join(fragments))
 

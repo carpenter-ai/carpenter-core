@@ -572,6 +572,20 @@ def _migrate_kb_text_content(conn: sqlite3.Connection, tables: set[str]) -> None
             pass  # FTS5 extension may not be available to drop it
 
 
+def _migrate_hidden_messages(conn: sqlite3.Connection, tables: set[str]) -> None:
+    """Phase 18: Add hidden column to messages for internal-only messages.
+
+    Hidden messages are included in the LLM context but not rendered in
+    the chat UI.  Used for arc completion notifications that the chat
+    agent relays to the user in its own words.
+    """
+    if "messages" in tables:
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(messages)").fetchall()}
+        if "hidden" not in cols:
+            conn.execute("ALTER TABLE messages ADD COLUMN hidden BOOLEAN DEFAULT FALSE")
+            conn.commit()
+
+
 def run_migrations(conn: sqlite3.Connection) -> None:
     """Run all data migrations for existing databases.
 
@@ -601,3 +615,4 @@ def run_migrations(conn: sqlite3.Connection) -> None:
     _drop_deprecated_skills_tables(conn, tables)
     _migrate_trigger_event_pipeline(conn, tables)
     _migrate_kb_text_content(conn, tables)
+    _migrate_hidden_messages(conn, tables)
