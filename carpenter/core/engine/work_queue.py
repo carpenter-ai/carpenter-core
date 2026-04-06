@@ -75,37 +75,26 @@ def claim() -> dict | None:
     """Atomically claim the next pending work item that is ready to execute.
 
     Only claims items that are past their scheduled_at time (or have no schedule).
+    Uses a single UPDATE ... RETURNING with an embedded subquery so that the
+    row selection and status flip happen in one atomic statement, eliminating
+    the race window between SELECT and UPDATE that caused spurious None
+    returns under contention.
 
     Returns the work item as a dict, or None if queue is empty.
     """
     with db_transaction() as db:
-        # Only claim items that are ready (scheduled_at is NULL or in the past)
         row = db.execute(
-            "SELECT id FROM work_queue "
-            "WHERE status = 'pending' "
-            "AND (scheduled_at IS NULL OR datetime(scheduled_at) <= datetime('now')) "
-            "ORDER BY created_at ASC LIMIT 1"
-        ).fetchone()
-        if not row:
-            return None
-
-        cursor = db.execute(
             "UPDATE work_queue SET status = 'claimed', "
             "claimed_at = CURRENT_TIMESTAMP "
-            "WHERE id = ? AND status = 'pending'",
-            (row["id"],),
-        )
-
-        # CAS check: if rowcount is 0, another thread already claimed this item
-        if cursor.rowcount == 0:
-            db.commit()
-            return None
-
-
-        item = db.execute(
-            "SELECT * FROM work_queue WHERE id = ?", (row["id"],)
+            "WHERE id = ("
+            "  SELECT id FROM work_queue "
+            "  WHERE status = 'pending' "
+            "  AND (scheduled_at IS NULL OR datetime(scheduled_at) <= datetime('now')) "
+            "  ORDER BY created_at ASC LIMIT 1"
+            ") RETURNING *"
         ).fetchone()
-        return dict(item) if item else None
+
+        return dict(row) if row else None
 
 
 def complete(work_id: int):
