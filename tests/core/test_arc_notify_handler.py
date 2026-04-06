@@ -242,9 +242,80 @@ async def test_handler_truncates_long_result():
     assert len(system_msgs) == 1
     # Should be truncated with "..."
     assert "..." in system_msgs[0]["content"]
-    # Should not contain the full 5000 chars
-    assert len(system_msgs[0]["content"]) < 4200
+    # Should not contain the full 5000 chars (before nudge)
     assert system_msgs[0]["hidden"], "Arc notify messages should be hidden from UI"
+
+
+@pytest.mark.asyncio
+async def test_handler_includes_read_arc_result_nudge_when_truncated():
+    """When result is truncated, notification includes nudge to use read_arc_result."""
+    arc_id = arc_manager.create_arc("big-result-arc")
+    arc_manager.update_status(arc_id, "active")
+    long_response = "data_" * 2000  # 10000 chars, well over 4000 limit
+    set_arc_state(arc_id, "_agent_response", long_response)
+    arc_manager.update_status(arc_id, "completed")
+
+    conv_id = conversation.get_or_create_conversation()
+    db = get_db()
+    try:
+        db.execute(
+            "INSERT INTO conversation_arcs (conversation_id, arc_id) VALUES (?, ?)",
+            (conv_id, arc_id),
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    mock_run = AsyncMock()
+    with patch(
+        "carpenter.core.workflows.arc_notify_handler.thread_pools.run_in_work_pool",
+        mock_run,
+    ):
+        await handle_arc_chat_notify(1, {"arc_id": arc_id})
+
+    msgs = conversation.get_messages(conv_id)
+    system_msgs = [m for m in msgs if m["role"] == "system"]
+    assert len(system_msgs) == 1
+    content = system_msgs[0]["content"]
+    # Should contain the nudge with full length and arc_id
+    assert "read_arc_result" in content
+    assert f"arc_id={arc_id}" in content
+    assert "10000 chars" in content
+
+
+@pytest.mark.asyncio
+async def test_handler_no_nudge_when_result_fits():
+    """Short results that fit within RESULT_PREVIEW_MAX should not include nudge."""
+    arc_id = arc_manager.create_arc("short-result-arc")
+    arc_manager.update_status(arc_id, "active")
+    short_response = "Brief answer: 42"
+    set_arc_state(arc_id, "_agent_response", short_response)
+    arc_manager.update_status(arc_id, "completed")
+
+    conv_id = conversation.get_or_create_conversation()
+    db = get_db()
+    try:
+        db.execute(
+            "INSERT INTO conversation_arcs (conversation_id, arc_id) VALUES (?, ?)",
+            (conv_id, arc_id),
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    mock_run = AsyncMock()
+    with patch(
+        "carpenter.core.workflows.arc_notify_handler.thread_pools.run_in_work_pool",
+        mock_run,
+    ):
+        await handle_arc_chat_notify(1, {"arc_id": arc_id})
+
+    msgs = conversation.get_messages(conv_id)
+    system_msgs = [m for m in msgs if m["role"] == "system"]
+    assert len(system_msgs) == 1
+    content = system_msgs[0]["content"]
+    # Should NOT contain the nudge
+    assert "read_arc_result" not in content
 
 
 @pytest.mark.asyncio

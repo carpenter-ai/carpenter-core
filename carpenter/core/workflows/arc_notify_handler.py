@@ -67,7 +67,9 @@ async def handle_arc_chat_notify(work_id: int, payload: dict) -> None:
                 if child_resp:
                     result = child_resp
                     break
-        if len(result) > RESULT_PREVIEW_MAX:
+        full_length = len(result)
+        was_truncated = full_length > RESULT_PREVIEW_MAX
+        if was_truncated:
             result = result[:RESULT_PREVIEW_MAX] + "..."
         if result:
             msg = (
@@ -75,6 +77,12 @@ async def handle_arc_chat_notify(work_id: int, payload: dict) -> None:
                 f"[Relay the result to the user concisely. For simple factual queries, "
                 f"give a brief summary — not a lengthy formatted response.]"
             )
+            if was_truncated:
+                msg += (
+                    f"\n[The full result ({full_length} chars) is available. "
+                    f"Use read_arc_result(arc_id={arc_id}) to access the "
+                    f"complete output, or write code that processes it.]"
+                )
         else:
             msg = f'[System notification: Arc "{name}" completed.]'
     else:

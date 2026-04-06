@@ -154,6 +154,87 @@ def get_arc_detail(tool_input, **kwargs):
 
 @chat_tool(
     description=(
+        "Read the full result from a completed arc. Use this when an arc "
+        "completion notification was truncated and you need the complete "
+        "output. Only works for arcs in 'completed' status. Returns the "
+        "full _agent_response content without truncation."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "arc_id": {
+                "type": "integer",
+                "description": "The arc ID to read the full result from.",
+            },
+            "offset": {
+                "type": "integer",
+                "description": (
+                    "Character offset to start reading from (default 0). "
+                    "Use this for paginating through very large results."
+                ),
+            },
+            "limit": {
+                "type": "integer",
+                "description": (
+                    "Maximum characters to return (default 50000). "
+                    "Use with offset to paginate through large results."
+                ),
+            },
+        },
+        "required": ["arc_id"],
+    },
+    capabilities=["database_read"],
+    always_available=True,
+)
+def read_arc_result(tool_input, **kwargs):
+    from carpenter.core.arcs import manager as arc_manager
+    from carpenter.core.workflows._arc_state import get_arc_state
+
+    arc_id = tool_input["arc_id"]
+    offset = tool_input.get("offset", 0)
+    char_limit = tool_input.get("limit", 50000)
+
+    arc = arc_manager.get_arc(arc_id)
+    if arc is None:
+        return f"Arc #{arc_id} not found."
+
+    if arc["status"] != "completed":
+        return (
+            f"Arc #{arc_id} has status '{arc['status']}'. "
+            f"read_arc_result only works for completed arcs."
+        )
+
+    # Try root arc's _agent_response first
+    result = get_arc_state(arc_id, "_agent_response", "") or ""
+
+    # If root arc has no response, check children (same logic as arc_notify_handler)
+    if not result:
+        children = arc_manager.get_children(arc_id) or []
+        for child in reversed(children):
+            child_resp = get_arc_state(child["id"], "_agent_response", "") or ""
+            if child_resp:
+                result = child_resp
+                break
+
+    if not result:
+        return f"Arc #{arc_id} has no result content."
+
+    total_len = len(result)
+    chunk = result[offset:offset + char_limit]
+
+    if total_len <= char_limit and offset == 0:
+        return chunk
+
+    # Include pagination metadata for large results
+    remaining = max(0, total_len - offset - char_limit)
+    return (
+        f"[Showing characters {offset}-{offset + len(chunk)} of {total_len} total"
+        f"{f', {remaining} remaining' if remaining else ''}]\n{chunk}"
+    )
+
+
+@chat_tool(
+    description=(
         "List recent work queue items showing what's been processing. "
         "Returns event type, status, timestamps, and errors if any."
     ),
