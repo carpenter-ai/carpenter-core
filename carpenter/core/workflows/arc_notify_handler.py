@@ -69,7 +69,11 @@ async def handle_arc_chat_notify(work_id: int, payload: dict) -> None:
         if len(result) > RESULT_PREVIEW_MAX:
             result = result[:RESULT_PREVIEW_MAX] + "..."
         if result:
-            msg = f'[System notification: Arc "{name}" completed. Result: {result}]'
+            msg = (
+                f'[System notification: Arc "{name}" completed. Result: {result}]\n'
+                f"[Relay the result to the user concisely. For simple factual queries, "
+                f"give a brief summary — not a lengthy formatted response.]"
+            )
         else:
             msg = f'[System notification: Arc "{name}" completed.]'
     else:
