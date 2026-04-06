@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Diff Review - {review_id_short}</title>
+    <style>{css}</style>
+</head>
+<body>
+    <div class="header">
+        <div>
+            <h2>Diff Review</h2>
+            <div class="subtitle">{title}</div>
+        </div>
+        {outcome_badge}
+    </div>
+    {filename_info}
+    {ai_reviews_html}
+    {files_list}
+    <pre>{diff_html}</pre>
+    <textarea id="comment" placeholder="Feedback (required for revise)..."></textarea>
+    <div class="feedback-note">Provide feedback when requesting revisions.</div>
+    <div class="actions">
+        {action_buttons}
+        <div class="ai-review-controls">
+            <select id="ai-model">
+                <option value="sonnet">Sonnet</option>
+                <option value="opus">Opus</option>
+                <option value="haiku">Haiku</option>
+            </select>
+            <button class="btn btn-ai-review" onclick="requestAIReview()">Request AI Review</button>
+        </div>
+    </div>
+    <script>{js}</script>
+</body>
+</html>

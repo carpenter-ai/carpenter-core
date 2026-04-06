@@ -1,0 +1,35 @@
+name: coding-change
+description: Invoke a coding agent, verify with AI, then present to human for approval
+steps:
+  - name: invoke-agent
+    description: Set up workspace and run coding agent
+    order: 0
+  - name: generate-review
+    description: Generate diff, create review link, and spawn verification arcs
+    order: 1
+  - name: verify-quality
+    description: Static code review — style, naming, structure (platform/tool code only)
+    order: 2
+    arc_role: verifier
+    agent_type: REVIEWER
+    model_policy: careful-coding
+  - name: verify-correctness
+    description: Run tests, check behavior matches spec, validate no regressions
+    order: 3
+    arc_role: verifier
+    agent_type: REVIEWER
+    model_policy: careful-coding
+  - name: judge-verification
+    description: Python-only boolean aggregation of verification results (no AI)
+    order: 4
+    arc_role: verifier
+    # Handled by dedicated Python code in arc_dispatch_handler, not an AI agent
+  - name: post-verification-docs
+    description: Read reviewed code, write docstrings and arc summary
+    order: 5
+    agent_type: EXECUTOR
+    model_policy: background-batch
+  - name: await-approval
+    description: Wait for human to approve, reject, or request changes
+    order: 6
+    activation_event: arc.manual_trigger

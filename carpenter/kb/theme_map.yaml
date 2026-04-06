@@ -1,0 +1,17 @@
+# theme_map.yaml — maps tool module names to KB paths
+# Coding arcs can update this when tools are added/moved.
+scheduling: scheduling/tools
+messaging: messaging/tools
+arc: arcs/tools
+files: files/tools
+git: git/tools
+web: web/tools
+lm: ai/tools
+state: arcs/state-tools
+config: self-modification/config-tools
+webhook: git/webhooks
+kb: self-modification/kb-editing
+review: security/review-tools
+plugin: chat/utilities
+platform_time: chat/utilities
+system_info: chat/utilities

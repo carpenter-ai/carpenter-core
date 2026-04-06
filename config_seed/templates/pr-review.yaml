@@ -1,0 +1,16 @@
+name: pr-review
+description: Review a pull request and post results to the forge
+steps:
+  - name: fetch-pr
+    description: Fetch PR metadata and diff from the forge API
+    order: 0
+  - name: ai-review
+    description: Run AI code review on the diff
+    order: 1
+    model_policy: careful-coding
+  - name: post-review
+    description: Post review verdict and comments to the forge
+    order: 2
+  - name: notify
+    description: Notify the user of review results
+    order: 3

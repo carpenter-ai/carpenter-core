@@ -1,0 +1,116 @@
+# Model Registry — seed file synced to {base_dir}/model_registry.yaml on first run.
+# Add custom models (local Ollama, redpill, tinfoil, etc.) to the synced copy.
+# Fields:
+#   provider:  API backend ("anthropic", "ollama", "local", "tinfoil")
+#   model_id:  Exact model string sent to the provider API
+#   quality_tier: 1-5 (1=basic chat, 5=frontier reasoning)
+#   cost_per_mtok_in/out/cached: USD per million tokens
+#   context_window: Max context tokens
+#   capabilities: List of capability tags for constraint filtering
+#   measured_speed: Populated automatically from api_calls latency data (seconds per ktok output)
+# Local GGUF download metadata (optional, for install tooling):
+#   hf_repo: HuggingFace repository path
+#   gguf_filename: GGUF file name within the repo
+#   download_size_mb: Approximate download size in MB
+#   description: Human-readable label for install menus
+
+models:
+  opus:
+    provider: anthropic
+    model_id: claude-opus-4-6
+    quality_tier: 5
+    cost_per_mtok_in: 15.0
+    cost_per_mtok_out: 75.0
+    cached_cost_per_mtok_in: 1.5
+    context_window: 200000
+    capabilities: [planning, review, implementation, code, security_review]
+
+  sonnet:
+    provider: anthropic
+    model_id: claude-sonnet-4-5-20250929
+    quality_tier: 4
+    cost_per_mtok_in: 3.0
+    cost_per_mtok_out: 15.0
+    cached_cost_per_mtok_in: 0.3
+    context_window: 200000
+    capabilities: [planning, review, implementation, code, documentation]
+
+  haiku:
+    provider: anthropic
+    model_id: claude-haiku-4-5-20251001
+    quality_tier: 2
+    cost_per_mtok_in: 0.8
+    cost_per_mtok_out: 4.0
+    cached_cost_per_mtok_in: 0.08
+    context_window: 200000
+    capabilities: [summarization, documentation, simple_code]
+
+  qwen3.5-9b:
+    provider: ollama
+    model_id: "qwen3.5:9b"
+    quality_tier: 1
+    cost_per_mtok_in: 0.0
+    cost_per_mtok_out: 0.0
+    cached_cost_per_mtok_in: 0.0
+    context_window: 16384
+    capabilities: [chat, summarization]
+
+  # -- Local GGUF models (llama.cpp) --
+  # These entries include download metadata for install tooling.
+  # Note: 0.5B model intentionally excluded — too small for tool use.
+
+  qwen2.5-1.5b-q4:
+    provider: local
+    model_id: qwen2.5-1.5b-instruct-q4_k_m
+    quality_tier: 1
+    cost_per_mtok_in: 0.0
+    cost_per_mtok_out: 0.0
+    cached_cost_per_mtok_in: 0.0
+    context_window: 16384
+    capabilities: [chat]
+    description: "Qwen 2.5 1.5B (~8-12 tok/s on Pi5, limited tool use)"
+    hf_repo: Qwen/Qwen2.5-1.5B-Instruct-GGUF
+    gguf_filename: qwen2.5-1.5b-instruct-q4_k_m.gguf
+    download_size_mb: 1050
+
+  gemma2-2b-q4:
+    provider: local
+    model_id: gemma-2-2b-it-q4_k_m
+    quality_tier: 1
+    cost_per_mtok_in: 0.0
+    cost_per_mtok_out: 0.0
+    cached_cost_per_mtok_in: 0.0
+    context_window: 8192
+    capabilities: [chat]
+    description: "Gemma 2 2B (~3-5 tok/s on Pi5)"
+    hf_repo: google/gemma-2-2b-it-GGUF
+    gguf_filename: gemma-2-2b-it-q4_k_m.gguf
+    download_size_mb: 1600
+
+  qwen2.5-3b-q4:
+    provider: local
+    model_id: qwen2.5-3b-instruct-q4_k_m
+    quality_tier: 1
+    cost_per_mtok_in: 0.0
+    cost_per_mtok_out: 0.0
+    cached_cost_per_mtok_in: 0.0
+    context_window: 16384
+    capabilities: [chat, simple_code]
+    description: "Qwen 2.5 3B (~3-5 tok/s on Pi5, recommended)"
+    hf_repo: Qwen/Qwen2.5-3B-Instruct-GGUF
+    gguf_filename: qwen2.5-3b-instruct-q4_k_m.gguf
+    download_size_mb: 2000
+
+  phi3.5-mini-q4:
+    provider: local
+    model_id: Phi-3.5-mini-instruct-Q4_K_M
+    quality_tier: 1
+    cost_per_mtok_in: 0.0
+    cost_per_mtok_out: 0.0
+    cached_cost_per_mtok_in: 0.0
+    context_window: 16384
+    capabilities: [chat, simple_code]
+    description: "Phi-3.5 Mini 3.8B (~3.4 tok/s on Pi5)"
+    hf_repo: microsoft/Phi-3.5-mini-instruct-GGUF
+    gguf_filename: Phi-3.5-mini-instruct-Q4_K_M.gguf
+    download_size_mb: 2200

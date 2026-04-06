@@ -1,0 +1,16 @@
+/* Code review page styles (Monokai theme) */
+body { font-family: monospace; background: #272822; color: #f8f8f2; margin: 0; padding: 20px; }
+.header { background: #3e3d32; padding: 10px 20px; margin: -20px -20px 20px; }
+.header h2 { margin: 0; color: #a6e22e; }
+.file-path { color: #75715e; font-size: 14px; }
+pre { background: #1e1e1e; padding: 20px; border-radius: 4px; overflow-x: auto;
+       line-height: 1.15; font-size: 14px; font-family: 'Cascadia Code', 'Fira Code', 'SF Mono', 'Consolas', 'Monaco', monospace; }
+.actions { margin-top: 20px; display: flex; gap: 10px; }
+.btn { padding: 12px 24px; border: none; border-radius: 4px; cursor: pointer;
+        font-size: 16px; font-weight: bold; }
+.btn-approve { background: #a6e22e; color: #272822; }
+.btn-reject { background: #f92672; color: white; }
+.btn:hover { opacity: 0.8; }
+textarea { width: 100%; height: 80px; background: #3e3d32; color: #f8f8f2;
+           border: 1px solid #75715e; border-radius: 4px; padding: 10px;
+           font-family: monospace; margin-top: 10px; }

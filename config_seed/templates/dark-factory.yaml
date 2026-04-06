@@ -1,0 +1,23 @@
+name: dark-factory
+description: Autonomous spec-driven development workflow with iterative implementation and holdout validation
+steps:
+  - name: spec-refinement
+    description: Refine user requirements into a structured development specification
+    order: 0
+    agent_type: CHAT
+    model_policy: fast-chat
+  - name: scenario-generation
+    description: Generate test scenarios from the development specification
+    order: 1
+    agent_type: EXECUTOR
+    model_policy: background-batch
+  - name: implementation-loop
+    description: Iterative implementation with validation using the iterative planning pattern
+    order: 2
+    agent_type: PLANNER
+    mutable: true
+  - name: completion-gate
+    description: Human review of final implementation with holdout validation
+    order: 3
+    agent_type: JUDGE
+    activation_event: arc.manual_trigger

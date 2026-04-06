@@ -1,0 +1,14 @@
+name: reflection
+description: Platform activity reflection and knowledge distillation
+capabilities:
+  - system.read
+  - kb.write
+steps:
+  - name: reflect
+    description: Analyze platform activity data and produce actionable reflection
+    order: 0
+    agent_type: EXECUTOR
+    model_policy: background-batch
+  - name: save-reflection
+    description: Save reflection output and run post-processing
+    order: 1

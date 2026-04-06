@@ -1,0 +1,25 @@
+name: skill-kb-review
+description: Review modifications to skill knowledge base entries
+steps:
+  - name: classify-source
+    description: Determine if the modification source is clean or tainted
+    order: 0
+    # Handled by dedicated Python code in skill_kb_review_handler, not an AI agent
+  - name: text-review
+    description: Progressive text review for tainted sources (paranoid processing)
+    order: 1
+    arc_role: verifier
+    required_pass: true
+    # Runs only for tainted sources; auto-passed for clean. Handled by Python code.
+  - name: intent-review
+    description: Check that the KB change aligns with user intent
+    order: 2
+    agent_type: REVIEWER
+    model_policy: careful-coding
+    arc_role: verifier
+    required_pass: true
+  - name: human-escalation
+    description: Escalate to human for approval (tainted sources only by default)
+    order: 3
+    # Handled by Python code in skill_kb_review_handler — auto-skips for
+    # clean sources, blocks and notifies for tainted sources.

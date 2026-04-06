@@ -1,0 +1,34 @@
+/* Diff review page styles (Monokai theme) */
+body { font-family: monospace; background: #272822; color: #f8f8f2; margin: 0; padding: 20px; }
+.header { background: #3e3d32; padding: 10px 20px; margin: -20px -20px 20px; display: flex; justify-content: space-between; align-items: center; }
+.header h2 { margin: 0; color: #a6e22e; }
+.subtitle { color: #75715e; font-size: 14px; }
+.outcome-badge { padding: 8px 16px; border-radius: 4px; font-weight: bold; font-size: 14px; color: #272822; }
+.files-list { margin: 10px 0; color: #e6db74; }
+.files-list ul { margin: 5px 0; padding-left: 20px; }
+.files-list li { color: #fd971f; }
+.filename-map { margin: 10px 0; padding: 10px; background: #1e1e1e; border-radius: 4px; font-size: 12px; }
+.filename-map ul { margin: 5px 0; padding-left: 20px; }
+.filename-map li { color: #66d9ef; }
+.filename-map code { color: #a6e22e; }
+pre { background: #1e1e1e; padding: 20px; border-radius: 4px; overflow-x: auto;
+       line-height: 1.15; font-size: 14px; font-family: 'Cascadia Code', 'Fira Code', 'SF Mono', 'Consolas', 'Monaco', monospace; }
+pre span { margin: 0; padding: 0; display: block; }
+.diff-add { color: #a6e22e; background: rgba(166, 226, 46, 0.1); display: block; }
+.diff-del { color: #f92672; background: rgba(249, 38, 114, 0.1); display: block; }
+.diff-header { color: #66d9ef; font-weight: bold; display: block; }
+.diff-hunk { color: #ae81ff; display: block; }
+.actions { margin-top: 20px; display: flex; gap: 10px; align-items: flex-start; }
+.btn { padding: 12px 24px; border: none; border-radius: 4px; cursor: pointer;
+        font-size: 16px; font-weight: bold; }
+.btn-approve { background: #a6e22e; color: #272822; }
+.btn-reject { background: #f92672; color: white; }
+.btn-revise { background: #e6db74; color: #272822; }
+.btn-ai-review { background: #66d9ef; color: #272822; }
+.btn:hover { opacity: 0.8; }
+.ai-review-controls { display: flex; gap: 8px; align-items: center; margin-left: auto; }
+.ai-review-controls select { background: #3e3d32; color: #f8f8f2; border: 1px solid #75715e; border-radius: 4px; padding: 8px; font-family: monospace; }
+textarea { width: 100%; height: 80px; background: #3e3d32; color: #f8f8f2;
+           border: 1px solid #75715e; border-radius: 4px; padding: 10px;
+           font-family: monospace; margin-top: 10px; }
+.feedback-note { color: #75715e; font-size: 12px; margin-top: 5px; }

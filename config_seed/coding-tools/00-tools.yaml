@@ -1,0 +1,67 @@
+tools:
+  - name: read_file
+    description: Read the contents of a file. Path is relative to the workspace root.
+    input_schema:
+      type: object
+      properties:
+        path:
+          type: string
+          description: Relative path to the file to read.
+      required:
+        - path
+
+  - name: write_file
+    description: Write content to a file. Creates the file and parent directories if they don't exist.
+    input_schema:
+      type: object
+      properties:
+        path:
+          type: string
+          description: Relative path to the file to write.
+        content:
+          type: string
+          description: The content to write to the file.
+      required:
+        - path
+        - content
+
+  - name: edit_file
+    description: Find and replace text in a file. Fails if old_text is not found exactly once.
+    input_schema:
+      type: object
+      properties:
+        path:
+          type: string
+          description: Relative path to the file to edit.
+        old_text:
+          type: string
+          description: The exact text to find and replace.
+        new_text:
+          type: string
+          description: The replacement text.
+      required:
+        - path
+        - old_text
+        - new_text
+
+  - name: delete_file
+    description: Delete a file from the workspace. Use this when you need to remove a file entirely (e.g. removing a tool or module).
+    input_schema:
+      type: object
+      properties:
+        path:
+          type: string
+          description: Relative path to the file to delete.
+      required:
+        - path
+
+  - name: list_files
+    description: List files and directories at the given path relative to workspace root. Returns a tree-like listing. Use '.' or omit path to list the workspace root.
+    input_schema:
+      type: object
+      properties:
+        path:
+          type: string
+          description: Relative path to the directory to list. Defaults to workspace root.
+          default: "."
+      required: []

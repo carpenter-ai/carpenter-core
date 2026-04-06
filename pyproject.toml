@@ -1,0 +1,65 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "carpenter-ai"
+version = "0.1.0"
+description = "Agentic AI system that only acts through reviewable python code"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+authors = [
+    { name = "Ben Harack" },
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Python :: 3",
+]
+dependencies = [
+    "starlette>=0.40.0",
+    "uvicorn>=0.30.0",
+    "httpx>=0.28.0",
+    "pyyaml>=6.0",
+    "jinja2>=3.1.0",
+    "croniter>=1.0",
+    "pygments>=2.17",
+    "cryptography>=41.0",
+    "attrs>=25.0",
+    "cattrs>=26.0",
+    "six>=1.0",
+    "dulwich>=0.22.0",
+    "RestrictedPython>=8.0",
+    "numpy>=1.24",
+    "safetensors>=0.4",
+]
+
+[project.optional-dependencies]
+encryption = [
+    "pysqlcipher3>=1.0",
+]
+fast-search = [
+    "onnxruntime>=1.17",
+]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "pytest-xdist>=3.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["carpenter*", "carpenter_tools*"]
+
+[tool.setuptools.package-data]
+carpenter = ["schema.sql", "agent/*.yaml", "api/static/*.css", "api/static/*.js", "api/static/*.html", "kb/model/vocab.txt"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+# -n 3 leaves one core free on a 4-core Pi so tests don't starve the server.
+# Override with: pytest -n auto (all cores) or pytest -n 0 (single-threaded).
+addopts = "--strict-markers -n 3"
+tmp_path_retention_count = 0
+markers = [
+    "concurrency: tests for race conditions and concurrent access patterns",
+]

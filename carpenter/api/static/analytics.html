@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Carpenter Analytics</title>
+    <script src="https://unpkg.com/htmx.org@2.0.4"></script>
+    <style>{css}</style>
+</head>
+<body>
+    <div class="header">
+        <h1>Carpenter</h1>
+        <a class="nav-link" href="/">Chat</a>
+        <span style="color:#a6e22e;font-size:14px;font-weight:bold;">Stats</span>
+    </div>
+    <div class="content">
+        <div class="section">
+            <div class="section-title">Model Health</div>
+            <div id="health-cards"
+                 hx-get="/api/analytics/health"
+                 hx-trigger="load, every 5s"
+                 hx-swap="innerHTML">
+            </div>
+        </div>
+        <div class="section">
+            <div class="section-title">Recent Retry Attempts</div>
+            <div id="retries-table"
+                 hx-get="/api/analytics/retries"
+                 hx-trigger="load, every 10s"
+                 hx-swap="innerHTML">
+            </div>
+        </div>
+        <div class="section">
+            <div class="section-title">Error Type Breakdown</div>
+            <div id="errors-breakdown"
+                 hx-get="/api/analytics/errors"
+                 hx-trigger="load, every 10s"
+                 hx-swap="innerHTML">
+            </div>
+        </div>
+    </div>
+</body>
+</html>

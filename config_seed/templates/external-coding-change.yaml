@@ -1,0 +1,16 @@
+name: external-coding-change
+description: Clone external repo, make changes via coding agent, push and create PR
+steps:
+  - name: clone-and-branch
+    description: Clone repository and create feature branch
+    order: 0
+  - name: invoke-agent
+    description: Run coding agent in workspace
+    order: 1
+  - name: local-review
+    description: Generate diff for local approval before push
+    order: 2
+    activation_event: arc.manual_trigger
+  - name: push-and-pr
+    description: Commit, push, and create pull request
+    order: 3

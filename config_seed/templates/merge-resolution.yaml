@@ -1,0 +1,21 @@
+name: merge-resolution
+description: Attempt git merge, resolve conflicts with AI if needed
+steps:
+  - name: attempt-merge
+    description: Mechanistic git merge attempt
+    order: 0
+    agent_type: EXECUTOR
+    # No model needed — handler runs git commands directly
+
+  - name: resolve-conflicts
+    description: AI-assisted conflict resolution using coding tools
+    order: 1
+    agent_type: EXECUTOR
+    model_min_tier: high
+    model_policy: careful-coding
+    # Only activated if attempt-merge fails
+
+  - name: review-resolution
+    description: Human review of conflict resolution
+    order: 2
+    activation_event: arc.manual_trigger

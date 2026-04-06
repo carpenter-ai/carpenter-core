@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Carpenter Chat</title>
+    <script src="https://unpkg.com/htmx.org@2.0.4"></script>
+    <style>{css}</style>
+</head>
+<body>
+    <div class="header">
+        <div class="header-row1">
+            <h1>Carpenter</h1>
+        </div>
+        <div class="header-row2">
+            <div class="filter-tabs">
+                <button class="filter-tab active" id="tab-active" onclick="setFilter('active')">Active</button>
+                <button class="filter-tab" id="tab-archived" onclick="setFilter('archived')">Archived</button>
+            </div>
+            <select id="conv-select" onchange="switchConversation(this.value)"></select>
+            <a class="new-chat-btn" href="__NEW_CHAT_URL__" title="New Chat"><span class="btn-icon">+</span><span class="btn-label"> New</span></a>
+            <button class="archive-btn" id="archive-btn" onclick="showArchiveModal()" title="Archive current conversation (Ctrl/Cmd + D)">
+                <span class="btn-icon">&#x1f4e6;</span><span class="btn-label"> Archive</span>
+            </button>
+            <button class="unarchive-btn" id="unarchive-btn" onclick="unarchiveCurrent()" title="Restore to active conversations (Ctrl/Cmd + D)" style="display:none;">
+                <span class="btn-icon">&#x1f4c2;</span><span class="btn-label"> Restore</span>
+            </button>
+            <a class="stats-btn" href="/analytics" title="Model health &amp; retry stats">
+                <span class="btn-icon">&#x1f4ca;</span><span class="btn-label"> Stats</span>
+            </a>
+        </div>
+    </div>
+    <!-- Archive Confirmation Modal -->
+    <div class="modal-overlay" id="archive-modal" onclick="if(event.target===this)closeArchiveModal()">
+        <div class="modal-content">
+            <div class="modal-title">Archive Conversation?</div>
+            <div class="modal-text" id="archive-modal-text">
+                This will hide the conversation from your main list.
+                You can view archived chats by switching to the "Archived" tab.
+            </div>
+            <div class="modal-buttons">
+                <button class="modal-btn modal-btn-secondary" onclick="closeArchiveModal()">Cancel</button>
+                <button class="modal-btn modal-btn-primary" onclick="confirmArchive()">Archive</button>
+            </div>
+        </div>
+    </div>
+    <!-- Toast Notification -->
+    <div class="toast" id="toast"></div>
+    <div id="chat-messages"
+         hx-get="__POLL_URL__"
+         hx-trigger="load, every 3s"
+         hx-swap="innerHTML">
+    </div>
+    <div id="loading">Thinking...</div>
+    <div class="input-area">
+        <input type="text" id="chat-input"
+               placeholder="Type a message..."
+               autocomplete="off"
+               onkeydown="if(event.key==='Enter')sendMessage()">
+        <button id="send-btn" onclick="sendMessage()">Send</button>
+    </div>
+    <script>{js}</script>
+</body>
+</html>

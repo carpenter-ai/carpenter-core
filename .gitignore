@@ -1,0 +1,21 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+*.so
+*.db
+*.db-shm
+*.db-wal
+data/
+!carpenter/data/
+.env
+*.log
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+# Instance-specific launch script (contains personal tokens/bind config)
+launch.sh

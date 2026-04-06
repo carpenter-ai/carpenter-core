@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Code Review - {review_id_short}</title>
+    <style>{css}</style>
+</head>
+<body>
+    <div class="header">
+        <h2>Code Review</h2>
+        <div class="file-path">{file_path}</div>
+    </div>
+    <pre>{code_escaped}</pre>
+    <textarea id="comment" placeholder="Optional comment..."></textarea>
+    <div class="actions">
+        <button class="btn btn-approve" onclick="decide('approved')">Approve</button>
+        <button class="btn btn-reject" onclick="decide('rejected')">Reject</button>
+    </div>
+    <script>{js}</script>
+</body>
+</html>

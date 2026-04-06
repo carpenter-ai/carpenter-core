@@ -1,0 +1,25 @@
+name: writing-repo-change
+description: Standard process for changing the writing repository
+required_for:
+  - "repo:writing"
+steps:
+  - name: create-branch
+    description: Create a feature branch on the fork
+    order: 1
+  - name: make-changes
+    description: Agent implements the requested changes
+    order: 2
+  - name: create-pr
+    description: Create a pull request against upstream
+    order: 3
+  - name: automated-review
+    description: Run prompt injection and content review
+    order: 4
+    model_policy: careful-coding
+  - name: human-approval
+    description: Human reviews and approves the changes
+    order: 5
+    activation_event: arc.manual_trigger
+  - name: merge
+    description: Merge the pull request
+    order: 6
