@@ -72,21 +72,17 @@ async def handle_arc_chat_notify(work_id: int, payload: dict) -> None:
         if was_truncated:
             result = result[:RESULT_PREVIEW_MAX] + "..."
         if result:
-            msg = (
-                f'[System notification: Arc "{name}" completed. Result: {result}]\n'
-                f"[Relay the result to the user concisely. For simple factual queries, "
-                f"give a brief summary — not a lengthy formatted response.]"
-            )
+            msg = f'[Arc "{name}" completed: {result}]'
             if was_truncated:
                 msg += (
-                    f"\n[The full result ({full_length} chars) is available. "
-                    f"Use read_arc_result(arc_id={arc_id}) to access the "
-                    f"complete output, or write code that processes it.]"
+                    f"\n[Truncated — full result is {full_length} chars. "
+                    f"Use read_arc_result(arc_id={arc_id}) for complete output.]"
                 )
+            msg += "\n[Be concise.]"
         else:
-            msg = f'[System notification: Arc "{name}" completed.]'
+            msg = f'[Arc "{name}" completed.]'
     else:
-        msg = f'[System notification: Arc "{name}" failed.]'
+        msg = f'[Arc "{name}" failed.]'
 
     # Inject system message as hidden — included in LLM context but
     # not rendered in the chat UI.  The chat agent will relay the

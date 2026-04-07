@@ -202,7 +202,7 @@ async def test_handler_builds_failed_message():
     # Filter to just our notification (root_failure handler may also add one)
     notify_msgs = [
         m for m in msgs
-        if m["role"] == "system" and "System notification" in m["content"]
+        if m["role"] == "system" and m.get("arc_id") == arc_id
     ]
     assert len(notify_msgs) == 1
     assert "broken-task" in notify_msgs[0]["content"]

@@ -1200,11 +1200,7 @@ def _handle_fetch_web_content(
         idempotency_key=f"arc_dispatch:{executor_arc_id}",
     )
 
-    return (
-        f"Web fetch started (arc #{parent_id}). "
-        f"The content will be fetched, reviewed, and the result "
-        f"will be delivered to this conversation automatically."
-    )
+    return f"Web fetch started (arc #{parent_id}). Result will arrive automatically."
 
 
 def _save_api_call(
