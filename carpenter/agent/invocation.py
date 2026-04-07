@@ -30,6 +30,12 @@ logger = logging.getLogger(__name__)
 # Checked before the built-in if/elif chain in _execute_chat_tool().
 _extra_tool_handlers: dict[str, object] = {}
 
+# Tools that start async background work (results arrive via arc.chat_notify).
+# When ALL tools in a turn are async AND the model already produced visible text
+# alongside the tool call, skip the post-tool API call to avoid a redundant
+# "I'm fetching that now..." acknowledgment message.
+_ASYNC_TOOLS = frozenset({"fetch_web_content"})
+
 
 def register_tool_handler(name: str, handler) -> None:
     """Register a tool handler from a platform package.
@@ -1194,11 +1200,7 @@ def _handle_fetch_web_content(
         idempotency_key=f"arc_dispatch:{executor_arc_id}",
     )
 
-    return (
-        f"Web fetch started (arc #{parent_id}). "
-        f"The content will be fetched, reviewed, and the result "
-        f"will be delivered to this conversation automatically."
-    )
+    return f"Web fetch started (arc #{parent_id}). Result will arrive automatically."
 
 
 def _save_api_call(
@@ -2202,6 +2204,24 @@ def invoke_for_chat(
         db_message_ids.append(None)
 
         last_msg_id = assistant_msg_id
+
+        # Async tool short-circuit: if every tool in this turn is async
+        # (results arrive later via arc.chat_notify) AND the model already
+        # produced visible text alongside the tool call, skip the next API
+        # call — it would only generate a redundant "fetching now..." message.
+        if (
+            tool_names_used
+            and all(n in _ASYNC_TOOLS for n in tool_names_used)
+            and msg_role == "assistant"
+        ):
+            logger.info(
+                "Skipping post-tool API call: async tools %s with visible ack",
+                tool_names_used,
+            )
+            # Mark as non-tool-use so the force-final-response logic below
+            # doesn't make another API call.
+            last_stop_reason = "end_turn"
+            break
 
     # --- Force final response if needed ---
     # If the loop exited while still in tool_use mode, or if we collected no text,

@@ -229,6 +229,121 @@ class TestToolCallPersistence:
         assert final_call_kwargs.get("tools") is None
 
 
+class TestAsyncToolShortCircuit:
+    """Tests for the async tool short-circuit in invoke_for_chat.
+
+    When ALL tools in a turn are async (e.g. fetch_web_content) and the
+    model already produced visible text alongside the tool call, the
+    post-tool API call should be skipped to avoid a redundant
+    acknowledgment message.
+    """
+
+    @patch("carpenter.agent.invocation._handle_fetch_web_content")
+    @patch("carpenter.agent.invocation.claude_client")
+    def test_async_tool_with_text_skips_post_tool_call(self, mock_client, mock_fetch):
+        """fetch_web_content with visible text -> no extra API call."""
+        mock_fetch.return_value = "Web fetch started (arc #99). Result will arrive automatically."
+
+        # Single API call: model says text + calls fetch_web_content
+        tool_response = {
+            "content": [
+                {"type": "text", "text": "I'll fetch the weather for you."},
+                {
+                    "type": "tool_use",
+                    "id": "tu_fw",
+                    "name": "fetch_web_content",
+                    "input": {"url": "https://wttr.in/Oxford", "goal": "weather"},
+                },
+            ],
+            "stop_reason": "tool_use",
+            "usage": {"input_tokens": 100, "output_tokens": 50},
+        }
+        mock_client.call.side_effect = [tool_response]
+        mock_client.extract_code_from_text.return_value = None
+
+        result = invocation.invoke_for_chat("What's the weather?", api_key="k")
+
+        # Only 1 API call — the post-tool call was skipped
+        assert mock_client.call.call_count == 1
+
+        # Response text is the acknowledgment from the tool_use turn
+        assert result["response_text"]  # non-empty
+
+        messages = conversation.get_messages(result["conversation_id"])
+        # user + assistant(tool_use with text) + tool_result = 3 messages
+        # No extra assistant message after tool_result
+        assistant_msgs = [m for m in messages if m["role"] == "assistant"]
+        assert len(assistant_msgs) == 1
+        assert assistant_msgs[0]["content"]  # non-empty
+
+    @patch("carpenter.agent.invocation._handle_fetch_web_content")
+    @patch("carpenter.agent.invocation.claude_client")
+    def test_async_tool_without_text_allows_post_tool_call(self, mock_client, mock_fetch):
+        """fetch_web_content without visible text -> one brief acknowledgment."""
+        mock_fetch.return_value = "Web fetch started (arc #99). Result will arrive automatically."
+
+        # First call: tool_use with no visible text
+        tool_response = {
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "tu_fw",
+                    "name": "fetch_web_content",
+                    "input": {"url": "https://wttr.in/Oxford", "goal": "weather"},
+                },
+            ],
+            "stop_reason": "tool_use",
+            "usage": {"input_tokens": 100, "output_tokens": 50},
+        }
+        # Second call: model generates a brief acknowledgment
+        ack_response = {
+            "content": [{"type": "text", "text": "On it."}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 200, "output_tokens": 5},
+        }
+        mock_client.call.side_effect = [tool_response, ack_response]
+        mock_client.extract_code_from_text.return_value = None
+
+        result = invocation.invoke_for_chat("Weather?", api_key="k")
+
+        # 2 API calls — post-tool call needed since model didn't produce text
+        assert mock_client.call.call_count == 2
+        # Only 1 visible assistant message total
+        messages = conversation.get_messages(result["conversation_id"])
+        assistant_msgs = [m for m in messages if m["role"] == "assistant"]
+        assert len(assistant_msgs) == 1
+
+    @patch("carpenter.agent.invocation.claude_client")
+    def test_non_async_tool_with_text_still_makes_post_tool_call(self, mock_client):
+        """Regular (non-async) tools always proceed with the post-tool API call."""
+        tool_response = {
+            "content": [
+                {"type": "text", "text": "Let me check."},
+                {
+                    "type": "tool_use",
+                    "id": "tu_1",
+                    "name": "get_state",
+                    "input": {"key": "foo"},
+                },
+            ],
+            "stop_reason": "tool_use",
+            "usage": {"input_tokens": 100, "output_tokens": 50},
+        }
+        final_response = {
+            "content": [{"type": "text", "text": "The value is bar."}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 200, "output_tokens": 30},
+        }
+        mock_client.call.side_effect = [tool_response, final_response]
+        mock_client.extract_code_from_text.return_value = None
+
+        result = invocation.invoke_for_chat("What is foo?", api_key="k")
+
+        # 2 API calls — regular tools are not short-circuited
+        assert mock_client.call.call_count == 2
+        assert "The value is bar" in result["response_text"]
+
+
 class TestApiCallPersistence:
     """Tests for API call metrics being persisted in invoke_for_chat."""
 

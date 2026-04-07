@@ -119,6 +119,7 @@ def add_message(
     content: str,
     arc_id: int | None = None,
     content_json: str | None = None,
+    hidden: bool = False,
 ) -> int:
     """Add a message to a conversation.
 
@@ -128,6 +129,8 @@ def add_message(
         content: Message text (plain-text summary).
         arc_id: Optional arc this message relates to.
         content_json: Optional JSON-serialized API content blocks.
+        hidden: If True, the message is included in the LLM context
+            but not rendered in the chat UI.
 
     Returns:
         Message ID.
@@ -140,9 +143,9 @@ def add_message(
         content_json = content_json.encode("utf-8", errors="replace").decode("utf-8")
     with db_transaction() as db:
         cursor = db.execute(
-            "INSERT INTO messages (conversation_id, role, content, arc_id, content_json) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (conversation_id, role, content, arc_id, content_json),
+            "INSERT INTO messages (conversation_id, role, content, arc_id, content_json, hidden) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (conversation_id, role, content, arc_id, content_json, hidden),
         )
         msg_id = cursor.lastrowid
 

@@ -106,9 +106,11 @@ async def get_chat_history(request: Request):
         conversation_id = conversation.get_or_create_conversation()
 
     messages = conversation.get_messages(conversation_id)
+    # Filter out hidden messages (internal-only, e.g. arc completion notifications)
+    visible = [m for m in messages if not m.get("hidden")]
     return JSONResponse(content={
         "conversation_id": conversation_id,
-        "messages": messages,
+        "messages": visible,
     })
 
 

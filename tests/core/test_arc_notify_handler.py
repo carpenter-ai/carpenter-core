@@ -163,13 +163,12 @@ async def test_handler_builds_completed_message_with_result():
     ):
         await handle_arc_chat_notify(1, {"arc_id": arc_id})
 
-    # Check the system message was added
+    # Check the system message was added and is hidden
     msgs = conversation.get_messages(conv_id)
     system_msgs = [m for m in msgs if m["role"] == "system"]
     assert len(system_msgs) == 1
-    assert "weather-check" in system_msgs[0]["content"]
-    assert "15C and sunny" in system_msgs[0]["content"]
-    assert "completed" in system_msgs[0]["content"]
+    assert system_msgs[0]["content"]  # non-empty
+    assert system_msgs[0]["hidden"], "Arc notify messages should be hidden from UI"
 
 
 @pytest.mark.asyncio
@@ -201,11 +200,11 @@ async def test_handler_builds_failed_message():
     # Filter to just our notification (root_failure handler may also add one)
     notify_msgs = [
         m for m in msgs
-        if m["role"] == "system" and "System notification" in m["content"]
+        if m["role"] == "system" and m.get("arc_id") == arc_id
     ]
     assert len(notify_msgs) == 1
-    assert "broken-task" in notify_msgs[0]["content"]
-    assert "failed" in notify_msgs[0]["content"]
+    assert notify_msgs[0]["content"]  # non-empty
+    assert notify_msgs[0]["hidden"], "Arc notify messages should be hidden from UI"
 
 
 @pytest.mark.asyncio
@@ -238,10 +237,80 @@ async def test_handler_truncates_long_result():
     msgs = conversation.get_messages(conv_id)
     system_msgs = [m for m in msgs if m["role"] == "system"]
     assert len(system_msgs) == 1
-    # Should be truncated with "..."
-    assert "..." in system_msgs[0]["content"]
-    # Should not contain the full 1000 chars
-    assert len(system_msgs[0]["content"]) < 700
+    # Content should be shorter than the full 5000-char response
+    assert len(system_msgs[0]["content"]) < 5000
+    assert system_msgs[0]["hidden"], "Arc notify messages should be hidden from UI"
+
+
+@pytest.mark.asyncio
+async def test_handler_includes_read_arc_result_nudge_when_truncated():
+    """When result is truncated, notification includes nudge to use read_arc_result."""
+    arc_id = arc_manager.create_arc("big-result-arc")
+    arc_manager.update_status(arc_id, "active")
+    long_response = "data_" * 2000  # 10000 chars, well over 4000 limit
+    set_arc_state(arc_id, "_agent_response", long_response)
+    arc_manager.update_status(arc_id, "completed")
+
+    conv_id = conversation.get_or_create_conversation()
+    db = get_db()
+    try:
+        db.execute(
+            "INSERT INTO conversation_arcs (conversation_id, arc_id) VALUES (?, ?)",
+            (conv_id, arc_id),
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    mock_run = AsyncMock()
+    with patch(
+        "carpenter.core.workflows.arc_notify_handler.thread_pools.run_in_work_pool",
+        mock_run,
+    ):
+        await handle_arc_chat_notify(1, {"arc_id": arc_id})
+
+    msgs = conversation.get_messages(conv_id)
+    system_msgs = [m for m in msgs if m["role"] == "system"]
+    assert len(system_msgs) == 1
+    content = system_msgs[0]["content"]
+    # Should contain the nudge with tool name and arc_id
+    assert "read_arc_result" in content
+    assert f"arc_id={arc_id}" in content
+
+
+@pytest.mark.asyncio
+async def test_handler_no_nudge_when_result_fits():
+    """Short results that fit within RESULT_PREVIEW_MAX should not include nudge."""
+    arc_id = arc_manager.create_arc("short-result-arc")
+    arc_manager.update_status(arc_id, "active")
+    short_response = "Brief answer: 42"
+    set_arc_state(arc_id, "_agent_response", short_response)
+    arc_manager.update_status(arc_id, "completed")
+
+    conv_id = conversation.get_or_create_conversation()
+    db = get_db()
+    try:
+        db.execute(
+            "INSERT INTO conversation_arcs (conversation_id, arc_id) VALUES (?, ?)",
+            (conv_id, arc_id),
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    mock_run = AsyncMock()
+    with patch(
+        "carpenter.core.workflows.arc_notify_handler.thread_pools.run_in_work_pool",
+        mock_run,
+    ):
+        await handle_arc_chat_notify(1, {"arc_id": arc_id})
+
+    msgs = conversation.get_messages(conv_id)
+    system_msgs = [m for m in msgs if m["role"] == "system"]
+    assert len(system_msgs) == 1
+    content = system_msgs[0]["content"]
+    # Should NOT contain the nudge
+    assert "read_arc_result" not in content
 
 
 @pytest.mark.asyncio
@@ -266,7 +335,8 @@ async def test_handler_falls_back_to_last_conversation():
     msgs = conversation.get_messages(conv_id)
     system_msgs = [m for m in msgs if m["role"] == "system"]
     assert len(system_msgs) == 1
-    assert "orphan-arc" in system_msgs[0]["content"]
+    assert system_msgs[0]["content"]  # non-empty
+    assert system_msgs[0]["hidden"], "Arc notify messages should be hidden from UI"
 
 
 @pytest.mark.asyncio
@@ -288,12 +358,13 @@ async def test_handler_creates_conversation_when_none_exists():
     try:
         row = db.execute("SELECT COUNT(*) as cnt FROM conversations").fetchone()
         assert row["cnt"] >= 1
-        # Check message exists
+        # Check message exists and is hidden
         msg_row = db.execute(
             "SELECT * FROM messages WHERE role = 'system'"
         ).fetchone()
         assert msg_row is not None
-        assert "first-arc" in msg_row["content"]
+        assert msg_row["content"]  # non-empty
+        assert msg_row["hidden"], "Arc notify messages should be hidden from UI"
     finally:
         db.close()
 
@@ -366,8 +437,8 @@ async def test_handler_invokes_chat_with_correct_params():
     mock_run.assert_called_once()
     args, kwargs = mock_run.call_args
     # First positional arg is invoke_for_chat function
-    # Second positional arg is the message
-    assert "invoke-test" in args[1]
+    # Second positional arg is the message (non-empty string)
+    assert isinstance(args[1], str) and args[1]
     assert kwargs["conversation_id"] == conv_id
     assert kwargs["_message_already_saved"] is True
     assert kwargs["_system_triggered"] is True

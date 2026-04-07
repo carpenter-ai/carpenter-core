@@ -243,6 +243,7 @@ CREATE TABLE IF NOT EXISTS messages (
     content_json TEXT,
     arc_id INTEGER REFERENCES arcs(id),
     compaction_event_id INTEGER REFERENCES compaction_events(id),
+    hidden BOOLEAN DEFAULT FALSE,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id, role, id);
