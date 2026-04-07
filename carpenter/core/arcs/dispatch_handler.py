@@ -922,6 +922,85 @@ def _clone_arc_for_cron(
         return None
 
 
+def _try_inject_fetched_content(reviewer_arc_id: int) -> bool:
+    """Check if a REVIEWER arc's review target has fetched web content.
+
+    If the target EXECUTOR arc has encrypted ``fetched_content`` in its state,
+    decrypt it and store the web page content as ``_agent_response`` on the
+    REVIEWER arc.  This allows the fetch pipeline to bypass the LLM-based
+    review step (which cannot access cross-arc encrypted state from the
+    sandbox).
+
+    Returns True if content was injected (caller should skip LLM invocation).
+    """
+    from ..workflows._arc_state import get_arc_state, set_arc_state
+
+    review_target = get_arc_state(reviewer_arc_id, "_review_target")
+    if review_target is None:
+        return False
+
+    # Read the raw value_json to check for encryption marker
+    with db_connection() as db:
+        row = db.execute(
+            "SELECT value_json FROM arc_state WHERE arc_id = ? AND key = ?",
+            (review_target, "fetched_content"),
+        ).fetchone()
+
+    if row is None:
+        return False
+
+    value_json = row["value_json"]
+    encrypted_marker = "__encrypted__:"
+
+    # Check if it's encrypted
+    if not value_json.startswith(f'"{encrypted_marker}'):
+        # Plaintext — just read the value directly
+        try:
+            content_obj = json.loads(value_json)
+        except (json.JSONDecodeError, TypeError):
+            return False
+    else:
+        # Encrypted — decrypt using the reviewer's key
+        try:
+            raw = json.loads(value_json)  # -> "__encrypted__:BASE64..."
+            ciphertext = raw[len(encrypted_marker):].encode("ascii")
+            from ..trust.encryption import decrypt_for_reviewer
+            decrypted_json = decrypt_for_reviewer(
+                reviewer_arc_id, review_target, ciphertext,
+            )
+            content_obj = json.loads(decrypted_json)
+        except (PermissionError, json.JSONDecodeError, ImportError,
+                TypeError, ValueError, RuntimeError) as exc:
+            logger.warning(
+                "Arc %d: failed to decrypt fetched_content from target %d: %s",
+                reviewer_arc_id, review_target, exc,
+            )
+            return False
+
+    # Extract the web page content from the fetch result.
+    # Store the FULL content — the notification handler truncates for
+    # display and nudges the chat agent to use read_arc_result() for
+    # the complete output.
+    if isinstance(content_obj, dict):
+        page_content = content_obj.get("content", "")
+        url = content_obj.get("url", "")
+        if url:
+            result = f"Fetched from {url}:\n{page_content}"
+        else:
+            result = page_content
+    elif isinstance(content_obj, str):
+        result = content_obj
+    else:
+        result = str(content_obj)
+
+    set_arc_state(reviewer_arc_id, "_agent_response", result)
+    logger.info(
+        "Arc %d: injected %d chars of fetched content from target arc %d",
+        reviewer_arc_id, len(result), review_target,
+    )
+    return True
+
+
 def _find_arc_conversation(arc_id: int, _depth: int = 0) -> int | None:
     """Walk up the arc family tree to find a linked conversation.
 
