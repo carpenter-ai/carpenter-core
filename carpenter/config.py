@@ -182,7 +182,7 @@ DEFAULTS = {
         },
         "sonnet": {
             "provider": "anthropic",
-            "model_id": "claude-sonnet-4-5-20250929",
+            "model_id": "claude-sonnet-4-6",
             "description": "Balanced capability and cost. Standard implementation, code review, general-purpose tasks.",
             "cost_tier": "medium",
             "context_window": 200000,
@@ -416,7 +416,7 @@ DEFAULTS = {
     "coding_agents": {
         "builtin": {
             "type": "builtin",
-            "model": "claude-sonnet-4-5-20250929",
+            "model": "claude-sonnet-4-6",
             "max_tokens": 4096,
             "max_iterations": 20,
             "timeout": 300,
