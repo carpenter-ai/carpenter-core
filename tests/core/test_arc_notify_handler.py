@@ -17,9 +17,22 @@ from carpenter.db import get_db
 
 
 def test_completed_root_arc_enqueues_chat_notify():
-    """Completing a root arc enqueues an arc.chat_notify work item."""
+    """Completing a conversation-linked root arc enqueues an arc.chat_notify work item."""
     arc_id = arc_manager.create_arc("test-root")
     arc_manager.update_status(arc_id, "active")
+
+    # Link arc to a conversation (required since PR #217)
+    conv_id = conversation.get_or_create_conversation()
+    db = get_db()
+    try:
+        db.execute(
+            "INSERT INTO conversation_arcs (conversation_id, arc_id) VALUES (?, ?)",
+            (conv_id, arc_id),
+        )
+        db.commit()
+    finally:
+        db.close()
+
     arc_manager.update_status(arc_id, "completed")
 
     db = get_db()
@@ -36,9 +49,22 @@ def test_completed_root_arc_enqueues_chat_notify():
 
 
 def test_failed_root_arc_enqueues_chat_notify():
-    """Failing a root arc enqueues an arc.chat_notify work item."""
+    """Failing a conversation-linked root arc enqueues an arc.chat_notify work item."""
     arc_id = arc_manager.create_arc("test-root")
     arc_manager.update_status(arc_id, "active")
+
+    # Link arc to a conversation (required since PR #217)
+    conv_id = conversation.get_or_create_conversation()
+    db = get_db()
+    try:
+        db.execute(
+            "INSERT INTO conversation_arcs (conversation_id, arc_id) VALUES (?, ?)",
+            (conv_id, arc_id),
+        )
+        db.commit()
+    finally:
+        db.close()
+
     arc_manager.update_status(arc_id, "failed")
 
     db = get_db()
@@ -61,6 +87,24 @@ def test_child_arc_does_not_enqueue_chat_notify():
     child = arc_manager.add_child(parent, "child", goal="sub-task")
     arc_manager.update_status(child, "active")
     arc_manager.update_status(child, "completed")
+
+    db = get_db()
+    try:
+        row = db.execute(
+            "SELECT * FROM work_queue WHERE event_type = 'arc.chat_notify'"
+        ).fetchone()
+    finally:
+        db.close()
+
+    assert row is None
+
+
+def test_unlinked_root_arc_does_not_enqueue_chat_notify():
+    """Completing a root arc NOT linked to a conversation should NOT enqueue arc.chat_notify."""
+    arc_id = arc_manager.create_arc("unlinked-root")
+    arc_manager.update_status(arc_id, "active")
+    # Do NOT link to any conversation
+    arc_manager.update_status(arc_id, "completed")
 
     db = get_db()
     try:
@@ -212,7 +256,7 @@ async def test_handler_truncates_long_result():
     """Long _agent_response is truncated to RESULT_PREVIEW_MAX."""
     arc_id = arc_manager.create_arc("verbose-arc")
     arc_manager.update_status(arc_id, "active")
-    long_response = "x" * 1000
+    long_response = "x" * 5000
     set_arc_state(arc_id, "_agent_response", long_response)
     arc_manager.update_status(arc_id, "completed")
 

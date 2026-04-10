@@ -575,10 +575,11 @@ def update_status(
     # to get_last_conversation(), causing spurious chat invocations.
     if new_status in ("completed", "failed") and _is_root_arc:
         try:
-            _has_conv = db.execute(
-                "SELECT 1 FROM conversation_arcs WHERE arc_id = ? LIMIT 1",
-                (arc_id,),
-            ).fetchone()
+            with db_connection() as _notify_db:
+                _has_conv = _notify_db.execute(
+                    "SELECT 1 FROM conversation_arcs WHERE arc_id = ? LIMIT 1",
+                    (arc_id,),
+                ).fetchone()
             if _has_conv:
                 from ..engine import work_queue as _wq2
                 _wq2.enqueue(

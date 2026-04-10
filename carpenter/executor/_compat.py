@@ -65,16 +65,53 @@ class _PackageNamespace:
 class _CarpenterToolsRoot:
     """Top-level ``carpenter_tools`` namespace.
 
-    Provides ``.act`` and ``.read`` sub-packages, each of which returns
-    tool modules on attribute access.
+    Provides ``.act``, ``.read``, ``.declarations``, and ``.policy``
+    sub-packages so that code can import security types at runtime.
     """
 
-    __slots__ = ("_dispatch", "_act", "_read")
+    __slots__ = ("_dispatch", "_act", "_read", "_declarations", "_policy")
 
     def __init__(self, dispatch_fn):
         object.__setattr__(self, "_dispatch", dispatch_fn)
         object.__setattr__(self, "_act", _PackageNamespace(dispatch_fn))
         object.__setattr__(self, "_read", _PackageNamespace(dispatch_fn))
+        # Import real declaration and policy types so code can use
+        # Label(), URL(), etc. in the restricted executor.
+        from carpenter_tools.declarations import (
+            SecurityType, Label, Email, URL, WorkspacePath,
+            SQL, JSON, UnstructuredText,
+        )
+        decl_ns = type("declarations", (), {
+            "SecurityType": SecurityType,
+            "Label": Label,
+            "Email": Email,
+            "URL": URL,
+            "WorkspacePath": WorkspacePath,
+            "SQL": SQL,
+            "JSON": JSON,
+            "UnstructuredText": UnstructuredText,
+        })()
+        object.__setattr__(self, "_declarations", decl_ns)
+
+        from carpenter_tools.policy.types import (
+            EmailPolicy, Domain, Url, FilePath, Command,
+            IntRange, Enum, Bool, Pattern, PolicyLiteral,
+        )
+        policy_ns = type("policy", (), {
+            "types": type("types", (), {
+                "EmailPolicy": EmailPolicy,
+                "Domain": Domain,
+                "Url": Url,
+                "FilePath": FilePath,
+                "Command": Command,
+                "IntRange": IntRange,
+                "Enum": Enum,
+                "Bool": Bool,
+                "Pattern": Pattern,
+                "PolicyLiteral": PolicyLiteral,
+            })(),
+        })()
+        object.__setattr__(self, "_policy", policy_ns)
 
     @property
     def act(self):
@@ -83,6 +120,14 @@ class _CarpenterToolsRoot:
     @property
     def read(self):
         return object.__getattribute__(self, "_read")
+
+    @property
+    def declarations(self):
+        return object.__getattribute__(self, "_declarations")
+
+    @property
+    def policy(self):
+        return object.__getattribute__(self, "_policy")
 
 
 def build_compat_namespace(dispatch_fn) -> dict:
@@ -103,6 +148,11 @@ def build_compat_namespace(dispatch_fn) -> dict:
     root = _CarpenterToolsRoot(dispatch_fn)
     act = root.act
 
+    # Import SecurityType classes for direct use (no import statement needed)
+    from carpenter_tools.declarations import (
+        Label, Email, URL, WorkspacePath, SQL, JSON, UnstructuredText,
+    )
+
     return {
         "carpenter_tools": root,
         # Pre-import the most commonly used act modules
@@ -122,4 +172,12 @@ def build_compat_namespace(dispatch_fn) -> dict:
         "lm": act.lm,
         "webhook": act.webhook,
         "plugin": act.plugin,
+        # SecurityType classes for typed string declarations
+        "Label": Label,
+        "Email": Email,
+        "URL": URL,
+        "WorkspacePath": WorkspacePath,
+        "SQL": SQL,
+        "JSON": JSON,
+        "UnstructuredText": UnstructuredText,
     }

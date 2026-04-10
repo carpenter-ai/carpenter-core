@@ -1075,14 +1075,11 @@ def _handle_escalate(
 # platform before dispatch) so the script body is identical for every fetch,
 # keeping a single hash in verified_code_hashes.
 _FETCH_SCRIPT = """\
-from carpenter_tools.act import web
-from carpenter_tools.act import state as write_state
-from carpenter_tools.read import state as read_state
 from carpenter_tools.declarations import Label
-
-url = read_state.get(Label("fetch_url"))
-result = web.fetch_webpage(url)
-write_state.set(Label("fetched_content"), result)
+url_result = dispatch(Label("state.get"), {"key": Label("fetch_url")})
+url = url_result[Label("value")]
+result = dispatch(Label("web.fetch_webpage"), {"url": url})
+dispatch(Label("state.set"), {"key": Label("fetched_content"), "value": result})
 """
 
 
@@ -1156,6 +1153,7 @@ def _handle_fetch_web_content(
                 "agent_type": "REVIEWER",
                 "integrity_level": "trusted",
                 "reviewer_profile": "security-reviewer",
+                "model_policy": "fast-chat",
                 "step_order": 1,
             },
             {

@@ -16,7 +16,7 @@ from ... import thread_pools
 
 logger = logging.getLogger(__name__)
 
-RESULT_PREVIEW_MAX = 500
+RESULT_PREVIEW_MAX = 4000
 
 
 async def handle_arc_chat_notify(work_id: int, payload: dict) -> None:
@@ -62,7 +62,9 @@ async def handle_arc_chat_notify(work_id: int, payload: dict) -> None:
         # stored on the child arc that actually ran the agent)
         if not result:
             children = arc_manager.get_children(arc_id) or []
-            for child in children:
+            # Iterate in reverse step_order so the JUDGE/REVIEWER response
+            # (the most refined summary) is preferred over the EXECUTOR's.
+            for child in reversed(children):
                 child_resp = get_arc_state(child["id"], "_agent_response", "") or ""
                 if child_resp:
                     result = child_resp

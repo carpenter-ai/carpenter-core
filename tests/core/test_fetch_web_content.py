@@ -175,6 +175,41 @@ def test_fetch_web_content_sets_url_in_arc_state():
     assert stored_url == test_url
 
 
+# -- _FETCH_SCRIPT sandbox test --
+
+
+def test_fetch_script_runs_in_restricted_sandbox():
+    """_FETCH_SCRIPT compiles and dispatches correctly in RestrictedPython."""
+    from carpenter.agent.invocation import _FETCH_SCRIPT
+    from carpenter.executor.restricted import RestrictedExecutor
+
+    calls = []
+
+    def handler(tool_name, params):
+        calls.append((tool_name, dict(params)))
+        if tool_name == "state.get":
+            return {"value": "https://example.com/weather"}
+        if tool_name == "web.fetch_webpage":
+            return {"content": "<html>sunny</html>", "status_code": 200}
+        if tool_name == "state.set":
+            return {"success": True}
+        return {"ok": True}
+
+    executor = RestrictedExecutor(tool_handler=handler)
+    result = executor.execute(_FETCH_SCRIPT)
+
+    assert result.exit_code == 0, f"Script failed: {result.error}"
+    assert result.error == ""
+
+    # Verify the three dispatch calls happened in order
+    assert len(calls) == 3
+    assert calls[0] == ("state.get", {"key": "fetch_url"})
+    assert calls[1] == ("web.fetch_webpage", {"url": "https://example.com/weather"})
+    assert calls[2][0] == "state.set"
+    assert calls[2][1]["key"] == "fetched_content"
+    assert calls[2][1]["value"]["content"] == "<html>sunny</html>"
+
+
 # -- dispatch_bridge.py linking test --
 
 
