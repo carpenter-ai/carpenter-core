@@ -136,6 +136,20 @@ async def handle_arc_dispatch(work_id: int, payload: dict):
                 logger.info("Arc %d dispatched successfully (action: judge_policy_checks)", arc_id)
                 return
 
+            # REVIEWER arcs with fetched content: decrypt and inject directly,
+            # skipping LLM invocation.  The REVIEWER sandbox cannot access
+            # the EXECUTOR's encrypted arc state, so we handle it at the
+            # platform level.
+            if agent_type == "REVIEWER" and _try_inject_fetched_content(arc_id):
+                arc_manager.freeze_arc(arc_id)
+                _propagate_completion(arc_id)
+                logger.info(
+                    "Arc %d: fetched content injected as _agent_response, "
+                    "skipping LLM invocation",
+                    arc_id,
+                )
+                return
+
             # Resolve model config — prefer model_policy_id, fall back to agent_config_id
             policy_id = arc_info.get("model_policy_id") if arc_info else None
             agent_config = None
@@ -1130,7 +1144,10 @@ async def _run_arc_agent(
             _executor_conv_id=source_conv_id,
             _model_override=model_override,
         )
-        # Store agent response for downstream steps to access
+        # Store agent response for downstream steps to access.
+        # Use ON CONFLICT DO NOTHING so that if the agent explicitly set
+        # _agent_response via state.set (e.g. a clean summary), we preserve
+        # that value instead of overwriting it with the full response_text.
         response_text = ""
         if isinstance(result, dict):
             response_text = result.get("response_text", "")
@@ -1138,8 +1155,9 @@ async def _run_arc_agent(
             _db = get_db()
             try:
                 _db.execute(
-                    "INSERT OR REPLACE INTO arc_state (arc_id, key, value_json) "
-                    "VALUES (?, ?, ?)",
+                    "INSERT INTO arc_state (arc_id, key, value_json) "
+                    "VALUES (?, ?, ?) "
+                    "ON CONFLICT(arc_id, key) DO NOTHING",
                     (arc_id, "_agent_response", json.dumps(response_text)),
                 )
                 _db.commit()

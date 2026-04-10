@@ -775,3 +775,71 @@ class TestModelFailover:
             original_error_info=None,
         )
         assert result is False
+
+
+# ---------------------------------------------------------------------------
+# _agent_response preservation tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_invoke_arc_agent_preserves_explicit_agent_response():
+    """If agent explicitly sets _agent_response via state.set, the dispatch
+    handler's fallback INSERT should not overwrite it (ON CONFLICT DO NOTHING).
+    """
+    from carpenter.core.workflows._arc_state import set_arc_state, get_arc_state
+
+    arc_id = arc_manager.create_arc("test-preserve", goal="Test preservation")
+    arc_manager.update_status(arc_id, "active")
+
+    # Pre-set _agent_response (simulating what state.set does during agent execution)
+    set_arc_state(arc_id, "_agent_response", "Clean summary from agent")
+
+    # Mock invoke_for_chat to return a response_text (simulating the full response_text)
+    mock_result = {"response_text": "Messy debugging text\nLet me try again\nActual result"}
+
+    with patch("carpenter.thread_pools.run_in_work_pool", new_callable=AsyncMock) as mock_pool:
+        mock_pool.return_value = mock_result
+
+        await arc_dispatch_handler._run_arc_agent(
+            arc_id=arc_id,
+            goal="Test preservation",
+            source_conv_id=None,
+            agent_config=None,
+        )
+
+    # The pre-set clean summary should be preserved, NOT overwritten
+    stored = get_arc_state(arc_id, "_agent_response")
+    assert stored == "Clean summary from agent", (
+        f"Expected preserved clean summary, got: {stored!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_invoke_arc_agent_stores_response_text_as_fallback():
+    """If agent does NOT explicitly set _agent_response, the dispatch handler
+    stores response_text as a fallback.
+    """
+    from carpenter.core.workflows._arc_state import get_arc_state
+
+    arc_id = arc_manager.create_arc("test-fallback", goal="Test fallback")
+    arc_manager.update_status(arc_id, "active")
+
+    # Do NOT pre-set _agent_response — simulate agent that didn't call state.set
+
+    mock_result = {"response_text": "Agent response text as fallback"}
+
+    with patch("carpenter.thread_pools.run_in_work_pool", new_callable=AsyncMock) as mock_pool:
+        mock_pool.return_value = mock_result
+
+        await arc_dispatch_handler._run_arc_agent(
+            arc_id=arc_id,
+            goal="Test fallback",
+            source_conv_id=None,
+            agent_config=None,
+        )
+
+    stored = get_arc_state(arc_id, "_agent_response")
+    assert stored == "Agent response text as fallback", (
+        f"Expected response_text fallback, got: {stored!r}"
+    )

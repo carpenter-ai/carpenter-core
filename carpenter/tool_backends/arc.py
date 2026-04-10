@@ -340,12 +340,20 @@ def handle_create_batch(params: dict) -> dict:
                     if parent is not None:
                         depth = parent["depth"] + 1
 
+                # Resolve model_policy_id (by name or direct ID)
+                policy_id = arc_spec.get("model_policy_id")
+                if policy_id is None and arc_spec.get("model_policy"):
+                    policy_id = arc_manager.get_policy_id_by_name(
+                        arc_spec["model_policy"]
+                    )
+
                 # Insert arc
                 cursor = db.execute(
                     "INSERT INTO arcs "
                     "(name, goal, parent_id, step_order, depth, "
-                    " integrity_level, output_type, agent_type, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    " integrity_level, output_type, agent_type, "
+                    " model_policy_id, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         arc_spec.get("name", ""),
                         arc_spec.get("goal"),
@@ -355,6 +363,7 @@ def handle_create_batch(params: dict) -> dict:
                         integrity_level,
                         output_type,
                         agent_type,
+                        policy_id,
                         now,
                     ),
                 )
