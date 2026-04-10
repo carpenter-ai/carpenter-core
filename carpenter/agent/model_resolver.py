@@ -115,7 +115,7 @@ def get_model_for_role(slot: str) -> str:
     # 3. Auto-detect from provider
     provider = config.CONFIG.get("ai_provider", "anthropic")
     if provider == "anthropic":
-        anthropic_model = config.CONFIG.get("anthropic_model", "claude-sonnet-4-5-20250929")
+        anthropic_model = config.CONFIG.get("anthropic_model", "claude-sonnet-4-6")
         return f"anthropic:{anthropic_model}"
     elif provider == "ollama":
         ollama_model = config.CONFIG.get("ollama_model", "llama3.1")
@@ -135,7 +135,7 @@ def get_model_for_role(slot: str) -> str:
             return f"local:{basename}"
         return "local:default"
     else:
-        anthropic_model = config.CONFIG.get("anthropic_model", "claude-sonnet-4-5-20250929")
+        anthropic_model = config.CONFIG.get("anthropic_model", "claude-sonnet-4-6")
         return f"anthropic:{anthropic_model}"
 
 
