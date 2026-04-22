@@ -48,7 +48,15 @@ def load_template(yaml_path: str) -> int:
     exists, updates it and increments the version.
 
     Returns the template ID.
+
+    Raises:
+        ValueError: If any step declares an ``untrusted_shape`` that is
+            unknown or that conflicts with other step-level fields.
+            Validation happens at load time so authorship errors surface
+            before a workflow is ever instantiated.
     """
+    from ..trust.untrusted_shapes import validate_step_against_shape
+
     with open(yaml_path, "r") as f:
         data = yaml.safe_load(f)
 
@@ -57,6 +65,11 @@ def load_template(yaml_path: str) -> int:
     required_for = data.get("required_for", [])
     steps = data.get("steps", [])
     capabilities = data.get("capabilities", [])
+
+    # Validate any ``untrusted_shape`` declarations up front.
+    for step in steps:
+        if isinstance(step, dict) and step.get("untrusted_shape"):
+            validate_step_against_shape(step)
 
     required_for_json = json.dumps(required_for)
     # Store as dict with steps + template-level capabilities
@@ -198,6 +211,77 @@ def _enforce_min_tier(agent_model: str, model_min_tier: str) -> None:
         )
 
 
+def _instantiate_untrusted_shape(
+    step: dict,
+    parent_arc_id: int,
+    template_id: int,
+    template_capabilities: list,
+) -> list[int]:
+    """Expand an ``untrusted_shape`` step into a canonical arc batch.
+
+    Renders the shape's child specs, parents them to ``parent_arc_id``,
+    and delegates to :func:`carpenter.core.trust.batch.create_untrusted_batch`.
+    Step-level fields that the shape does not own (``description``,
+    ``capabilities``, ``activation_event``, ``required_pass``,
+    ``model_min_tier``) are applied to the child arcs after creation
+    using the same conventions as the trusted-step path.
+    """
+    from ..trust.batch import create_untrusted_batch
+    from ..trust.untrusted_shapes import render_shape
+
+    bindings = {
+        "goal": step.get("description", "") or step.get("name", ""),
+        "name": step.get("name", ""),
+    }
+    specs = render_shape(step["untrusted_shape"], bindings)
+
+    # Offset child step_orders by the YAML-declared base ``order`` so
+    # template-rigidity-style invariants still see a monotonic layout.
+    base_order = step.get("order", 0)
+    for spec in specs:
+        spec["parent_id"] = parent_arc_id
+        spec["step_order"] = base_order + int(spec.get("step_order", 0))
+        # Tag as template-originated so rigidity checks treat them
+        # identically to ordinary template steps.
+        spec["template_id"] = template_id
+        spec["from_template"] = True
+        spec["template_mutable"] = step.get("mutable", False)
+
+    result = create_untrusted_batch(specs, parent_id=parent_arc_id)
+    if "error" in result:
+        raise ValueError(
+            f"Failed to instantiate untrusted_shape "
+            f"{step['untrusted_shape']!r}: {result['error']}"
+        )
+
+    arc_ids = result["arc_ids"]
+
+    # Merge template-level + step-level capabilities onto each child.
+    step_capabilities = step.get("capabilities", [])
+    merged_caps = sorted(set(template_capabilities) | set(step_capabilities))
+    if merged_caps:
+        with db_transaction() as db:
+            for arc_id in arc_ids:
+                db.execute(
+                    "INSERT OR REPLACE INTO arc_state "
+                    "(arc_id, key, value_json) VALUES (?, ?, ?)",
+                    (arc_id, "_capabilities", json.dumps(merged_caps)),
+                )
+
+    # activation_event on a shape step attaches to the first (executor)
+    # child, matching the "one event → one entry point" convention.
+    activation_event = step.get("activation_event")
+    if activation_event:
+        with db_transaction() as db:
+            db.execute(
+                "INSERT OR IGNORE INTO arc_activations "
+                "(arc_id, event_type) VALUES (?, ?)",
+                (arc_ids[0], activation_event),
+            )
+
+    return arc_ids
+
+
 def instantiate_template(template_id: int, parent_arc_id: int) -> list[int]:
     """Instantiate a template as child arcs on a parent arc.
 
@@ -218,6 +302,21 @@ def instantiate_template(template_id: int, parent_arc_id: int) -> list[int]:
     arc_ids = []
 
     for step in steps:
+        # ``untrusted_shape`` steps expand into a canonical batch of
+        # (EXECUTOR-untrusted, reviewer(s), judge) child arcs via the
+        # shared trust helper instead of a single create_arc call.
+        shape_name = step.get("untrusted_shape")
+        if shape_name:
+            arc_ids.extend(
+                _instantiate_untrusted_shape(
+                    step=step,
+                    parent_arc_id=parent_arc_id,
+                    template_id=template_id,
+                    template_capabilities=template_capabilities,
+                )
+            )
+            continue
+
         # Pass through optional arc properties from the step definition
         extra_kwargs = {}
         for step_key in ("agent_type", "integrity_level", "output_type",
