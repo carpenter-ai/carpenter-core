@@ -5,6 +5,7 @@ Trust boundaries, review pipeline, and information-flow security.
 ## In this section
 - [[security/trust-boundaries]] — Three-level integrity lattice
 - [[security/review-pipeline]] — How code review works
+- [[security/typed-declarations]] — Typed string constructors required in submitted code
 - [[security/config]] — Security-related configuration
 
 ## Core principle
