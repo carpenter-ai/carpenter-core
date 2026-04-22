@@ -1071,16 +1071,14 @@ def _handle_escalate(
     return f"Escalated to {next_model}. Arc #{new_arc_id} created. This arc is now frozen."
 
 
-# Pre-verified fetch script.  The URL is read from arc state (set by the
-# platform before dispatch) so the script body is identical for every fetch,
-# keeping a single hash in verified_code_hashes.
-_FETCH_SCRIPT = """\
-from carpenter_tools.declarations import Label
-url_result = dispatch(Label("state.get"), {"key": Label("fetch_url")})
-url = url_result[Label("value")]
-result = dispatch(Label("web.fetch_webpage"), {"url": url})
-dispatch(Label("state.set"), {"key": Label("fetched_content"), "value": result})
-"""
+# The pre-verified fetch script and the reviewer/judge wiring now live
+# in ``carpenter.core.trust.untrusted_shapes`` under the ``fetch_web``
+# preset.  This function is the sole runtime caller; YAML templates get
+# the same shape via ``untrusted_shape: fetch_web``.
+#
+# ``_FETCH_SCRIPT`` is re-exported here for backwards compatibility —
+# tests and verified_code_hashes tooling import it from this module.
+from ..core.trust.untrusted_shapes import _FETCH_SCRIPT  # noqa: E402,F401
 
 
 def _handle_fetch_web_content(
@@ -1089,7 +1087,8 @@ def _handle_fetch_web_content(
 ) -> str:
     """Handle fetch_web_content — create an untrusted arc batch to fetch a URL.
 
-    Creates a parent PLANNER arc with three children:
+    Creates a parent PLANNER arc with three children produced by the
+    ``fetch_web`` shape:
       1. EXECUTOR (untrusted) — fetches the URL using a pre-verified script
       2. REVIEWER (trusted) — reviews the untrusted output
       3. JUDGE (trusted) — validates the review
@@ -1099,8 +1098,9 @@ def _handle_fetch_web_content(
     """
     from ..core.arcs import manager as _am
     from ..core.engine import work_queue as _wq
+    from ..core.trust.batch import create_untrusted_batch
+    from ..core.trust.untrusted_shapes import render_shape
     from ..core.workflows._arc_state import set_arc_state
-    from ..tool_backends import arc as arc_backend
 
     url = tool_input.get("url", "").strip()
     goal = tool_input.get("goal", "").strip()
@@ -1125,51 +1125,13 @@ def _handle_fetch_web_content(
     # Activate parent so freeze_arc() can transition it
     _am.update_status(parent_id, "active")
 
-    # Create children via create_batch (handles Fernet keys, review_keys, etc.)
-    batch_result = arc_backend.handle_create_batch({
-        "arcs": [
-            {
-                "name": "Fetch web content",
-                "goal": (
-                    "Submit this EXACT code via submit_code "
-                    "(do not modify it):\n"
-                    "```python\n" + _FETCH_SCRIPT + "```\n"
-                    "The URL has been pre-set in arc state as 'fetch_url'."
-                ),
-                "parent_id": parent_id,
-                "integrity_level": "untrusted",
-                "output_type": "json",
-                "agent_type": "EXECUTOR",
-                "step_order": 0,
-            },
-            {
-                "name": "Review fetched content",
-                "goal": (
-                    f"Read the untrusted output from the fetch arc. "
-                    f"Extract the relevant information the user wanted: {goal}. "
-                    f"Store a clean summary in arc state under key '_agent_response'."
-                ),
-                "parent_id": parent_id,
-                "agent_type": "REVIEWER",
-                "integrity_level": "trusted",
-                "reviewer_profile": "security-reviewer",
-                "model_policy": "fast-chat",
-                "step_order": 1,
-            },
-            {
-                "name": "Validate review",
-                "goal": (
-                    "Validate that the reviewer's extraction is accurate and complete. "
-                    "Copy the final answer to arc state key '_agent_response'."
-                ),
-                "parent_id": parent_id,
-                "agent_type": "JUDGE",
-                "integrity_level": "trusted",
-                "reviewer_profile": "judge",
-                "step_order": 2,
-            },
-        ],
-    })
+    # Resolve the canonical fetch_web shape, parent the children, and
+    # delegate to the shared helper (handles Fernet keys, review_keys,
+    # arc_state wiring, batch invariants).
+    specs = render_shape("fetch_web", {"goal": goal})
+    for spec in specs:
+        spec["parent_id"] = parent_id
+    batch_result = create_untrusted_batch(specs, parent_id=parent_id)
 
     if "error" in batch_result:
         # Clean up the parent

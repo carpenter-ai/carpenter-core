@@ -231,6 +231,12 @@ def create_untrusted_batch(
     audit_events: list[tuple[int, str, dict]] = []
     created_ids: list[int] = []
 
+    # Resolve ``model_policy`` preset names *outside* the main transaction:
+    # ``get_or_create_model_policy`` opens its own connection, which would
+    # deadlock with an already-held write lock.
+    for spec in arc_specs:
+        _resolve_model_policy(spec)
+
     try:
         with db_transaction() as db:
             _assign_step_orders(db, arc_specs, effective_parent)
@@ -254,8 +260,6 @@ def create_untrusted_batch(
                         }
 
             for spec in arc_specs:
-                _resolve_model_policy(spec)
-
                 integrity_level = validate_integrity_level(
                     spec.get("integrity_level", "trusted")
                 )
