@@ -150,13 +150,22 @@ def _assign_step_orders(
             next_step += 1
 
 
-def _resolve_model_policy(spec: dict[str, Any]) -> None:
+def _resolve_model_policy(spec: dict[str, Any], _db_conn=None) -> None:
     """Resolve ``model_policy`` preset name to ``model_policy_id`` in place.
 
     Tries the selector-preset registry first (matching how
     ``template_manager.instantiate_template`` resolves presets); falls
     back to a DB lookup by policy name (matching the pre-refactor
     ``handle_create_batch`` behaviour).
+
+    Args:
+        spec: Arc spec dict; mutated in place on success.
+        _db_conn: Optional existing DB connection. Callers inside a
+            ``db_transaction()`` MUST pass their connection so the
+            write performed by ``get_or_create_model_policy`` happens on
+            the same connection as the surrounding transaction. Opening
+            a second connection while the outer transaction holds the
+            WAL write lock would deadlock until the 30 s SQLite timeout.
     """
     name = spec.get("model_policy")
     if not name or spec.get("model_policy_id") is not None:
@@ -173,6 +182,7 @@ def _resolve_model_policy(spec: dict[str, Any]) -> None:
                 max_tokens=preset.max_tokens,
                 policy_json=policy_json,
                 name=name,
+                _db_conn=_db_conn,
             )
             return
     except (ImportError, KeyError, ValueError, TypeError):
@@ -180,7 +190,7 @@ def _resolve_model_policy(spec: dict[str, Any]) -> None:
 
     # Legacy fallback: plain DB lookup by policy name.
     try:
-        policy_id = arc_manager.get_policy_id_by_name(name)
+        policy_id = arc_manager.get_policy_id_by_name(name, _db_conn=_db_conn)
         if policy_id is not None:
             spec["model_policy_id"] = policy_id
     except (sqlite3.Error, ValueError):
@@ -231,14 +241,14 @@ def create_untrusted_batch(
     audit_events: list[tuple[int, str, dict]] = []
     created_ids: list[int] = []
 
-    # Resolve ``model_policy`` preset names *outside* the main transaction:
-    # ``get_or_create_model_policy`` opens its own connection, which would
-    # deadlock with an already-held write lock.
-    for spec in arc_specs:
-        _resolve_model_policy(spec)
-
     try:
         with db_transaction() as db:
+            # Resolve ``model_policy`` preset names on the transaction's
+            # connection. Opening a second connection here would deadlock
+            # on the WAL write lock we already hold.
+            for spec in arc_specs:
+                _resolve_model_policy(spec, _db_conn=db)
+
             _assign_step_orders(db, arc_specs, effective_parent)
 
             # Validate judge step_order now that orders are assigned.

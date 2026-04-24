@@ -1580,15 +1580,25 @@ def list_read_grants(arc_id: int) -> list[dict]:
         return [dict(row) for row in rows]
 
 
-def get_policy_id_by_name(name: str) -> int | None:
+def get_policy_id_by_name(name: str, _db_conn=None) -> int | None:
     """Look up model_policy ID by name.
 
     Args:
         name: Policy preset name (e.g., "fast-chat", "careful-coding")
+        _db_conn: Optional existing DB connection. Callers inside a
+            ``db_transaction()`` should pass their connection so this
+            read reuses the transaction's snapshot rather than opening
+            a second connection.
 
     Returns:
         Policy ID or None if not found
     """
+    if _db_conn is not None:
+        row = _db_conn.execute(
+            "SELECT id FROM model_policies WHERE name = ?",
+            (name,)
+        ).fetchone()
+        return row["id"] if row else None
     with db_connection() as db:
         row = db.execute(
             "SELECT id FROM model_policies WHERE name = ?",
