@@ -57,13 +57,13 @@ class TestParentChildStateReads:
         from carpenter.db import get_db
 
         root = create_arc("root")
-        # Create an untrusted child directly via create_arc (bypassing add_child
-        # which would conflict on _allow_tainted kwarg)
-        child = arc_manager.create_arc(
+        # Create an untrusted child directly via the unchecked _insert_arc
+        # (the public create_arc rejects untrusted creation outside a
+        # batch-builder; we want a bare untrusted arc for this guard test).
+        child = arc_manager._insert_arc(
             name="untrusted-child",
             parent_id=root,
             integrity_level="untrusted",
-            _allow_tainted=True,
         )
 
         # Verify it IS a descendant

@@ -91,7 +91,6 @@ async def handle_reflection_trigger(work_id: int, payload: dict):
         name=f"{cadence}-reflection",
         goal=f"{cadence.title()} reflection",
         agent_type="PLANNER",
-        _allow_tainted=True,
     )
 
     # Create and link a conversation for the parent arc

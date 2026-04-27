@@ -149,6 +149,19 @@ class TestI4:
         with pytest.raises(ValueError, match="Cannot create individual untrusted arc"):
             arc_manager.create_arc("tainted", integrity_level="untrusted")
 
+    def test_create_arc_does_not_accept_allow_tainted_kwarg(self):
+        """I4: the legacy ``_allow_tainted`` bypass kwarg has been removed.
+
+        Internal batch-builders go through ``_insert_arc`` directly; no
+        public caller should be able to bypass the guard.
+        """
+        with pytest.raises(TypeError, match="_allow_tainted"):
+            arc_manager.create_arc(
+                "tainted",
+                integrity_level="untrusted",
+                _allow_tainted=True,  # type: ignore[call-arg]
+            )
+
     def test_batch_without_reviewer_rejected(self):
         """I4: create_batch with untrusted arc but no reviewers is rejected."""
         result = arc_backend.handle_create_batch({

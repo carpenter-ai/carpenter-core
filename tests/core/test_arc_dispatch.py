@@ -843,3 +843,134 @@ async def test_invoke_arc_agent_stores_response_text_as_fallback():
     assert stored == "Agent response text as fallback", (
         f"Expected response_text fallback, got: {stored!r}"
     )
+
+
+# ── _clone_arc_for_cron ────────────────────────────────────────────────
+
+class TestCloneArcForCron:
+    """Cron-clone must rebuild the review chain when children are non-trusted."""
+
+    def test_clone_trusted_planner_with_trusted_children(self):
+        """Trusted PLANNER with trusted children clones via per-arc create_arc."""
+        parent_id = arc_manager.create_arc(
+            "cron-root", goal="g", agent_type="PLANNER"
+        )
+        arc_manager.add_child(parent_id, "child1", goal="g1")
+        arc_manager.update_status(parent_id, "active")
+        arc_manager.update_status(parent_id, "completed")
+
+        original_info = arc_manager.get_arc(parent_id)
+        new_id = arc_dispatch_handler._clone_arc_for_cron(
+            parent_id, original_info, conversation_id=None
+        )
+        assert new_id is not None
+        new_arc = arc_manager.get_arc(new_id)
+        assert new_arc["parent_id"] is None
+        assert new_arc["integrity_level"] == "trusted"
+        children = arc_manager.get_children(new_id)
+        assert len(children) == 1
+        assert children[0]["name"] == "child1"
+
+    def test_clone_planner_with_untrusted_batch_rebuilds_review_chain(self):
+        """Cloning a PLANNER with EXECUTOR-untrusted+REVIEWER+JUDGE children
+        re-establishes Fernet keys and review-target arc_state via
+        create_untrusted_batch."""
+        from carpenter.core.trust.batch import create_untrusted_batch
+
+        parent_id = arc_manager.create_arc(
+            "cron-root", goal="g", agent_type="PLANNER"
+        )
+
+        # Build the original untrusted batch as children.
+        result = create_untrusted_batch(
+            [
+                {
+                    "name": "exec",
+                    "integrity_level": "untrusted",
+                    "agent_type": "EXECUTOR",
+                    "step_order": 0,
+                },
+                {
+                    "name": "reviewer",
+                    "integrity_level": "trusted",
+                    "agent_type": "REVIEWER",
+                    "reviewer_profile": "security-reviewer",
+                    "step_order": 1,
+                },
+                {
+                    "name": "judge",
+                    "integrity_level": "trusted",
+                    "agent_type": "JUDGE",
+                    "reviewer_profile": "security-reviewer",
+                    "step_order": 2,
+                },
+            ],
+            parent_id=parent_id,
+        )
+        assert "arc_ids" in result, result
+
+        # Mark parent completed so cron-clone path runs.
+        arc_manager.update_status(parent_id, "active")
+        arc_manager.update_status(parent_id, "completed")
+
+        original_info = arc_manager.get_arc(parent_id)
+        new_id = arc_dispatch_handler._clone_arc_for_cron(
+            parent_id, original_info, conversation_id=None
+        )
+        assert new_id is not None
+
+        children = arc_manager.get_children(new_id)
+        assert len(children) == 3
+        by_type = {c["agent_type"]: c for c in children}
+        assert "EXECUTOR" in by_type and "REVIEWER" in by_type and "JUDGE" in by_type
+        new_executor = by_type["EXECUTOR"]
+        new_reviewer = by_type["REVIEWER"]
+        new_judge = by_type["JUDGE"]
+        assert new_executor["integrity_level"] == "untrusted"
+
+        db = get_db()
+        try:
+            # Fernet keys exist for every (executor, reviewer-or-judge) pair.
+            rows = db.execute(
+                "SELECT reviewer_arc_id FROM review_keys WHERE target_arc_id = ?",
+                (new_executor["id"],),
+            ).fetchall()
+            reviewer_ids = {r["reviewer_arc_id"] for r in rows}
+            assert reviewer_ids == {new_reviewer["id"], new_judge["id"]}
+
+            # _reviewer_profile wired on REVIEWER + JUDGE.
+            for rid in (new_reviewer["id"], new_judge["id"]):
+                row = db.execute(
+                    "SELECT value_json FROM arc_state "
+                    "WHERE arc_id = ? AND key = '_reviewer_profile'",
+                    (rid,),
+                ).fetchone()
+                assert row is not None
+                assert json.loads(row["value_json"]) == "security-reviewer"
+
+            # _review_target points at the new EXECUTOR.
+            for rid in (new_reviewer["id"], new_judge["id"]):
+                row = db.execute(
+                    "SELECT value_json FROM arc_state "
+                    "WHERE arc_id = ? AND key = '_review_target'",
+                    (rid,),
+                ).fetchone()
+                assert row is not None
+                assert json.loads(row["value_json"]) == new_executor["id"]
+        finally:
+            db.close()
+
+    def test_clone_rejects_untrusted_root(self):
+        """An untrusted root cannot be cloned: standalone untrusted arcs
+        cannot have a sibling reviewer chain."""
+        original_info = {
+            "name": "tainted-root",
+            "goal": "g",
+            "integrity_level": "untrusted",
+            "output_type": "text",
+            "agent_type": "EXECUTOR",
+        }
+        new_id = arc_dispatch_handler._clone_arc_for_cron(
+            999, original_info, conversation_id=None
+        )
+        assert new_id is None

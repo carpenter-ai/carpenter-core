@@ -69,7 +69,9 @@ one REVIEWER or JUDGE arc is included.
 
 **Enforcement:**
 - `core/arc_manager.py` `create_arc()` — raises `ValueError` when
-  `integrity_level` is non-trusted and `_allow_tainted` is False.
+  `integrity_level` is non-trusted. Internal batch-builders use the
+  unchecked `_insert_arc` directly after running batch-level validation
+  (reviewer coverage, single judge, judge-highest-order).
 - `core/integrity.py` `is_non_trusted()` — returns True for both
   `constrained` and `untrusted` levels.
 - `tool_backends/arc.py` `handle_create_batch()` — validates batch includes

@@ -16,10 +16,11 @@ The canonical shape of an untrusted batch is:
 
 The helper enforces those invariants inside a single database
 transaction, materialises the arcs via
-:func:`carpenter.core.arcs.manager.create_arc` (using the existing
-``_allow_tainted`` kwarg to bypass the individual-untrusted guard), and
-wires up Fernet keys + ``_reviewer_profile`` / ``_review_target``
-``arc_state`` rows.
+:func:`carpenter.core.arcs.manager._insert_arc` (the unchecked
+counterpart to ``create_arc`` — safe here because the batch-level
+validation has already established the review chain the public guard
+exists to enforce), and wires up Fernet keys +
+``_reviewer_profile`` / ``_review_target`` ``arc_state`` rows.
 
 Callers should provide ``arc_specs`` with the same keys accepted by
 ``handle_create_batch``: ``name``, ``goal``, ``integrity_level``,
@@ -208,8 +209,8 @@ def create_untrusted_batch(
 
     1. Validates batch invariants (shared parent, reviewer coverage,
        at most one judge, judge-highest-order).
-    2. Creates each arc via :func:`arc_manager.create_arc`, passing
-       ``_allow_tainted=True`` for non-trusted specs.
+    2. Creates each arc via :func:`arc_manager._insert_arc` (the
+       unchecked sibling of ``create_arc``).
     3. For every ``(tainted_target, reviewer)`` pair, generates a
        Fernet key and inserts it into ``review_keys`` (if the
        ``cryptography`` library is available and encryption is
@@ -296,12 +297,15 @@ def create_untrusted_batch(
                 # create an agent_config_id for reviewers, which the
                 # original batch handler avoided.
 
-                arc_id = arc_manager.create_arc(
+                # Bypass the public guard: the batch-level validation
+                # above (reviewer coverage, single judge, judge highest
+                # order) has already established the review chain that
+                # the guard exists to enforce.
+                arc_id = arc_manager._insert_arc(
                     name=spec.get("name", ""),
                     goal=spec.get("goal"),
                     parent_id=spec.get("parent_id"),
                     step_order=spec["step_order"],
-                    _allow_tainted=is_non_trusted(integrity_level),
                     _db_conn=db,
                     _audit_queue=audit_events,
                     **kwargs,

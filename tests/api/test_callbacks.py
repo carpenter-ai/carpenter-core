@@ -193,7 +193,13 @@ class TestCallerArcIdInjection:
 
 
 class TestTaintedConversationForcesArcTaint:
-    """Verify that arc.create from a tainted conversation forces integrity_level='untrusted'."""
+    """Verify that arc.create / arc.add_child from a tainted conversation are rejected.
+
+    Earlier behaviour silently promoted ``integrity_level`` to ``untrusted``
+    and bypassed the individual-untrusted guard, producing orphan tainted
+    arcs with no reviewer/judge chain. The new contract is to reject the
+    call and force the caller onto ``arc.create_batch``.
+    """
 
     def _create_tainted_session(self, session_id="tainted-session"):
         """Create a reviewed session linked to a tainted conversation."""
@@ -276,37 +282,32 @@ class TestTaintedConversationForcesArcTaint:
             db.close()
         return session_id
 
-    def test_tainted_conversation_forces_taint_on_arc_create(self):
-        """arc.create from tainted conversation overrides trusted -> untrusted."""
+    def test_tainted_conversation_rejects_arc_create(self):
+        """arc.create from tainted conversation is rejected with a pointer
+        to arc.create_batch."""
         session_id = self._create_tainted_session("taint-create")
 
-        result = validate_and_dispatch(
-            "arc.create",
-            {"name": "new-arc", "integrity_level": "trusted"},
-            session_id=session_id,
-        )
-        arc_id = result["arc_id"]
+        with pytest.raises(DispatchError, match="arc.create_batch"):
+            validate_and_dispatch(
+                "arc.create",
+                {"name": "new-arc", "integrity_level": "trusted"},
+                session_id=session_id,
+            )
 
-        from carpenter.core.arcs import manager as arc_manager
-        arc = arc_manager.get_arc(arc_id)
-        assert arc["integrity_level"] == "untrusted"
-
-    def test_tainted_conversation_forces_taint_on_add_child(self):
-        """arc.add_child from tainted conversation overrides trusted -> untrusted."""
+    def test_tainted_conversation_rejects_add_child(self):
+        """arc.add_child from tainted conversation is rejected."""
         from carpenter.core.arcs import manager as arc_manager
         parent_id = arc_manager.create_arc("parent")
 
         session_id = self._create_tainted_session("taint-child")
 
-        result = validate_and_dispatch(
-            "arc.add_child",
-            {"parent_id": parent_id, "name": "child", "integrity_level": "trusted"},
-            session_id=session_id,
-        )
-        child_id = result["arc_id"]
-
-        child = arc_manager.get_arc(child_id)
-        assert child["integrity_level"] == "untrusted"
+        with pytest.raises(DispatchError, match="arc.create_batch"):
+            validate_and_dispatch(
+                "arc.add_child",
+                {"parent_id": parent_id, "name": "child",
+                 "integrity_level": "trusted"},
+                session_id=session_id,
+            )
 
     def test_clean_conversation_preserves_requested_integrity_level(self):
         """arc.create from clean conversation keeps requested integrity_level."""
@@ -323,20 +324,17 @@ class TestTaintedConversationForcesArcTaint:
         arc = arc_manager.get_arc(arc_id)
         assert arc["integrity_level"] == "trusted"
 
-    def test_tainted_conversation_allows_explicit_untrusted(self):
-        """arc.create requesting untrusted from tainted conversation keeps untrusted."""
+    def test_tainted_conversation_rejects_explicit_untrusted(self):
+        """Even when the caller explicitly requests untrusted, single-arc
+        creation is rejected — the review chain must come from a batch."""
         session_id = self._create_tainted_session("taint-explicit")
 
-        result = validate_and_dispatch(
-            "arc.create",
-            {"name": "untrusted-arc", "integrity_level": "untrusted"},
-            session_id=session_id,
-        )
-        arc_id = result["arc_id"]
-
-        from carpenter.core.arcs import manager as arc_manager
-        arc = arc_manager.get_arc(arc_id)
-        assert arc["integrity_level"] == "untrusted"
+        with pytest.raises(DispatchError, match="arc.create_batch"):
+            validate_and_dispatch(
+                "arc.create",
+                {"name": "untrusted-arc", "integrity_level": "untrusted"},
+                session_id=session_id,
+            )
 
 
 # --- Tool classification validation tests ---

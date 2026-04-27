@@ -13,16 +13,17 @@ def handle_create(params: dict) -> dict:
     """Create a new arc. Params: name, goal (opt), parent_id (opt),
     integrity_level (opt), output_type (opt), agent_type (opt),
     model (opt), model_role (opt), agent_role (opt), wait_until (opt),
-    model_policy_id (opt), _allow_tainted (opt)."""
+    model_policy_id (opt).
+
+    Untrusted arcs cannot be created via this entrypoint — use
+    arc.create_batch (handle_create_batch) so the reviewer + judge chain
+    is established atomically.
+    """
     kwargs = {}
     for key in ("integrity_level", "output_type", "agent_type", "model", "model_role",
                 "agent_role", "wait_until", "output_contract", "model_policy_id"):
         if key in params:
             kwargs[key] = params[key]
-
-    # Allow tainted arcs when explicitly permitted (e.g., from tainted conversations)
-    if params.get("_allow_tainted"):
-        kwargs["_allow_tainted"] = True
 
     arc_id = arc_manager.create_arc(
         name=params["name"],
@@ -37,14 +38,13 @@ def handle_add_child(params: dict) -> dict:
     """Add a child arc. Params: parent_id, name, goal (opt),
     integrity_level (opt), output_type (opt), agent_type (opt),
     model (opt), model_role (opt), agent_role (opt), wait_until (opt),
-    output_contract (opt), model_policy_id (opt), _allow_tainted (opt)."""
+    output_contract (opt), model_policy_id (opt)."""
     kwargs = {}
     for key in ("integrity_level", "output_type", "agent_type", "model", "model_role",
                 "agent_role", "wait_until", "output_contract", "model_policy_id"):
         if key in params:
             kwargs[key] = params[key]
 
-    # Note: add_child internally uses _allow_tainted for tainted children
     parent_id = params["parent_id"]
     child_id = arc_manager.add_child(
         parent_id=parent_id,
