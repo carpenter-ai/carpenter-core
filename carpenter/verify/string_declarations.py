@@ -58,7 +58,8 @@ def check_string_declarations(code: str) -> StringDeclarationResult:
                 snippet = snippet[:40] + "...'"
             violations.append(
                 f"Line {lineno}: untyped string literal {snippet} "
-                f"— wrap in Label(), URL(), etc."
+                f"— wrap in Label(), URL(), etc. "
+                f"(see KB: security/typed-declarations)"
             )
 
         elif isinstance(node, ast.JoinedStr):
@@ -70,7 +71,8 @@ def check_string_declarations(code: str) -> StringDeclarationResult:
             lineno = getattr(node, "lineno", "?")
             violations.append(
                 f"Line {lineno}: untyped f-string "
-                f"— wrap in Label(), UnstructuredText(), etc."
+                f"— wrap in Label(), UnstructuredText(), etc. "
+                f"(see KB: security/typed-declarations)"
             )
 
     return StringDeclarationResult(
