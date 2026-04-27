@@ -36,13 +36,46 @@ except ImportError:
     pass
 
 
-def get_db() -> sqlite3.Connection:
+# Thread-local marker indicating an active db_transaction() on this thread.
+# Defined at module level (above get_db) so the get_db guard can read it.
+_transaction_guard = threading.local()
+
+
+def get_db(*, _allow_during_transaction: bool = False) -> sqlite3.Connection:
     """Get a database connection with WAL mode and Row factory.
 
     If ``db_encryption_key`` is set in config and pysqlcipher3 is
     available, uses SQLCipher for at-rest encryption. Falls back to
     plain sqlite3 with a warning if pysqlcipher3 is not installed.
+
+    Raises:
+        RuntimeError: If called while a ``db_transaction()`` is active
+            on the same thread (without ``_allow_during_transaction``).
+            Opening a second connection inside a write transaction
+            deadlocks on SQLite's WAL writer lock until the 30-second
+            timeout. The fix is to pass the existing transaction's
+            connection through to the helper -- mirror the
+            ``_db_conn`` parameter pattern used by
+            ``carpenter.core.trust.batch._resolve_model_policy``.
+
+    Args:
+        _allow_during_transaction: Escape hatch for the rare case where
+            a genuinely separate read-only connection is desired while a
+            write transaction is in flight on the same thread. Use
+            sparingly; prefer threading the existing connection through.
     """
+    if (
+        not _allow_during_transaction
+        and getattr(_transaction_guard, "active", False)
+    ):
+        raise RuntimeError(
+            "get_db() called while a db_transaction() is active on this "
+            "thread. Opening a second connection inside the outer write "
+            "transaction will deadlock on SQLite's WAL writer lock until "
+            "the 30 s timeout. Pass the existing `db` connection through "
+            "to the helper instead -- mirror the `_db_conn` parameter "
+            "pattern in carpenter.core.trust.batch._resolve_model_policy."
+        )
     db_path = config.CONFIG["database_path"]
     encryption_key = config.CONFIG.get("db_encryption_key")
 
@@ -83,9 +116,6 @@ def db_connection():
         db.close()
 
 
-_transaction_guard = threading.local()
-
-
 @contextmanager
 def db_transaction():
     """Context manager that auto-commits on success, rolls back on exception.
@@ -107,8 +137,10 @@ def db_transaction():
             "Move the inner write operation outside the outer transaction, "
             "or pass the existing db connection explicitly."
         )
-    _transaction_guard.active = True
+    # Open the connection BEFORE flipping the guard, so this legitimate
+    # first connection isn't blocked by the get_db() guard.
     db = get_db()
+    _transaction_guard.active = True
     try:
         yield db
         db.commit()
@@ -116,8 +148,8 @@ def db_transaction():
         db.rollback()
         raise
     finally:
-        db.close()
         _transaction_guard.active = False
+        db.close()
 
 
 # Backward-compatible alias: some tests import _migrate from carpenter.db
