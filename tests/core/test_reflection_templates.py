@@ -89,7 +89,6 @@ def test_reflection_template_instantiation(reflection_template):
         "daily-reflection",
         goal="Daily reflection",
         agent_type="PLANNER",
-        _allow_tainted=True,
     )
     arc_ids = template_manager.instantiate_template(reflection_template, parent_id)
     assert len(arc_ids) == 2
@@ -211,7 +210,6 @@ def test_is_reflection_save_step_true(reflection_template):
         "daily-reflection",
         goal="Daily reflection",
         agent_type="PLANNER",
-        _allow_tainted=True,
     )
     arc_ids = template_manager.instantiate_template(reflection_template, parent_id)
 
@@ -245,7 +243,6 @@ def test_is_reflection_save_step_false_wrong_parent():
         "some-other-workflow",
         goal="Something else",
         agent_type="PLANNER",
-        _allow_tainted=True,
     )
     arc_info = {"name": "save-reflection", "from_template": True, "parent_id": parent_id}
     assert reflection_template_handler.is_reflection_save_step(arc_info) is False
@@ -260,7 +257,6 @@ async def test_save_reflection_reads_agent_response(reflection_template, _enable
         "daily-reflection",
         goal="Daily reflection",
         agent_type="PLANNER",
-        _allow_tainted=True,
     )
 
     # Store metadata on parent
@@ -335,7 +331,6 @@ async def test_save_reflection_no_response(reflection_template, _enable_reflecti
         "daily-reflection",
         goal="Daily reflection",
         agent_type="PLANNER",
-        _allow_tainted=True,
     )
 
     reflection_template_handler._set_arc_state(parent_id, "cadence", "daily")
@@ -452,7 +447,6 @@ async def test_daily_reflection_updates_model_speeds(
         "daily-reflection",
         goal="Daily reflection",
         agent_type="PLANNER",
-        _allow_tainted=True,
     )
 
     reflection_template_handler._set_arc_state(parent_id, "cadence", "daily")
@@ -514,7 +508,6 @@ async def test_auto_action_processing(
         "daily-reflection",
         goal="Daily reflection",
         agent_type="PLANNER",
-        _allow_tainted=True,
     )
 
     reflection_template_handler._set_arc_state(parent_id, "cadence", "daily")

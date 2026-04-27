@@ -107,7 +107,6 @@ def create_arc(
     output_contract: str | None = None,
     arc_role: str = "worker",
     verification_target_id: int | None = None,
-    _allow_tainted: bool = False,
     _db_conn=None,
     _audit_queue: list | None = None,
 ) -> int:
@@ -115,11 +114,15 @@ def create_arc(
 
     Auto-calculates depth from parent (parent.depth + 1, or 0 if root).
 
+    Rejects creation of non-trusted arcs: untrusted/constrained arcs must
+    be created via :func:`carpenter.core.trust.batch.create_untrusted_batch`
+    (or, internally, :func:`add_child` and :func:`_insert_arc`) so the
+    reviewer + judge chain is established atomically.
+
     Args:
         integrity_level: Integrity level ('trusted', 'constrained', 'untrusted').
         output_type: Expected output format ('python', 'text', 'json', 'unknown').
         agent_type: Agent role ('PLANNER', 'EXECUTOR', 'REVIEWER', 'CHAT').
-        _allow_tainted: Internal flag to allow untrusted arcs (for add_child use).
         _db_conn: Optional existing database connection (for batching).
         _audit_queue: Optional list to queue audit events instead of logging immediately.
 
@@ -132,13 +135,90 @@ def create_arc(
     output_type = validate_output_type(output_type)
     agent_type = validate_agent_type(agent_type)
 
-    # Reject individual non-trusted arc creation (must use batch creation)
-    # Exception: add_child() can create non-trusted children (batch validates reviewers)
-    if is_non_trusted(integrity_level) and not _allow_tainted:
+    # Reject individual non-trusted arc creation: untrusted arcs must be
+    # created via a batch-builder (create_untrusted_batch / add_child) so
+    # the reviewer + judge chain is wired atomically.
+    if is_non_trusted(integrity_level):
         raise ValueError(
             "Cannot create individual untrusted arc. Use arc.create_batch to create "
             "untrusted arcs with their required review arcs atomically."
         )
+
+    return _insert_arc(
+        name=name,
+        goal=goal,
+        parent_id=parent_id,
+        code_file_id=code_file_id,
+        template_id=template_id,
+        from_template=from_template,
+        template_mutable=template_mutable,
+        timeout_minutes=timeout_minutes,
+        step_order=step_order,
+        integrity_level=integrity_level,
+        output_type=output_type,
+        agent_type=agent_type,
+        model=model,
+        model_role=model_role,
+        agent_role=agent_role,
+        agent_model=agent_model,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        agent_config_id=agent_config_id,
+        model_policy_id=model_policy_id,
+        wait_until=wait_until,
+        output_contract=output_contract,
+        arc_role=arc_role,
+        verification_target_id=verification_target_id,
+        _db_conn=_db_conn,
+        _audit_queue=_audit_queue,
+    )
+
+
+def _insert_arc(
+    name: str,
+    goal: str | None = None,
+    parent_id: int | None = None,
+    code_file_id: int | None = None,
+    template_id: int | None = None,
+    from_template: bool = False,
+    template_mutable: bool = False,
+    timeout_minutes: int | None = None,
+    step_order: int = 0,
+    integrity_level: str = "trusted",
+    output_type: str = "python",
+    agent_type: str = "EXECUTOR",
+    model: str | None = None,
+    model_role: str | None = None,
+    agent_role: str | None = None,
+    agent_model: str | None = None,
+    temperature: float | None = None,
+    max_tokens: int | None = None,
+    agent_config_id: int | None = None,
+    model_policy_id: int | None = None,
+    wait_until: str | None = None,
+    output_contract: str | None = None,
+    arc_role: str = "worker",
+    verification_target_id: int | None = None,
+    _db_conn=None,
+    _audit_queue: list | None = None,
+) -> int:
+    """Internal: insert an arc row + history entry without the integrity guard.
+
+    Callers must already have validated that creating a non-trusted arc is
+    permissible (e.g. as part of a batch with a reviewer chain, or as a
+    child of an arc whose parent has validated the wider structure). External
+    code MUST go through :func:`create_arc` so the guard fires.
+
+    Performs the same model-config resolution, depth calculation, history
+    log, retry-state init, audit event, and root-enqueue side-effects as
+    the public ``create_arc`` used to.
+    """
+    from ..trust.types import validate_integrity_level, validate_output_type, validate_agent_type
+    from ..trust.integrity import is_non_trusted
+
+    integrity_level = validate_integrity_level(integrity_level)
+    output_type = validate_output_type(output_type)
+    agent_type = validate_agent_type(agent_type)
 
     # Resolve agent_model short identifier to provider:model_id
     if agent_model and not model:
@@ -357,15 +437,15 @@ def add_child(
             ),
         )
 
-        # Create the child arc within same transaction
-        from ..trust.integrity import is_non_trusted as _is_non_trusted
-        child_integrity = kwargs.get("integrity_level", "trusted")
-        child_id = create_arc(
+        # Create the child arc within same transaction.
+        # ``add_child`` is itself a batch-builder seam: the parent has
+        # validated the wider structure, so we go through ``_insert_arc``
+        # directly (which skips the individual-untrusted guard).
+        child_id = _insert_arc(
             name=name,
             goal=goal,
             parent_id=parent_id,
             step_order=step_order,
-            _allow_tainted=_is_non_trusted(child_integrity),
             _db_conn=db,  # Reuse connection
             _audit_queue=audit_queue,  # Share audit queue
             **kwargs,
