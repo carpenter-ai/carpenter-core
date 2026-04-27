@@ -885,8 +885,30 @@ def _clone_arc_for_cron(
     entanglement with the original arc's completed parent.
 
     If the original arc was a PLANNER with children, we also clone the
-    children so the recurring dispatch actually executes them.
+    children so the recurring dispatch actually executes them. When any
+    child is non-trusted, the children are re-materialised via
+    :func:`create_untrusted_batch` so the review chain (Fernet keys,
+    ``review_keys`` rows, ``_reviewer_profile`` / ``_review_target`` arc
+    state) is rebuilt — without this, cron repeats of untrusted workflows
+    silently produce orphan untrusted arcs.
+
+    The cron root itself must be trusted: an orphan untrusted arc with
+    ``parent_id=None`` cannot have a sibling reviewer chain, so the batch
+    invariant cannot be satisfied. If the original root is non-trusted we
+    log an error and bail out.
     """
+    from ..trust.integrity import is_non_trusted
+
+    if is_non_trusted(original_info.get("integrity_level", "trusted")):
+        logger.error(
+            "Cannot clone arc %d for cron repeat: root arc is non-trusted "
+            "(integrity_level=%r). A standalone untrusted root cannot have "
+            "a sibling reviewer chain. Rebuild the cron schedule so its "
+            "root is a trusted PLANNER with untrusted children.",
+            original_arc_id, original_info.get("integrity_level"),
+        )
+        return None
+
     try:
         new_arc_id = arc_manager.create_arc(
             name=original_info.get("name", f"cron-repeat-{original_arc_id}"),
@@ -897,7 +919,6 @@ def _clone_arc_for_cron(
             agent_type=original_info.get("agent_type", "EXECUTOR"),
             agent_config_id=original_info.get("agent_config_id"),
             timeout_minutes=original_info.get("timeout_minutes"),
-            _allow_tainted=True,  # Cron-spawned arcs may need untrusted level
         )
         if conversation_id:
             from ...agent.conversation import link_arc_to_conversation
@@ -908,20 +929,64 @@ def _clone_arc_for_cron(
         # without doing any work.
         original_children = arc_manager.get_children(original_arc_id)
         if original_children:
-            for child in original_children:
-                child_id = arc_manager.create_arc(
-                    name=child.get("name", "cloned-child"),
-                    goal=child.get("goal"),
-                    parent_id=new_arc_id,
-                    integrity_level=child.get("integrity_level", "trusted"),
-                    output_type=child.get("output_type", "python"),
-                    agent_type=child.get("agent_type", "EXECUTOR"),
-                    agent_config_id=child.get("agent_config_id"),
-                    timeout_minutes=child.get("timeout_minutes"),
-                    _allow_tainted=True,
+            has_untrusted = any(
+                is_non_trusted(c.get("integrity_level", "trusted"))
+                for c in original_children
+            )
+            if has_untrusted:
+                # Re-materialise the children atomically as a batch so the
+                # review chain (Fernet keys, review_keys rows, arc_state)
+                # is wired correctly.
+                from ..trust.batch import create_untrusted_batch
+
+                arc_specs = []
+                for child in original_children:
+                    spec: dict = {
+                        "name": child.get("name", "cloned-child"),
+                        "goal": child.get("goal"),
+                        "integrity_level": child.get("integrity_level", "trusted"),
+                        "output_type": child.get("output_type", "python"),
+                        "agent_type": child.get("agent_type", "EXECUTOR"),
+                        "step_order": child.get("step_order", 0),
+                    }
+                    if child.get("agent_config_id") is not None:
+                        spec["agent_config_id"] = child["agent_config_id"]
+                    if child.get("timeout_minutes") is not None:
+                        spec["timeout_minutes"] = child["timeout_minutes"]
+                    # Re-attach reviewer profile so JUDGE/REVIEWER arcs get
+                    # their `_reviewer_profile` arc_state row.
+                    rprofile = _read_reviewer_profile(child["id"])
+                    if rprofile is not None:
+                        spec["reviewer_profile"] = rprofile
+                    arc_specs.append(spec)
+
+                batch_result = create_untrusted_batch(
+                    arc_specs, parent_id=new_arc_id,
                 )
+                if "error" in batch_result:
+                    logger.error(
+                        "Failed to re-materialise untrusted batch for "
+                        "cron clone of arc %d: %s",
+                        original_arc_id, batch_result["error"],
+                    )
+                    return None
                 if conversation_id:
-                    link_arc_to_conversation(conversation_id, child_id)
+                    for child_id in batch_result["arc_ids"]:
+                        link_arc_to_conversation(conversation_id, child_id)
+            else:
+                for child in original_children:
+                    child_id = arc_manager.create_arc(
+                        name=child.get("name", "cloned-child"),
+                        goal=child.get("goal"),
+                        parent_id=new_arc_id,
+                        integrity_level=child.get("integrity_level", "trusted"),
+                        output_type=child.get("output_type", "python"),
+                        agent_type=child.get("agent_type", "EXECUTOR"),
+                        agent_config_id=child.get("agent_config_id"),
+                        timeout_minutes=child.get("timeout_minutes"),
+                    )
+                    if conversation_id:
+                        link_arc_to_conversation(conversation_id, child_id)
 
         logger.info(
             "Cloned completed arc %d -> new arc %d for cron repeat "
@@ -933,6 +998,22 @@ def _clone_arc_for_cron(
         logger.exception(
             "Failed to clone arc %d for cron repeat", original_arc_id
         )
+        return None
+
+
+def _read_reviewer_profile(arc_id: int) -> str | None:
+    """Read the `_reviewer_profile` arc_state value for an arc, if any."""
+    try:
+        with db_connection() as db:
+            row = db.execute(
+                "SELECT value_json FROM arc_state "
+                "WHERE arc_id = ? AND key = '_reviewer_profile'",
+                (arc_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            return json.loads(row["value_json"])
+    except (sqlite3.Error, ValueError, json.JSONDecodeError):
         return None
 
 
