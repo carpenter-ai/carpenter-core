@@ -174,14 +174,24 @@ def validate_and_dispatch(
                 f"arc (current: {caller_ctx['integrity_level']})"
             )
 
-    # ── Tainted conversation forces untrusted on arc creation ───────
+    # ── Tainted conversation rejects single-arc creation ────────────
+    # Untrusted output must flow through a reviewer + judge chain. A bare
+    # arc.create / arc.add_child cannot establish that chain, so silently
+    # promoting it to untrusted produced an orphan tainted arc with no
+    # review wiring. Force callers onto arc.create_batch instead.
     if tool_name in ("arc.create", "arc.add_child"):
         if _is_session_conversation_tainted(session_id):
-            requested_integrity = params.get("integrity_level", "trusted")
-            if requested_integrity == "trusted":
-                params["integrity_level"] = "untrusted"
-            if params.get("integrity_level") == "untrusted":
-                params["_allow_tainted"] = True
+            _arc = params.get("_caller_arc_id") or params.get("arc_id")
+            log_trust_event(_arc, "access_denied", {
+                "tool": tool_name,
+                "reason": "tainted conversation requires arc.create_batch",
+            })
+            raise DispatchError(
+                "Tainted conversations cannot create individual arcs. "
+                "Untrusted output must be validated by a reviewer + "
+                "judge chain. Use arc.create_batch with EXECUTOR + "
+                "REVIEWER + JUDGE."
+            )
 
     if tool_name == "arc.create_batch":
         if _is_session_conversation_tainted(session_id):
