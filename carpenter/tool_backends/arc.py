@@ -2,21 +2,11 @@
 import json
 import logging
 import sqlite3
-from datetime import datetime, timezone
 from ..core.arcs import CODING_CHANGE_PREFIX, manager as arc_manager
-from ..core.trust.types import validate_integrity_level, validate_output_type, validate_agent_type
-from ..core.trust.audit import log_trust_event
 from ..db import get_db, db_connection, db_transaction
 from .. import config
 
 logger = logging.getLogger(__name__)
-
-# Import Fernet for encryption key generation
-try:
-    from cryptography.fernet import Fernet
-    HAS_CRYPTOGRAPHY = True
-except ImportError:
-    HAS_CRYPTOGRAPHY = False
 
 
 def handle_create(params: dict) -> dict:
@@ -247,219 +237,20 @@ def handle_create_batch(params: dict) -> dict:
     Returns:
         {"arc_ids": [list of created arc IDs]} or {"error": "message"}
     """
+    from ..core.trust.batch import create_untrusted_batch
+
     arcs_list = params.get("arcs", [])
     if not arcs_list:
         return {"error": "No arcs provided"}
 
-    # Validation 1: Check parent_id consistency
+    # Derive effective parent for the PLANNER-hint (below). The helper
+    # re-validates parent_id consistency itself.
     parent_ids = {arc.get("parent_id") for arc in arcs_list}
-    if len(parent_ids) > 1:
-        return {"error": "All arcs must have the same parent_id"}
+    parent_id = parent_ids.pop() if len(parent_ids) == 1 else None
 
-    parent_id = parent_ids.pop() if parent_ids else None
-
-    # Load agent roles from config
-    agent_roles = config.CONFIG.get("agent_roles", {})
-
-    # Validation 2: Check agent roles exist for reviewer/judge arcs
-    for arc_spec in arcs_list:
-        agent_type = arc_spec.get("agent_type", "EXECUTOR")
-        if agent_type in ("REVIEWER", "JUDGE"):
-            role_name = arc_spec.get("reviewer_profile") or arc_spec.get("agent_role")
-            if not role_name:
-                return {
-                    "error": f"Arc '{arc_spec.get('name')}' is {agent_type} but missing agent_role/reviewer_profile"
-                }
-            if role_name not in agent_roles:
-                return {
-                    "error": f"Unknown agent_role '{role_name}' for arc '{arc_spec.get('name')}'"
-                }
-
-    # Validation 3 & 4: Check non-trusted arcs have reviewers and max one judge
-    from carpenter.core.trust.integrity import is_non_trusted
-    tainted_arcs = [a for a in arcs_list if is_non_trusted(a.get("integrity_level", "trusted"))]
-    reviewer_arcs = [
-        a for a in arcs_list
-        if a.get("agent_type") in ("REVIEWER", "JUDGE")
-    ]
-    judge_arcs = [a for a in arcs_list if a.get("agent_type") == "JUDGE"]
-
-    if tainted_arcs and not reviewer_arcs:
-        return {"error": "Untrusted arcs require at least one REVIEWER or JUDGE arc"}
-
-    if len(judge_arcs) > 1:
-        return {"error": "Maximum one JUDGE arc allowed per batch"}
-
-    # Auto-assign step_order if not provided
-    with db_transaction() as db:
-        try:
-            # Get max existing step_order for parent
-            if parent_id is not None:
-                row = db.execute(
-                    "SELECT COALESCE(MAX(step_order), -1) AS max_order "
-                    "FROM arcs WHERE parent_id = ?",
-                    (parent_id,),
-                ).fetchone()
-                next_step = row["max_order"] + 1
-            else:
-                next_step = 0
-
-            # Assign step_order to arcs that don't have one
-            for arc_spec in arcs_list:
-                if "step_order" not in arc_spec or arc_spec["step_order"] is None:
-                    arc_spec["step_order"] = next_step
-                    next_step += 1
-
-            # Validation 5: Judge must have highest step_order among reviewers
-            if judge_arcs:
-                judge = judge_arcs[0]
-                judge_order = judge["step_order"]
-                for reviewer in reviewer_arcs:
-                    if reviewer is not judge and reviewer["step_order"] >= judge_order:
-                        return {
-                            "error": "JUDGE must have highest step_order among all reviewer/judge arcs"
-                        }
-
-            # All validations passed — create arcs in transaction
-            created_ids = []
-            audit_events = []  # Collect audit events to log after commit
-            now = datetime.now(timezone.utc).isoformat()
-
-            for idx, arc_spec in enumerate(arcs_list):
-                # Validate and normalize trust types
-                integrity_level = validate_integrity_level(arc_spec.get("integrity_level", "trusted"))
-                output_type = validate_output_type(arc_spec.get("output_type", "python"))
-                agent_type = validate_agent_type(arc_spec.get("agent_type", "EXECUTOR"))
-
-                # Calculate depth
-                depth = 0
-                if parent_id is not None:
-                    parent = db.execute(
-                        "SELECT depth FROM arcs WHERE id = ?", (parent_id,)
-                    ).fetchone()
-                    if parent is not None:
-                        depth = parent["depth"] + 1
-
-                # Resolve model_policy_id (by name or direct ID)
-                policy_id = arc_spec.get("model_policy_id")
-                if policy_id is None and arc_spec.get("model_policy"):
-                    policy_id = arc_manager.get_policy_id_by_name(
-                        arc_spec["model_policy"]
-                    )
-
-                # Insert arc
-                cursor = db.execute(
-                    "INSERT INTO arcs "
-                    "(name, goal, parent_id, step_order, depth, "
-                    " integrity_level, output_type, agent_type, "
-                    " model_policy_id, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        arc_spec.get("name", ""),
-                        arc_spec.get("goal"),
-                        parent_id,
-                        arc_spec["step_order"],
-                        depth,
-                        integrity_level,
-                        output_type,
-                        agent_type,
-                        policy_id,
-                        now,
-                    ),
-                )
-                arc_id = cursor.lastrowid
-                created_ids.append(arc_id)
-
-                # Log creation history
-                db.execute(
-                    "INSERT INTO arc_history (arc_id, entry_type, content_json, actor) "
-                    "VALUES (?, ?, ?, ?)",
-                    (
-                        arc_id,
-                        "created",
-                        json.dumps({"name": arc_spec.get("name", ""), "goal": arc_spec.get("goal")}),
-                        "system",
-                    ),
-                )
-
-                # Store reviewer_profile in arc_state if provided
-                if arc_spec.get("reviewer_profile"):
-                    db.execute(
-                        "INSERT INTO arc_state (arc_id, key, value_json) VALUES (?, ?, ?)",
-                        (arc_id, "_reviewer_profile", json.dumps(arc_spec["reviewer_profile"])),
-                    )
-
-            # Collect reviewer and tainted indices for post-processing
-            reviewer_indices = [i for i, spec in enumerate(arcs_list) if spec.get("agent_type") in ("REVIEWER", "JUDGE")]
-            tainted_indices = [i for i, spec in enumerate(arcs_list) if is_non_trusted(spec.get("integrity_level", "trusted"))]
-
-            # Generate Fernet encryption keys for tainted arcs and link reviewers
-            for tainted_idx in tainted_indices:
-                tainted_arc_id = created_ids[tainted_idx]
-
-                # Collect all reviewer arc IDs for this tainted arc
-                reviewer_ids = [created_ids[i] for i in reviewer_indices]
-
-                # Generate and store encryption key for all reviewers (inline to avoid nested transactions)
-                if reviewer_ids:
-                    if not HAS_CRYPTOGRAPHY:
-                        # Check if encryption is enforced
-                        enforce_encryption = config.CONFIG.get("encryption", {}).get("enforce", True)
-                        if enforce_encryption:
-                            db.rollback()
-                            raise RuntimeError(
-                                "Cannot create tainted arc: cryptography library is not available. "
-                                "Encryption is required for tainted arc output (encryption.enforce=true). "
-                                "Install with: pip install cryptography>=41.0 "
-                                "Or set encryption.enforce=false in config.yaml to allow plaintext fallback."
-                            )
-                        else:
-                            logger.warning(
-                                "cryptography library not available - cannot encrypt arc %d output. "
-                                "Install with: pip install cryptography>=41.0",
-                                tainted_arc_id
-                            )
-                            audit_events.append((tainted_arc_id, "encryption_unavailable", {
-                                "reason": "cryptography_library_missing",
-                                "reviewer_count": len(reviewer_ids),
-                            }))
-                    else:
-                        key = Fernet.generate_key()
-                        for reviewer_id in reviewer_ids:
-                            db.execute(
-                                "INSERT INTO review_keys "
-                                "(target_arc_id, reviewer_arc_id, fernet_key_encrypted) "
-                                "VALUES (?, ?, ?) "
-                                "ON CONFLICT(target_arc_id, reviewer_arc_id) "
-                                "DO UPDATE SET fernet_key_encrypted = excluded.fernet_key_encrypted",
-                                (tainted_arc_id, reviewer_id, key),
-                            )
-                        # Queue audit event for after commit
-                        audit_events.append((tainted_arc_id, "encryption_key_created", {
-                            "reviewer_count": len(reviewer_ids),
-                        }))
-
-                # Link all reviewers to this tainted arc
-                for reviewer_idx in reviewer_indices:
-                    reviewer_arc_id = created_ids[reviewer_idx]
-                    db.execute(
-                        "INSERT INTO arc_state (arc_id, key, value_json) VALUES (?, ?, ?)",
-                        (reviewer_arc_id, "_review_target", json.dumps(tainted_arc_id)),
-                    )
-
-
-        except Exception as e:  # broad catch: batch arc creation involves many operations
-            db.rollback()
-            return {"error": str(e)}
-
-    # Post-commit: log audit events (outside transaction to avoid nested writes)
-    for arc_id, event_type, details in audit_events:
-        try:
-            log_trust_event(arc_id, event_type, details)
-        except (ImportError, sqlite3.Error) as _exc:
-            pass  # Don't fail the batch creation over audit logging
-
-    result = {"arc_ids": created_ids}
+    result = create_untrusted_batch(arcs_list, parent_id=parent_id)
+    if "error" in result:
+        return result
 
     # Platform hint: suggest PLANNER root when batch-creating children under non-PLANNER
     if parent_id is not None:
@@ -477,10 +268,12 @@ def handle_create_batch(params: dict) -> dict:
                         "it gives the escalation system a meaningful target "
                         "when children fail. See skills/planner-root in the knowledge base."
                     )
-        except (sqlite3.Error, KeyError, ValueError) as _exc:
+        except (sqlite3.Error, KeyError, ValueError):
             pass  # Don't fail batch creation over hint logic
 
     return result
+
+
 
 
 def handle_request_ai_review(params: dict) -> dict:
