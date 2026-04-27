@@ -218,44 +218,68 @@ def _normalize_value(policy_type: str, value: str) -> str:
 _singleton: SecurityPolicies | None = None
 
 
-def get_policies() -> SecurityPolicies:
+def get_policies(_db_conn=None) -> SecurityPolicies:
     """Return the module-level SecurityPolicies singleton.
 
     Creates a fresh instance on first call. Call reload_policies()
     to refresh from DB after policy changes.
+
+    Args:
+        _db_conn: Optional existing DB connection. Callers inside a
+            ``db_transaction()`` MUST pass their connection so the
+            first-call ``_load_from_db()`` doesn't open a second
+            connection (which would deadlock on SQLite's WAL writer
+            lock until the 30 s timeout).
     """
     global _singleton
     if _singleton is None:
         _singleton = SecurityPolicies()
-        _load_from_db(_singleton)
+        _load_from_db(_singleton, _db_conn=_db_conn)
         _load_from_config(_singleton)
     return _singleton
 
 
-def reload_policies() -> SecurityPolicies:
-    """Recreate the singleton from DB + config. Returns the new instance."""
+def reload_policies(_db_conn=None) -> SecurityPolicies:
+    """Recreate the singleton from DB + config. Returns the new instance.
+
+    Args:
+        _db_conn: Optional existing DB connection (see ``get_policies``).
+    """
     global _singleton
     _singleton = SecurityPolicies()
-    _load_from_db(_singleton)
+    _load_from_db(_singleton, _db_conn=_db_conn)
     _load_from_config(_singleton)
     return _singleton
 
 
-def _load_from_db(policies: SecurityPolicies) -> None:
-    """Load policies from security_policies DB table."""
+def _load_from_db(policies: SecurityPolicies, _db_conn=None) -> None:
+    """Load policies from security_policies DB table.
+
+    Args:
+        policies: SecurityPolicies instance to populate.
+        _db_conn: Optional existing DB connection. When provided,
+            the function uses it directly instead of opening a new
+            one. Required when called from inside a ``db_transaction()``
+            on the same thread.
+    """
     try:
-        from ..db import get_db, db_connection
-        with db_connection() as db:
-            rows = db.execute(
+        from ..db import db_connection
+        if _db_conn is not None:
+            rows = _db_conn.execute(
                 "SELECT policy_type, value FROM security_policies"
             ).fetchall()
-            for row in rows:
-                try:
-                    policies.add(row["policy_type"], row["value"])
-                except ValueError:
-                    logger.warning(
-                        "Skipping unknown policy type '%s' from DB", row["policy_type"]
-                    )
+        else:
+            with db_connection() as db:
+                rows = db.execute(
+                    "SELECT policy_type, value FROM security_policies"
+                ).fetchall()
+        for row in rows:
+            try:
+                policies.add(row["policy_type"], row["value"])
+            except ValueError:
+                logger.warning(
+                    "Skipping unknown policy type '%s' from DB", row["policy_type"]
+                )
     except (sqlite3.Error, KeyError, ValueError) as _exc:
         logger.debug("Could not load policies from DB (table may not exist yet)")
 

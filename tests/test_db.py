@@ -121,3 +121,81 @@ def test_sqlcipher_fallback_warns_when_unavailable(monkeypatch, caplog):
             conn.close()
 
     assert "pysqlcipher3 is not installed" in caplog.text
+
+
+class TestGetDbTransactionGuard:
+    """Verify get_db() refuses to open a 2nd connection inside db_transaction().
+
+    Regression test for the deadlock class fixed in PR #4 / commit 313271cc:
+    a function called inside a `with db_transaction() as db:` block that
+    calls `get_db()` (instead of receiving the existing connection)
+    deadlocks on SQLite's WAL writer lock until the 30 s timeout. The
+    guard turns that into an immediate, clearly-explained RuntimeError.
+    """
+
+    def test_get_db_raises_inside_db_transaction(self, test_db):
+        """get_db() inside db_transaction() raises RuntimeError immediately."""
+        from carpenter.db import db_transaction, get_db
+
+        with pytest.raises(RuntimeError) as excinfo:
+            with db_transaction() as _db:
+                # This is the bug: a helper that opens a fresh connection
+                # while the transaction holds the writer lock.
+                _ = get_db()
+
+        msg = str(excinfo.value)
+        assert "db_transaction()" in msg
+        assert "deadlock" in msg.lower()
+        # Points the reader at the canonical fix.
+        assert "_db_conn" in msg
+
+    def test_db_connection_raises_inside_db_transaction(self, test_db):
+        """db_connection() (which wraps get_db) also trips the guard."""
+        from carpenter.db import db_transaction, db_connection
+
+        with pytest.raises(RuntimeError):
+            with db_transaction() as _db:
+                with db_connection() as _:
+                    pass
+
+    def test_allow_during_transaction_opt_out(self, test_db):
+        """The escape hatch lets callers explicitly bypass the guard."""
+        from carpenter.db import db_transaction, get_db
+
+        with db_transaction() as _db:
+            conn = get_db(_allow_during_transaction=True)
+            try:
+                # Read-only query is fine; we don't actually exercise the
+                # writer lock here -- this just proves the opt-out works.
+                conn.execute("SELECT 1").fetchone()
+            finally:
+                conn.close()
+
+    def test_guard_clears_after_transaction_exit(self, test_db):
+        """After db_transaction() exits, get_db() works normally again."""
+        from carpenter.db import db_transaction, get_db
+
+        with db_transaction() as _db:
+            pass
+
+        conn = get_db()
+        try:
+            assert conn.execute("SELECT 1").fetchone()[0] == 1
+        finally:
+            conn.close()
+
+    def test_guard_clears_after_transaction_exception(self, test_db):
+        """An exception inside db_transaction() still clears the guard."""
+        from carpenter.db import db_transaction, get_db
+
+        with pytest.raises(ValueError):
+            with db_transaction() as _db:
+                raise ValueError("boom")
+
+        # Guard must be reset, otherwise every subsequent get_db() on this
+        # thread would falsely report nested-transaction.
+        conn = get_db()
+        try:
+            assert conn.execute("SELECT 1").fetchone()[0] == 1
+        finally:
+            conn.close()

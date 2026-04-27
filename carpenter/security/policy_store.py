@@ -29,8 +29,10 @@ def add_to_allowlist(policy_type: str, value: str) -> int:
             _increment_version(db)
         row_id = cursor.lastrowid
 
-        # Update in-memory singleton
-        policies = get_policies()
+        # Update in-memory singleton -- pass the existing connection so a
+        # cold first-call get_policies() doesn't try to open a second
+        # connection while we hold the WAL writer lock.
+        policies = get_policies(_db_conn=db)
         policies.add(policy_type, value)
 
         return row_id
@@ -48,8 +50,8 @@ def remove_from_allowlist(policy_type: str, value: str) -> bool:
             _increment_version(db)
         removed = cursor.rowcount > 0
 
-        # Update in-memory singleton
-        policies = get_policies()
+        # Update in-memory singleton (see add_to_allowlist for rationale).
+        policies = get_policies(_db_conn=db)
         policies.remove(policy_type, value)
 
         return removed
@@ -102,8 +104,8 @@ def clear_allowlist(policy_type: str) -> int:
         if cursor.rowcount > 0:
             _increment_version(db)
 
-        # Update in-memory singleton
-        policies = get_policies()
+        # Update in-memory singleton (see add_to_allowlist for rationale).
+        policies = get_policies(_db_conn=db)
         policies.clear(policy_type)
 
         return cursor.rowcount
