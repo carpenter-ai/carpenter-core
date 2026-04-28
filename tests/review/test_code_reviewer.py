@@ -106,7 +106,7 @@ class TestGetReviewerModel:
         monkeypatch.setattr(config, "CONFIG", current)
 
         result = get_reviewer_model()
-        assert result == "anthropic:claude-sonnet-4-5-20250929"
+        assert result == "anthropic:claude-sonnet-4-6"
 
 
 # --- _parse_review_response ---
