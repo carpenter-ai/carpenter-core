@@ -34,7 +34,7 @@ def test_load_writing_repo_template(tmp_path):
 def test_load_templates_from_dir(tmp_path):
     templates_dir = _copy_templates(tmp_path)
     count = template_manager.load_templates_from_dir(templates_dir)
-    assert count == 8
+    assert count == 9
     templates = template_manager.list_templates()
     names = [t["name"] for t in templates]
     assert "writing-repo-change" in names
@@ -43,6 +43,7 @@ def test_load_templates_from_dir(tmp_path):
     assert "external-coding-change" in names
     assert "pr-review" in names
     assert "reflection" in names
+    assert "fetch_web" in names
 
 
 def test_find_template_for_resource(tmp_path):

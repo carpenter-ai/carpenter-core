@@ -1,16 +1,16 @@
 """Pre-flight verifier for ``config_seed/templates/*.yaml`` content.
 
-The shape registry (``carpenter.core.trust.untrusted_shapes``) exists
-because the existing template loader cannot tell at parse time whether
-a YAML step authored an untrusted EXECUTOR without the mandatory
+Historically, raw ``integrity_level: untrusted`` in a YAML step was
+unsafe because the template loader could not tell at parse time
+whether the step authored an untrusted EXECUTOR without the mandatory
 REVIEWER + JUDGE siblings, the right ``output_type``, and a registered
-reviewer profile.  Until that gap was closed, raw
-``integrity_level: untrusted`` in YAML was unsafe — so the registry
-(Python-only) became the single audited path.
+reviewer profile.  A parallel Python-only "shape registry" provided
+the only audited path until this verifier closed the gap; the
+registry has since been removed (Phase 2 — see ``fetch_web.yaml``).
 
-This verifier closes the gap.  It runs at coding time on the YAML
-*as text* (so line numbers in findings match what the agent sees in its
-editor) and enforces:
+This verifier runs at coding time on the YAML *as text* (so line
+numbers in findings match what the agent sees in its editor) and
+enforces:
 
 1.  **Schema**: top-level keys are recognised; ``steps`` is a list;
     each step has the required fields.
@@ -29,14 +29,10 @@ editor) and enforces:
     cleaner finding here).
 5.  **Goal-placeholder safety**: ``$placeholder`` substitution in a
     step's ``description``/``goal`` is allowed but flagged-with-context
-    if it lands inside a triple-backtick fenced block.  Same logic as
-    ``render_shape`` — a ``$`` inside fenced code can be rebound by
-    the caller's bindings dict and inject text into the agent's
-    instructions.
-
-Phase 2 will port the ``fetch_web`` shape to a YAML template that
-opts into ``integrity_level: untrusted`` directly.  This verifier is
-the safety net that lets that happen.
+    if it lands inside a triple-backtick fenced block.  A ``$`` inside
+    fenced code can be rebound by the caller's bindings dict and
+    inject text into the agent's instructions; flagging surfaces the
+    risk without blocking authors who have validated their bindings.
 """
 
 from __future__ import annotations
@@ -65,7 +61,6 @@ _VALID_STEP_KEYS = frozenset({
     "model", "model_role", "agent_model", "model_policy", "model_policy_id",
     "model_min_tier", "mutable", "template_mutable",
     "capabilities", "activation_event", "required_pass",
-    "untrusted_shape",
 })
 
 _VALID_AGENT_TYPES = frozenset({
@@ -677,7 +672,8 @@ def _step_order(step: dict, fallback: int) -> int:
 # default pattern.  We deliberately do NOT match a lone ``$`` or ``$$``.
 _PLACEHOLDER_RE = re.compile(r"\$(\{[A-Za-z_][A-Za-z0-9_]*\}|[A-Za-z_][A-Za-z0-9_]*)")
 
-# A triple-backtick fence, matching the convention in ``untrusted_shapes._FETCH_SCRIPT``.
+# A triple-backtick fence, matching the convention in
+# ``invocation._FETCH_SCRIPT`` and ``fetch_web.yaml``.
 _FENCE_RE = re.compile(r"```")
 
 

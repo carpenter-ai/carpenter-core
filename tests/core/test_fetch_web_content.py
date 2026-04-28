@@ -1,14 +1,33 @@
 """Tests for the fetch_web_content chat tool and arc.create_batch linking."""
 
 import json
+import os
 from unittest.mock import patch, MagicMock
 
 import pytest
 
 from carpenter.core.arcs import manager as arc_manager
+from carpenter.core.engine import template_manager
 from carpenter.agent import conversation
 from carpenter.agent.invocation import _handle_fetch_web_content
 from carpenter.db import get_db
+
+
+_FETCH_WEB_YAML_PATH = os.path.join(
+    os.path.dirname(__file__), "..", "..",
+    "config_seed", "templates", "fetch_web.yaml",
+)
+
+
+@pytest.fixture(autouse=True)
+def _load_fetch_web_template():
+    """Ensure the fetch_web template row exists in this test's isolated DB.
+
+    Production loads templates at coordinator startup; tests run with
+    an empty DB so we have to load it explicitly here.
+    """
+    template_manager.load_template(_FETCH_WEB_YAML_PATH)
+    yield
 
 
 def test_fetch_web_content_creates_parent_and_children():

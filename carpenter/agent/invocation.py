@@ -1071,14 +1071,22 @@ def _handle_escalate(
     return f"Escalated to {next_model}. Arc #{new_arc_id} created. This arc is now frozen."
 
 
-# The pre-verified fetch script and the reviewer/judge wiring now live
-# in ``carpenter.core.trust.untrusted_shapes`` under the ``fetch_web``
-# preset.  This function is the sole runtime caller; YAML templates get
-# the same shape via ``untrusted_shape: fetch_web``.
-#
-# ``_FETCH_SCRIPT`` is re-exported here for backwards compatibility —
-# tests and verified_code_hashes tooling import it from this module.
-from ..core.trust.untrusted_shapes import _FETCH_SCRIPT  # noqa: E402,F401
+# The pre-verified fetch script the EXECUTOR is told to ``submit_code``
+# for.  Kept as a module-level constant so dry-run / verified-hash
+# tooling and ``test_fetch_script_runs_in_restricted_sandbox`` can
+# import it directly.  The text is duplicated in
+# ``config_seed/templates/fetch_web.yaml`` (the runtime authoring
+# source); they MUST stay in sync — the verifier in
+# ``carpenter/verify/yaml_template.py`` plus the regression test in
+# ``tests/core/test_fetch_web_template.py`` enforce that the runtime
+# arc batch matches the shipped template.
+_FETCH_SCRIPT = """\
+from carpenter_tools.declarations import Label
+url_result = dispatch(Label("state.get"), {"key": Label("fetch_url")})
+url = url_result[Label("value")]
+result = dispatch(Label("web.fetch_webpage"), {"url": url})
+dispatch(Label("state.set"), {"key": Label("fetched_content"), "value": result})
+"""
 
 
 def _handle_fetch_web_content(
@@ -1087,19 +1095,20 @@ def _handle_fetch_web_content(
 ) -> str:
     """Handle fetch_web_content — create an untrusted arc batch to fetch a URL.
 
-    Creates a parent PLANNER arc with three children produced by the
-    ``fetch_web`` shape:
+    Creates a parent PLANNER arc plus the three children declared by
+    the shipped ``fetch_web`` workflow template
+    (``config_seed/templates/fetch_web.yaml``):
+
       1. EXECUTOR (untrusted) — fetches the URL using a pre-verified script
-      2. REVIEWER (trusted) — reviews the untrusted output
-      3. JUDGE (trusted) — validates the review
+      2. REVIEWER (trusted) — extracts the relevant info from the fetched output
+      3. JUDGE (trusted) — validates the reviewer's extraction
 
     The parent arc completes when all children finish, triggering
     arc.chat_notify to deliver results back to the conversation.
     """
     from ..core.arcs import manager as _am
+    from ..core.engine import template_manager as _tm
     from ..core.engine import work_queue as _wq
-    from ..core.trust.batch import create_untrusted_batch
-    from ..core.trust.untrusted_shapes import render_shape
     from ..core.workflows._arc_state import set_arc_state
 
     url = tool_input.get("url", "").strip()
@@ -1125,23 +1134,34 @@ def _handle_fetch_web_content(
     # Activate parent so freeze_arc() can transition it
     _am.update_status(parent_id, "active")
 
-    # Resolve the canonical fetch_web shape, parent the children, and
-    # delegate to the shared helper (handles Fernet keys, review_keys,
-    # arc_state wiring, batch invariants).
-    specs = render_shape("fetch_web", {"goal": goal})
-    for spec in specs:
-        spec["parent_id"] = parent_id
-    batch_result = create_untrusted_batch(specs, parent_id=parent_id)
-
-    if "error" in batch_result:
-        # Clean up the parent
+    # Look up the shipped template and instantiate it on the parent.
+    # The template loader runs at coordinator startup so by the time a
+    # chat tool fires the row is in place.
+    template = _tm.get_template_by_name("fetch_web")
+    if template is None:
         try:
             _am.update_status(parent_id, "failed")
         except (ValueError, Exception):
             pass
-        return f"Error creating web fetch arcs: {batch_result['error']}"
+        return (
+            "Error creating web fetch arcs: 'fetch_web' template not loaded. "
+            "Check config_seed/templates/fetch_web.yaml is present and that "
+            "coordinator startup logs no template-load failures."
+        )
 
-    child_ids = batch_result["arc_ids"]
+    try:
+        child_ids = _tm.instantiate_template(
+            template["id"],
+            parent_id,
+            bindings={"goal": goal},
+        )
+    except ValueError as exc:
+        try:
+            _am.update_status(parent_id, "failed")
+        except (ValueError, Exception):
+            pass
+        return f"Error creating web fetch arcs: {exc}"
+
     executor_arc_id = child_ids[0]
 
     # Pre-set the URL in the EXECUTOR arc's state so the script can read it.
