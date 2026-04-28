@@ -1,16 +1,11 @@
 """Pre-flight verifier for ``config_seed/templates/*.yaml`` content.
 
-Historically, raw ``integrity_level: untrusted`` in a YAML step was
-unsafe because the template loader could not tell at parse time
-whether the step authored an untrusted EXECUTOR without the mandatory
+Raw ``integrity_level: untrusted`` in a YAML step is only safe when
+the step authoring an untrusted EXECUTOR is paired with the mandatory
 REVIEWER + JUDGE siblings, the right ``output_type``, and a registered
-reviewer profile.  A parallel Python-only "shape registry" provided
-the only audited path until this verifier closed the gap; the
-registry has since been removed (Phase 2 — see ``fetch_web.yaml``).
-
-This verifier runs at coding time on the YAML *as text* (so line
-numbers in findings match what the agent sees in its editor) and
-enforces:
+reviewer profile.  This verifier runs at coding time on the YAML
+*as text* (so line numbers in findings match what the agent sees in
+its editor) and enforces:
 
 1.  **Schema**: top-level keys are recognised; ``steps`` is a list;
     each step has the required fields.
@@ -684,12 +679,11 @@ def _check_goal_placeholder_safety(
 ) -> list[VerificationFinding]:
     """Flag ``$placeholder`` substitutions that land inside fenced code.
 
-    Same risk as ``render_shape``: a binding value containing
-    backticks or further placeholders could re-bind text inside what
-    looks like literal code, injecting tool-call instructions.  At
-    coding time we cannot know the binding values, so we surface a
-    warning whenever a ``$placeholder`` lives inside a triple-backtick
-    fenced block.
+    A binding value containing backticks or further placeholders could
+    re-bind text inside what looks like literal code, injecting
+    tool-call instructions.  At coding time we cannot know the binding
+    values, so we surface a warning whenever a ``$placeholder`` lives
+    inside a triple-backtick fenced block.
     """
     findings: list[VerificationFinding] = []
     name = step.get("name", idx)

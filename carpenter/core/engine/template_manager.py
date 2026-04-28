@@ -23,7 +23,7 @@ from typing import Any
 
 import yaml
 
-from ...db import get_db, db_connection, db_transaction
+from ...db import db_connection, db_transaction
 
 logger = logging.getLogger(__name__)
 
@@ -221,9 +221,8 @@ def _apply_bindings_to_step(
 ) -> dict:
     """Return a copy of ``step`` with bindings substituted into text fields.
 
-    Mirrors the substitution semantics of the legacy
-    ``render_shape`` helper: only ``name`` / ``description`` / ``goal``
-    are templated.  Everything else passes through unchanged.
+    Only the human-facing text fields (``name`` / ``description`` /
+    ``goal``) are templated.  Everything else passes through unchanged.
     """
     if not bindings:
         return step
