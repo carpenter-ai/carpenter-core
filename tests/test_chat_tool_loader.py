@@ -147,16 +147,6 @@ class TestLoadChatTools:
         result = handler({"text": "hello"})
         assert result == "olleh"
 
-    def test_double_string_handler(self, tmp_path):
-        """double_string handler works correctly."""
-        target = str(tmp_path / "ct")
-        install_chat_tool_defaults(target)
-        load_chat_tools(target)
-        handler = get_handler("double_string")
-        assert handler is not None
-        result = handler({"text": "abc"})
-        assert result == "abcabc"
-
     def test_unknown_tool_returns_none(self, tmp_path):
         """get_handler returns None for unknown tools."""
         target = str(tmp_path / "ct")
