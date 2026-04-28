@@ -1,14 +1,12 @@
 """Regression tests for the ``fetch_web`` workflow template.
 
-Phase 2 of the trust-topology migration ported the ``fetch_web``
-arc-batch shape from a Python registry
-(``carpenter.core.trust.untrusted_shapes``) to a YAML workflow template
-(``config_seed/templates/fetch_web.yaml``).  These tests pin the
-runtime behaviour that the registry used to provide so a regression
-in either the YAML or the template loader breaks loud.
+The ``fetch_web`` arc-batch lives in
+``config_seed/templates/fetch_web.yaml`` and is loaded into the
+runtime template store like any other workflow template.  These tests
+pin its instantiated batch behaviour so a regression in either the
+YAML or the template loader breaks loud.
 
-What we assert about the instantiated batch (matches what
-``_REGISTRY['fetch_web']`` produced before the port):
+What we assert about the instantiated batch:
 
 - exactly three children: EXECUTOR-untrusted → REVIEWER-trusted → JUDGE-trusted
 - ``output_type: json`` on the executor (the runtime
@@ -50,7 +48,7 @@ def fetch_web_template_id() -> int:
 
 
 def test_fetch_web_yaml_passes_verifier():
-    """The shipped template must pass the PR#9 verifier with no errors."""
+    """The shipped template must pass the YAML-template verifier with no errors."""
     with open(_FETCH_WEB_YAML_PATH) as f:
         result = verify("yaml-template", f.read())
     error_findings = [f for f in result.findings if f.severity == "error"]
@@ -62,7 +60,7 @@ def test_fetch_web_yaml_passes_verifier():
 def test_instantiate_creates_three_children_with_correct_topology(
     fetch_web_template_id: int,
 ):
-    """The batch shape must match what ``_REGISTRY['fetch_web']`` produced."""
+    """The batch must instantiate as EXECUTOR → REVIEWER → JUDGE under the parent."""
     parent_id = arc_manager.create_arc(
         "fetch parent", "fetch some URL", agent_type="PLANNER",
     )
