@@ -313,6 +313,98 @@ _TOOL_HANDLERS = {
     "list_files": _exec_list_files,
 }
 
+
+def _verify_touched_files(
+    workspace: str, touched_paths: set[str]
+) -> list[dict]:
+    """Run registered content-type verifiers against touched files.
+
+    Called at agent-finalization time — *not* on every keystroke — to
+    enforce content-type-specific invariants (e.g. YAML template trust
+    topology) before the agent's "I'm done" signal lands.
+
+    Args:
+        workspace: Absolute path to the agent's workspace root.
+        touched_paths: Set of relative paths the agent edited or
+            wrote during this run.
+
+    Returns:
+        A list of feedback dicts, one per failing file::
+
+            {"path": "...", "findings": [{"severity": ..., "line": ...,
+              "message": ..., "fix_hint": ...}, ...]}
+
+        Returns an empty list when every touched file either passes its
+        verifier or has no registered verifier.
+    """
+    from ..verify.registry import detect_content_type, verify
+
+    feedback: list[dict] = []
+    for rel_path in sorted(touched_paths):
+        content_type = detect_content_type(rel_path)
+        if content_type is None:
+            continue
+        try:
+            abs_path = _validate_path(workspace, rel_path)
+        except ValueError:
+            continue
+        if not os.path.isfile(abs_path):
+            # Deleted file — nothing to verify.
+            continue
+        try:
+            with open(abs_path) as f:
+                content = f.read()
+        except OSError as exc:
+            logger.debug("Could not read %s for verification: %s",
+                         rel_path, exc)
+            continue
+        result = verify(content_type, content, context={"path": rel_path})
+        if result.ok:
+            continue
+        feedback.append({
+            "path": rel_path,
+            "findings": [
+                {
+                    "severity": fnd.severity,
+                    "line": fnd.line,
+                    "message": fnd.message,
+                    "fix_hint": fnd.fix_hint,
+                }
+                for fnd in result.findings
+            ],
+        })
+    return feedback
+
+
+def _format_verification_feedback(feedback: list[dict]) -> str:
+    """Render verification feedback as agent-readable text.
+
+    The agent receives this as a user-role message when its "I'm done"
+    signal is rejected, so the format mirrors the failure messages from
+    ``submit_code`` rejections: which file, which line, what to fix.
+    """
+    lines = [
+        "Your finalization was REJECTED by the content verifier. "
+        "The following files have errors that must be fixed before "
+        "you can finish:"
+    ]
+    for entry in feedback:
+        lines.append("")
+        lines.append(f"File: {entry['path']}")
+        for fnd in entry["findings"]:
+            line_str = f"line {fnd['line']}" if fnd["line"] else "file"
+            lines.append(
+                f"  [{fnd['severity']}] ({line_str}) "
+                f"{fnd['message']}"
+            )
+            lines.append(f"      fix: {fnd['fix_hint']}")
+    lines.append("")
+    lines.append(
+        "Use edit_file or write_file to address every error finding, "
+        "then signal completion again."
+    )
+    return "\n".join(lines)
+
 # Shutdown flag — set to stop the coding agent between iterations
 _shutdown = threading.Event()
 
@@ -356,8 +448,11 @@ def run(workspace: str, prompt: str, profile: dict) -> dict:
     consecutive_text_only = 0  # Track iterations with no tool use
     read_only_iterations = 0  # Track iterations with only read/list tools
     files_modified = False  # Track whether any write/edit was performed
+    touched_paths: set[str] = set()  # Files the agent has written/edited
     nudge_count = 0  # How many times we've nudged the agent to write
+    verify_reject_count = 0  # How many times the verifier rejected finalization
     MAX_NUDGES = 2
+    MAX_VERIFY_REJECTS = 3
     EXPLORATION_NUDGE_THRESHOLD = 8  # Nudge after this many read-only iters
     import time as _time
 
@@ -457,6 +552,33 @@ def run(workspace: str, prompt: str, profile: dict) -> dict:
                     "the requested changes now."
                 )})
                 continue
+
+            # Agent thinks its work is done — run content-type verifiers
+            # against every file it touched in this run.  Each registered
+            # verifier (yaml-template, python-arc-step, …) is a pure
+            # parse + AST check; no network, no DB.  If any returns
+            # ok=False we reject the finalization and feed the findings
+            # back so the agent can iterate.
+            if files_modified and verify_reject_count < MAX_VERIFY_REJECTS:
+                verify_feedback = _verify_touched_files(
+                    workspace, touched_paths,
+                )
+                if verify_feedback:
+                    verify_reject_count += 1
+                    logger.info(
+                        "Coding agent finalization rejected by verifier "
+                        "(%d files, attempt %d/%d)",
+                        len(verify_feedback),
+                        verify_reject_count, MAX_VERIFY_REJECTS,
+                    )
+                    messages.append({"role": "assistant", "content": content})
+                    messages.append({
+                        "role": "user",
+                        "content": _format_verification_feedback(
+                            verify_feedback
+                        ),
+                    })
+                    continue
             break
 
         # Handle tool_use blocks
@@ -474,6 +596,9 @@ def run(workspace: str, prompt: str, profile: dict) -> dict:
 
                 if tool_name in ("write_file", "edit_file", "delete_file"):
                     files_modified = True
+                    rel = tool_input.get("path")
+                    if isinstance(rel, str):
+                        touched_paths.add(rel)
 
                 tool_result = _execute_tool(workspace, tool_name, tool_input)
                 tool_results.append({
