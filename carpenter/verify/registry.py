@@ -104,6 +104,7 @@ def unregister_verifier(content_type: str) -> None:
 
 def list_content_types() -> list[str]:
     """Return the names of all registered content types, sorted."""
+    _ensure_default_verifiers()
     return sorted(_REGISTRY)
 
 
