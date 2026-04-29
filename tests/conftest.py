@@ -614,6 +614,20 @@ def _mock_local_embed(monkeypatch):
         "conversation", "daily", "review",
     ]
 
+    import hashlib as _hashlib
+
+    def _stable_hash(word: str) -> int:
+        """Process-stable hash. Python's built-in hash() is randomized per
+        process (PYTHONHASHSEED) which makes pytest-xdist workers disagree
+        on which embedding bucket a given word lands in — causing rare
+        rank-flip flakes when an unrelated entry's word collides with the
+        query word's bucket on one worker but not another. Use sha256 so
+        every worker maps the same word to the same bucket.
+        """
+        return int.from_bytes(
+            _hashlib.sha256(word.encode("utf-8")).digest()[:8], "big",
+        )
+
     def _fake_embed(texts):
         vectors = []
         for text in texts:
@@ -626,7 +640,7 @@ def _mock_local_embed(monkeypatch):
             # still produce unique, distinguishable embeddings.
             for word in low.split():
                 if word not in _keywords:
-                    idx = hash(word) % (_dim - len(_keywords) - 1) + len(_keywords)
+                    idx = _stable_hash(word) % (_dim - len(_keywords) - 1) + len(_keywords)
                     vec[idx] += 1.0
             norm = _math.sqrt(sum(x * x for x in vec))
             if norm > 0:
