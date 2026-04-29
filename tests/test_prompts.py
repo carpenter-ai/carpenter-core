@@ -161,12 +161,26 @@ class TestPromptIntegration:
             assert s.content.strip(), f"Section {s.name} has no content"
 
     def test_compact_filtering(self, tmp_path):
-        """Compact mode should return only compact=True sections."""
-        prompts_dir = str(tmp_path / "prompts")
-        install_prompt_defaults(prompts_dir)
+        """Loader must distinguish compact=True from compact=False sections.
+
+        Uses an in-test fixture rather than the default seed: the seed
+        currently ships only compact=True sections, but the loader's
+        compact-flag handling must work for both values regardless.
+        """
+        prompts_dir = str(tmp_path / "compact_filter_prompts")
+        os.makedirs(prompts_dir)
+        Path(prompts_dir, "00-compact-one.md").write_text(
+            "---\ncompact: true\n---\nCompact section one."
+        )
+        Path(prompts_dir, "01-compact-two.md").write_text(
+            "---\ncompact: true\n---\nCompact section two."
+        )
+        Path(prompts_dir, "02-full-only.md").write_text(
+            "---\ncompact: false\n---\nFull-only section."
+        )
         sections = load_prompt_sections(prompts_dir)
         compact_sections = [s for s in sections if s.compact]
         non_compact = [s for s in sections if not s.compact]
-        # Should have both types
-        assert len(compact_sections) > 0
-        assert len(non_compact) > 0
+        assert len(compact_sections) == 2
+        assert len(non_compact) == 1
+        assert non_compact[0].name == "full_only"
