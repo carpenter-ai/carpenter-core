@@ -193,6 +193,47 @@ Platform boundary is restricted to `PLATFORM_TOOLS` frozenset (`submit_code`,
 
 ---
 
+## Coding-time enforcement
+
+The invariants above are enforced at **runtime** — `create_arc()` rejects bare
+non-trusted creates (I4), `arc_dispatch_handler.py` intercepts JUDGE arcs to
+run platform code (I3, I8), `tool_backends/arc.py` `handle_create_batch()`
+checks reviewer/judge coverage. Runtime enforcement is the line of last
+defence and is not optional.
+
+A second line runs at **coding time**, before non-trusted templates and steps
+are ever instantiated. The coding agent's finalization hook re-verifies every
+file it edited or wrote, and refuses to end its turn while any verifier
+returns `ok=False`:
+
+- `carpenter/verify/registry.py` — content-type-keyed registry. Each content
+  type registers a callable `(content, context) -> VerificationResult`.
+  Unknown types pass through; registration is opt-in.
+- `carpenter/verify/yaml_template.py` — verifier for
+  `config_seed/templates/*.yaml`. Enforces the trust topology demanded by I3
+  and I4 *in the template text*: every `integrity_level: untrusted` EXECUTOR
+  must have downstream REVIEWER (`reviewer_profile: security-reviewer`) and
+  JUDGE (`reviewer_profile: judge`) sibling steps in correct `order`,
+  `output_type: json` is pinned, agent-type/integrity-level pairs are
+  compatible, and goal-placeholder substitution inside fenced code blocks is
+  flagged.
+- `carpenter/agent/coding_agent.py` `_verify_touched_files()` — fired when
+  the coding agent emits `end_turn`. Findings are fed back as a follow-up
+  message identical in shape to a `submit_code` rejection. Bounded by
+  `MAX_VERIFY_REJECTS` so a stuck agent escalates instead of looping.
+
+The pattern generalises. A new content type — KB articles, prompt files, JSON
+schemas — plugs in with `register_verifier(content_type, fn)` plus a branch
+in `detect_content_type()`. The verifier returns
+`VerificationResult(ok=..., findings=[VerificationFinding(severity, line,
+message, fix_hint), ...])`. `severity="error"` blocks finalization;
+`"warning"` is informational. `fix_hint` should point to the canonical KB
+article, mirroring `string_declarations.py` error messages — the coding
+agent reads it and edits the file accordingly.
+
+See `config_seed/kb/security/coding-time-verification.md` for the
+agent-facing rule sheet.
+
 ## Implementation Status
 
 Invariants I1-I10 are fully implemented and tested. The verified flow analysis
