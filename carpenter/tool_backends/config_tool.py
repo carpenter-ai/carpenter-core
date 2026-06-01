@@ -1,10 +1,36 @@
 """Config tool backend — reads, writes, and hot-reloads platform config."""
+import fnmatch
 import logging
 import os
 
 from .. import config as config_module
+from ..security.platform_paths import audit_path_decision
 
 logger = logging.getLogger(__name__)
+
+
+# Per-key human-gate predicate for ``handle_set_value`` (PR 4 of the
+# platform-integrity rollout).  These are fnmatch-style globs.  Any key
+# matching is refused with a ValueError even if it appears in the
+# ``_MUTABLE_KEYS`` allowlist — the gate is forward-looking, so a future
+# PR can't quietly add a new ``platform_integrity.*`` key to
+# ``_MUTABLE_KEYS`` and bypass human review.  Today none of the listed
+# patterns overlap ``_MUTABLE_KEYS``; the test
+# ``tests/tool_backends/test_config_tool_gate.py`` pins that invariant.
+_HUMAN_GATED_KEYS: tuple[str, ...] = (
+    "platform_integrity.*",
+    "model_policies.*",
+    "review.*",
+    "capability_matrix.*",
+)
+
+
+def _is_human_gated(key: str) -> bool:
+    """Return True if ``key`` matches any human-gated glob."""
+    for pattern in _HUMAN_GATED_KEYS:
+        if fnmatch.fnmatch(key, pattern):
+            return True
+    return False
 
 # Keys that agents are permitted to change at runtime.
 # Deliberately excludes security-critical keys (API keys, credentials,
@@ -83,6 +109,24 @@ def handle_set_value(params: dict) -> dict:
         raise ValueError(
             f"Config key {key!r} is not in the mutable-key allowlist. "
             f"Allowed keys: {sorted(_MUTABLE_KEYS)}"
+        )
+
+    # Per-key human-gate predicate (PR 4 platform-integrity).  Even if a
+    # key is in ``_MUTABLE_KEYS``, refuse it here if it matches a
+    # human-gated glob.  This is forward-looking: today the gated globs
+    # do not overlap ``_MUTABLE_KEYS``, but if a future PR adds e.g.
+    # ``"platform_integrity.path_overrides"`` to the allowlist without
+    # explicit human review, this predicate trips.
+    if _is_human_gated(key):
+        audit_path_decision(
+            None,
+            "config_set_refused",
+            "",
+            {"key": key, "tool": "config.set_value"},
+        )
+        raise ValueError(
+            f"config key {key!r} is human-gated; "
+            f"edit via the platform-integrity workflow"
         )
 
     yaml_path = config_module._loaded_yaml_path or os.path.join(
