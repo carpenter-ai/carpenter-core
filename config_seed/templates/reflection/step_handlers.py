@@ -196,49 +196,146 @@ async def handle_save_reflection(arc_id: int, arc_info: dict) -> None:
     )
 
 
-def _is_reflected_arc_tainted(reflected_arc_id: int | None) -> bool:
-    """Return True if the reflected arc (or any descendant) is non-trusted.
+def _is_reflection_restricted(
+    reflected_arc_id: int | None,
+    proposed_action: dict | None = None,
+) -> bool:
+    """Return True if the reflection should route to the gated template.
 
-    Stub preserving the safety property of legacy
-    ``_check_reflection_tainted``. Legacy queried conversation_taint by
-    title match — in the per-arc model, the equivalent signal is the arc's
-    own ``integrity_level`` (and its descendants'). If any is not
-    'trusted', the reflection drew from tainted inputs and action arcs
-    spawned from it should be marked for human review.
+    Broader than the legacy taint-only check (PR 4 platform-integrity):
+
+    1. **Taint** — if the reflected arc (or any descendant) is non-trusted,
+       the reflection drew from tainted inputs.  Spawned action arcs are
+       marked for human review.  (Preserved from
+       ``_is_reflected_arc_tainted``.)
+    2. **Path tier** — if a ``proposed_action`` is supplied and carries a
+       target filesystem path, classify it via
+       :func:`carpenter.security.platform_paths.path_tier`.  T1 or T0
+       targets force human review.
+    3. **Change category** — if the proposed action's target is anything
+       other than KB/YAML, treat as restricted by default until PR 5
+       wires category-specific workflows (``coding-change``,
+       ``yaml-change``, ``kb-change``).
+
+    TODO(PR 5): ``proposed_action_parser.parse_proposed_actions`` currently
+    returns plain strings — there is no target path field on the parsed
+    action.  Until the parser is extended to surface a structured target
+    (e.g. ``{"description": ..., "target_path": ...}``), only the taint
+    arm fires here.  The path/category arms are wired but unreachable.
+    The instruction set for PR 4 explicitly calls out this gap; PR 5
+    should extend ``parse_proposed_actions`` to emit a target-path field
+    (e.g. by extracting backticked paths from the description) and then
+    pass it through ``handle_dispatch_actions`` below.
     """
-    if reflected_arc_id is None:
-        return False
+    # Taint arm — preserved from the legacy check.
+    if reflected_arc_id is not None:
+        try:
+            with db_connection() as db:
+                row = db.execute(
+                    "SELECT integrity_level FROM arcs WHERE id = ?",
+                    (reflected_arc_id,),
+                ).fetchone()
+                if (
+                    row
+                    and row["integrity_level"]
+                    and row["integrity_level"] != "trusted"
+                ):
+                    _audit_reflection_restricted(reflected_arc_id, "taint")
+                    return True
+                # Check descendants. Cheap recursive walk; reflection arcs
+                # are rare and tree depth is bounded, so no CTE needed.
+                descendant_rows = db.execute(
+                    "WITH RECURSIVE descendants(id) AS ("
+                    "  SELECT id FROM arcs WHERE parent_id = ? "
+                    "  UNION ALL "
+                    "  SELECT a.id FROM arcs a "
+                    "  JOIN descendants d ON a.parent_id = d.id"
+                    ") "
+                    "SELECT a.integrity_level FROM arcs a "
+                    "JOIN descendants d ON a.id = d.id "
+                    "WHERE a.integrity_level IS NOT NULL "
+                    "  AND a.integrity_level != 'trusted' "
+                    "LIMIT 1",
+                    (reflected_arc_id,),
+                ).fetchall()
+                if descendant_rows:
+                    _audit_reflection_restricted(reflected_arc_id, "taint")
+                    return True
+        except Exception:
+            logger.exception(
+                "taint check failed for reflected arc %s; defaulting to untainted",
+                reflected_arc_id,
+            )
+            # Fall through to the path/category arms — defensive.
+
+    # Path/category arms — only fire if the parser surfaces a target.
+    # Today the parser produces plain strings (see TODO above), so this
+    # block is dead code; it is wired so PR 5 only has to extend the
+    # parser, not re-touch this function.
+    if proposed_action is not None and isinstance(proposed_action, dict):
+        target = proposed_action.get("target_path")
+        if isinstance(target, str) and target:
+            try:
+                from carpenter.security.platform_paths import (
+                    PATH_TIER_T0,
+                    PATH_TIER_T1,
+                    change_category,
+                    path_tier,
+                )
+                tier = path_tier(target)
+                if tier in (PATH_TIER_T0, PATH_TIER_T1):
+                    _audit_reflection_restricted(reflected_arc_id, "tier")
+                    return True
+                # Until PR 5 wires category-specific workflows, treat
+                # python/unknown changes as restricted by default.
+                cat = change_category(target)
+                if cat in ("python", "unknown"):
+                    _audit_reflection_restricted(reflected_arc_id, "category")
+                    return True
+            except Exception:
+                logger.exception(
+                    "path/category check failed for reflected arc %s "
+                    "target=%r; defaulting to unrestricted",
+                    reflected_arc_id, target,
+                )
+
+    return False
+
+
+def _audit_reflection_restricted(
+    reflected_arc_id: int | None,
+    reason: str,
+) -> None:
+    """Record an integrity audit row for a restricted reflection.
+
+    Late import of ``audit_path_decision`` keeps the reflection
+    template package importable in environments where the security
+    module is not yet initialized.  Audit failures are swallowed inside
+    the helper.
+    """
     try:
-        with db_connection() as db:
-            row = db.execute(
-                "SELECT integrity_level FROM arcs WHERE id = ?",
-                (reflected_arc_id,),
-            ).fetchone()
-            if row and row["integrity_level"] and row["integrity_level"] != "trusted":
-                return True
-            # Check descendants. Cheap recursive walk; reflection arcs are
-            # rare and tree depth is bounded, so no CTE needed.
-            descendant_rows = db.execute(
-                "WITH RECURSIVE descendants(id) AS ("
-                "  SELECT id FROM arcs WHERE parent_id = ? "
-                "  UNION ALL "
-                "  SELECT a.id FROM arcs a "
-                "  JOIN descendants d ON a.parent_id = d.id"
-                ") "
-                "SELECT a.integrity_level FROM arcs a "
-                "JOIN descendants d ON a.id = d.id "
-                "WHERE a.integrity_level IS NOT NULL "
-                "  AND a.integrity_level != 'trusted' "
-                "LIMIT 1",
-                (reflected_arc_id,),
-            ).fetchall()
-            return len(descendant_rows) > 0
-    except Exception:
-        logger.exception(
-            "taint check failed for reflected arc %s; defaulting to untainted",
-            reflected_arc_id,
+        from carpenter.security.platform_paths import audit_path_decision
+        audit_path_decision(
+            None,
+            "reflection_action_restricted",
+            "",
+            {"reflected_arc_id": reflected_arc_id, "reason": reason},
         )
-        return False
+    except Exception:
+        logger.warning(
+            "audit of reflection_action_restricted failed "
+            "(reflected_arc_id=%s, reason=%s)",
+            reflected_arc_id, reason, exc_info=True,
+        )
+
+
+def _is_reflected_arc_tainted(reflected_arc_id: int | None) -> bool:
+    """Backward-compat alias for :func:`_is_reflection_restricted`.
+
+    Kept so any out-of-tree caller (or test) referencing the legacy
+    name continues to work without modification.
+    """
+    return _is_reflection_restricted(reflected_arc_id, None)
 
 
 async def handle_dispatch_actions(arc_id: int, arc_info: dict) -> None:
@@ -319,7 +416,14 @@ async def handle_dispatch_actions(arc_id: int, arc_info: dict) -> None:
     truncated_count = max(0, total_proposed - cap)
     actions = actions[:cap]
 
-    is_tainted = _is_reflected_arc_tainted(reflected_arc_id)
+    # PR 4 platform-integrity: use the broader predicate.  Today the
+    # parsed actions are plain strings (no target_path), so passing
+    # ``proposed_action=None`` here matches the legacy taint-only
+    # behavior.  TODO(PR 5): once
+    # ``parse_proposed_actions`` returns structured actions with a
+    # ``target_path`` field, loop here and OR the per-action result
+    # into ``is_tainted`` (or compute review_mode per spawned arc).
+    is_tainted = _is_reflection_restricted(reflected_arc_id, None)
     review_mode = "human" if is_tainted else "auto"
 
     spawned_arcs: list[int] = []
