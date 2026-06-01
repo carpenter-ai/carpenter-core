@@ -56,10 +56,10 @@ def _cmd_setup_credential(argv: list[str]) -> None:
 
     Examples:
       # Prompt securely for the value:
-      python3 -m carpenter setup-credential --key FORGEJO_TOKEN
+      python3 -m carpenter setup-credential --key GIT_TOKEN
 
       # Supply the value non-interactively:
-      python3 -m carpenter setup-credential --key FORGEJO_TOKEN --value ghp_abc123
+      python3 -m carpenter setup-credential --key GIT_TOKEN --value ghp_abc123
     """
     import getpass
 
@@ -74,7 +74,7 @@ known credential keys:
   {chr(10).join(f'  {k:30s} → config key: {v}' for k, v in sorted(_CREDENTIAL_MAP.items()))}
 
 examples:
-  python3 -m carpenter setup-credential --key FORGEJO_TOKEN
+  python3 -m carpenter setup-credential --key GIT_TOKEN
   python3 -m carpenter setup-credential --key ANTHROPIC_API_KEY --value sk-ant-...
 
   Alternatively, export as an environment variable:
@@ -84,7 +84,7 @@ examples:
     )
     parser.add_argument(
         "--key", required=True,
-        help="Credential env-var key (e.g. FORGEJO_TOKEN). Must be a known key.",
+        help="Credential env-var key (e.g. GIT_TOKEN). Must be a known key.",
     )
     parser.add_argument(
         "--value",

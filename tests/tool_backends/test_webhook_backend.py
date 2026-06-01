@@ -107,7 +107,7 @@ def test_subscribe_builds_target_url(monkeypatch):
     # Override specific config keys for URL construction
     from carpenter import config as tc_config
     monkeypatch.setitem(tc_config.CONFIG, "tls_domain", "tc.example.com")
-    monkeypatch.setitem(tc_config.CONFIG, "git_server_url", "https://forge.example.com")
+    monkeypatch.setitem(tc_config.CONFIG, "git_url", "https://forge.example.com")
     monkeypatch.setitem(tc_config.CONFIG, "git_token", "test-token")
 
     with patch("carpenter.forges.forgejo.httpx") as mock_httpx:
@@ -141,7 +141,7 @@ def test_subscribe_builds_target_url_no_tls(monkeypatch):
     monkeypatch.setitem(tc_config.CONFIG, "tls_enabled", False)
     monkeypatch.setitem(tc_config.CONFIG, "host", "192.168.1.10")
     monkeypatch.setitem(tc_config.CONFIG, "port", 7842)
-    monkeypatch.setitem(tc_config.CONFIG, "git_server_url", "https://forge.example.com")
+    monkeypatch.setitem(tc_config.CONFIG, "git_url", "https://forge.example.com")
     monkeypatch.setitem(tc_config.CONFIG, "git_token", "test-token")
 
     with patch("carpenter.forges.forgejo.httpx") as mock_httpx:

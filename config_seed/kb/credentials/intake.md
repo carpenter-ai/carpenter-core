@@ -4,10 +4,10 @@ When a user provides an external git repository URL (e.g. a Forgejo, Gitea, or G
 
 ## Required flow
 1. Recognize the URL is an external repository that needs API access
-2. Use `verify_credential` with key `FORGEJO_TOKEN` to check if a token is already configured and valid
+2. Use `verify_credential` with key `GIT_TOKEN` to check if a token is already configured and valid
 3. If NOT valid, use `request_credential` to create a secure one-time link:
-   - key: `FORGEJO_TOKEN`
-   - label: a human-readable name (e.g. 'Forgejo API Token')
+   - key: `GIT_TOKEN`
+   - label: a human-readable name (e.g. 'Git Server API Token')
    - description: explain what the token is for
 4. Present the credential link URL to the user and ask them to provide their token via that link
 5. When the user confirms, use `verify_credential` to confirm it works

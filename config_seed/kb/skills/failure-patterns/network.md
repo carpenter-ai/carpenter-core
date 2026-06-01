@@ -97,7 +97,7 @@ Failures related to HTTP communication between platform components and external 
 1. For callback connection refused: the platform server is likely not running. Check server status.
 2. For external service connection refused: verify the URL and port are correct. The service may be down.
 3. For Ollama connection refused (at `ollama_url`): the Ollama server is not running. The user needs to start it (`ollama serve`).
-4. For Forgejo connection refused: the Forgejo instance at `git_server_url` is not reachable. Check the URL and server status.
+4. For git server connection refused: the git server at `git_url` is not reachable. Check the URL and server status.
 
 **Prevention**: For critical operations, implement retry logic with backoff. For optional operations (e.g., fetching supplementary data), handle connection errors gracefully and continue without the data.
 

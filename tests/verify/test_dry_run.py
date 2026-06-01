@@ -619,7 +619,7 @@ conversation.archive(1)
     def test_act_credentials_request(self):
         code = """
 from carpenter_tools.act import credentials
-credentials.request("FORGEJO_TOKEN", label="Forge Token")
+credentials.request("GIT_TOKEN", label="Forge Token")
 """
         result = run_dry_run(code, [])
         assert result.passed

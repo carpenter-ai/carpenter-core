@@ -42,7 +42,7 @@ def create_credential_request(
     """Create a one-time credential request link.
 
     Args:
-        key: The env var name (e.g. "FORGEJO_TOKEN", "ANTHROPIC_API_KEY").
+        key: The env var name (e.g. "GIT_TOKEN", "ANTHROPIC_API_KEY").
         label: Human-readable label for the form.
         description: Explanation of what the credential is used for.
 
@@ -89,9 +89,8 @@ def _update_dot_env(key: str, value: str) -> None:
 def verify_credential(key: str) -> dict:
     """Verify a stored credential by testing it.
 
-    For git_token/forgejo_token: delegates to the configured forge
-    provider's ``verify_token`` (today: Forgejo's
-    ``GET /api/v1/user``).
+    For git_token: delegates to the configured forge provider's
+    ``verify_token`` (today: Forgejo's ``GET /api/v1/user``).
     For other keys: checks that the value is non-empty.
 
     Never returns the credential value.
@@ -102,8 +101,8 @@ def verify_credential(key: str) -> dict:
     if not value:
         return {"valid": False, "reason": "credential not set"}
 
-    if key in ("GIT_TOKEN", "FORGEJO_TOKEN") or config_key in ("git_token", "forgejo_token"):
-        server_url = config.CONFIG.get("git_server_url", "") or config.CONFIG.get("forgejo_url", "")
+    if key == "GIT_TOKEN" or config_key == "git_token":
+        server_url = config.CONFIG.get("git_url", "")
         provider = get_forge_provider()
         if provider is None:
             return {"valid": False, "reason": "no forge provider registered"}

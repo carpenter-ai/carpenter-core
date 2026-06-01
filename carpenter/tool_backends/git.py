@@ -39,7 +39,7 @@ def _git_api_long_timeout() -> float:
 
 def _git_server_url() -> str:
     """Return the base git server API URL."""
-    base = config.CONFIG.get("git_server_url", "")
+    base = config.CONFIG.get("git_url", "")
     return base.rstrip("/") + "/api/v1"
 
 
