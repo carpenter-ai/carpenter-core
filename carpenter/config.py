@@ -394,6 +394,26 @@ DEFAULTS = {
         },
     },
     "model_presets": {},  # User overrides for model selector presets (see model_selector.py)
+    # Platform-integrity classifier config.  Read by
+    # ``carpenter/security/platform_paths.py`` to drive path-tier and
+    # change-category decisions.  This PR is purely additive — later PRs
+    # consume these keys to drive workflow routing and human-review forcing.
+    #
+    # ``change_workflows``: maps change-category ("python", "yaml", "kb",
+    # "unknown") to the template name used by the routing layer.
+    # ``path_overrides``: optional user-supplied list of
+    # ``{prefix: "/abs/path", tier: "T0"|"T1"|"T2"}`` entries that ADD to
+    # the hardcoded T0/T1 floor.  Entries cannot demote a hardcoded T1
+    # path to T2 — the floor wins.
+    "platform_integrity": {
+        "change_workflows": {
+            "python": "coding-change",
+            "yaml": "yaml-change",
+            "kb": "kb-change",
+            "unknown": "coding-change",
+        },
+        "path_overrides": [],
+    },
     "coding_agents": {
         "builtin": {
             "type": "builtin",
