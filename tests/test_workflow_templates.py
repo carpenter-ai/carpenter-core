@@ -37,7 +37,8 @@ def test_load_writing_repo_template(tmp_path):
 def test_load_templates_from_dir(tmp_path):
     templates_dir = _copy_templates(tmp_path)
     count = template_manager.load_templates_from_dir(templates_dir)
-    assert count == 12
+    # 12 pre-existing + yaml-change + kb-change (PR 5)
+    assert count == 14
     templates = template_manager.list_templates()
     names = [t["name"] for t in templates]
     assert "writing-repo-change" in names
@@ -53,6 +54,9 @@ def test_load_templates_from_dir(tmp_path):
     assert "reflection-code-action-gated" in names
     # skill-kb-review now ships as a template package (phase E2)
     assert "skill-kb-review" in names
+    # PR 5: yaml-change and kb-change templates
+    assert "yaml-change" in names
+    assert "kb-change" in names
 
 
 def test_find_template_for_resource(tmp_path):

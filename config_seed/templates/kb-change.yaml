@@ -1,0 +1,45 @@
+name: kb-change
+description: |
+  Workflow for changes that touch only KB markdown files. Mirrors
+  coding-change but swaps the test-execution verifier for a
+  deterministic KB-format check (path-regex + optional frontmatter
+  validity). Selected automatically by
+  ``select_workflow_for_paths`` when every affected path is in the
+  ``kb`` change-category.
+steps:
+  - name: invoke-agent
+    description: Set up workspace and run coding agent
+    order: 0
+  - name: generate-review
+    description: Generate diff, create review link, and spawn verification arcs
+    order: 1
+  - name: verify-quality
+    description: Static review of the KB diff — clarity, accuracy, KB conventions
+    order: 2
+    arc_role: verifier
+    agent_type: REVIEWER
+    model_policy: careful-coding
+  - name: verify-kb-format
+    description: |
+      Deterministic Python-only check of every changed KB file.
+      Validates KB path regex (matches ``carpenter.tool_backends.kb._VALID_PATH_RE``)
+      and, when present, YAML frontmatter validity. Internal ``[[link]]``
+      checking is currently advisory (no-op).
+    order: 3
+    arc_role: verifier
+    # Handled by dedicated Python code in carpenter.core.workflows.kb_format_handler
+    # No agent_type — Python-only deterministic step (I6).
+  - name: judge-verification
+    description: Python-only boolean aggregation of verification results (no AI)
+    order: 4
+    arc_role: verifier
+    # Handled by dedicated Python code in arc_dispatch_handler, not an AI agent
+  - name: post-verification-docs
+    description: Read reviewed code, write docstrings and arc summary
+    order: 5
+    agent_type: EXECUTOR
+    model_policy: background-batch
+  - name: await-approval
+    description: Wait for human to approve, reject, or request changes
+    order: 6
+    activation_event: arc.manual_trigger

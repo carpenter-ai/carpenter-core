@@ -605,10 +605,20 @@ def _resolve_source_dir(source_dir: str) -> str:
 def handle_invoke_coding_change(params: dict) -> dict:
     """Start the coding-change workflow.
 
-    Params: source_dir, prompt, conversation_id (injected by callbacks.py), coding_agent (opt).
+    Params:
+        source_dir, prompt, conversation_id (injected by callbacks.py),
+        coding_agent (opt), affected_paths (opt list).
 
-    Creates a coding-change arc, stores conversation_id and source_dir in arc_state,
-    then enqueues coding-change.invoke-agent to begin the workspace/agent/review cycle.
+    Creates a change arc, stores conversation_id and source_dir in
+    arc_state, then enqueues the workflow's ``invoke-agent`` step.
+
+    When ``affected_paths`` is supplied at creation time,
+    :func:`carpenter.security.platform_paths.select_workflow_for_paths`
+    chooses which workflow template to instantiate
+    (``coding-change``, ``yaml-change``, ``kb-change``, ...) and whether
+    to force human review (``force_human``).  When ``affected_paths`` is
+    missing or empty we default to ``coding-change`` and rely on the
+    later force-human gate at ``generate-review`` time (PR 6).
 
     Returns: {"arc_id": int}
     """
@@ -616,12 +626,21 @@ def handle_invoke_coding_change(params: dict) -> dict:
     import time as _time
     from ..core.engine import work_queue
     from ..core.source_classifier import classify_source_dir, get_policy_for_category
-    from ..core.engine.template_executor import get_template_for_workflow
+    from ..core.engine.template_manager import get_template_by_name
+    from ..security.platform_paths import (
+        select_workflow_for_paths,
+        audit_path_decision,
+        path_tier,
+        change_category,
+    )
 
     source_dir = params.get("source_dir", "")
     prompt = params.get("prompt", "")
     conversation_id = params.get("conversation_id")
     coding_agent = params.get("coding_agent")
+    affected_paths = params.get("affected_paths") or []
+    if not isinstance(affected_paths, list):
+        affected_paths = []
 
     # Resolve well-known aliases and auto-default for source_dir.
     # The agent may pass "platform" (alias) or an empty/missing value.
@@ -634,8 +653,48 @@ def handle_invoke_coding_change(params: dict) -> dict:
     if not prompt:
         return {"error": "prompt is required"}
 
-    # Look up template for this workflow type
-    template = get_template_for_workflow(CODING_CHANGE_PREFIX)
+    # ── Pick workflow template via platform-integrity registry ───────
+    if affected_paths:
+        template_name, force_human = select_workflow_for_paths(affected_paths)
+        tiers = [path_tier(p) for p in affected_paths]
+        categories = [change_category(p) for p in affected_paths]
+        audit_path_decision(
+            None,
+            "workflow_selected",
+            ", ".join(affected_paths)[:200],
+            {
+                "paths": affected_paths,
+                "tiers": tiers,
+                "categories": categories,
+                "chosen_template": template_name,
+                "force_human": force_human,
+            },
+        )
+    else:
+        template_name = CODING_CHANGE_PREFIX
+        force_human = False
+        audit_path_decision(
+            None,
+            "workflow_default_pending_classification",
+            "",
+            {
+                "paths": [],
+                "tiers": [],
+                "categories": [],
+                "chosen_template": template_name,
+                "force_human": force_human,
+            },
+        )
+
+    # Look up the chosen template by name; fall back to coding-change.
+    template = get_template_by_name(template_name)
+    if template is None and template_name != CODING_CHANGE_PREFIX:
+        logger.warning(
+            "Template %r not found; falling back to %r",
+            template_name, CODING_CHANGE_PREFIX,
+        )
+        template_name = CODING_CHANGE_PREFIX
+        template = get_template_by_name(template_name)
     template_id = template["id"] if template else None
 
     # Classify source directory and select appropriate model policy
@@ -651,13 +710,20 @@ def handle_invoke_coding_change(params: dict) -> dict:
         template_id=template_id     # Link to workflow template
     )
 
-    # Store conversation_id, source_dir, and source_category so the handler and reviewer can use them.
+    # Store conversation_id, source_dir, source_category, chosen workflow
+    # template, force_human flag, and original affected_paths list so the
+    # handler and reviewer can use them.
+    state_pairs: list[tuple[str, object]] = [
+        ("conversation_id", conversation_id),
+        ("source_dir", source_dir),
+        ("source_category", source_category),
+        ("_workflow_template", template_name),
+        ("_affected_paths", affected_paths),
+    ]
+    if force_human:
+        state_pairs.append(("_review_mode", "human"))
     with db_transaction() as db:
-        for key, value in [
-            ("conversation_id", conversation_id),
-            ("source_dir", source_dir),
-            ("source_category", source_category)
-        ]:
+        for key, value in state_pairs:
             if value is not None:
                 db.execute(
                     "INSERT INTO arc_state (arc_id, key, value_json) VALUES (?, ?, ?) "
@@ -670,6 +736,9 @@ def handle_invoke_coding_change(params: dict) -> dict:
     if coding_agent:
         payload["coding_agent"] = coding_agent
 
+    # All change workflows share the same invoke-agent dispatch event.
+    # (yaml-change / kb-change differ in their *verifiers*, not in how the
+    # initial agent invocation is dispatched.)
     work_queue.enqueue(
         f"{CODING_CHANGE_PREFIX}.invoke-agent",
         payload,
