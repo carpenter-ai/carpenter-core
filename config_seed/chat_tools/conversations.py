@@ -99,3 +99,104 @@ def get_conversation_messages(tool_input, **kwargs):
             f"    {content_preview}"
         )
     return "\n".join(lines)
+
+
+@chat_tool(
+    description=(
+        "Pin THIS conversation to a specific AI provider/model, or clear the "
+        "pin. Only affects the current conversation — the global default for "
+        "other chats is unchanged. Useful when the user wants to try an "
+        "alternate backend (e.g. a local Ollama model) without touching "
+        "server-wide configuration. "
+        "Supported providers: anthropic, ollama, tinfoil, chain, local. "
+        "The model string is the bare identifier (e.g. 'qwen3.5:9b' for "
+        "Ollama, 'claude-haiku-4-5' for Anthropic). "
+        "Pass clear=true with no provider/model to revert to the default."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "provider": {
+                "type": "string",
+                "description": (
+                    "Provider name: anthropic, ollama, tinfoil, chain, or "
+                    "local. Required unless clear=true."
+                ),
+            },
+            "model": {
+                "type": "string",
+                "description": (
+                    "Bare model identifier for the provider. "
+                    "Required unless clear=true."
+                ),
+            },
+            "clear": {
+                "type": "boolean",
+                "description": (
+                    "If true, remove the pin and revert to the global "
+                    "default. Default false."
+                ),
+            },
+        },
+        "required": [],
+    },
+    capabilities=["database_write"],
+    trust_boundary="platform",
+    always_available=True,
+)
+def set_conversation_model(tool_input, **kwargs):
+    """Pin or clear a per-conversation provider/model override."""
+    from carpenter.agent import conversation as conv_mod
+
+    conv_id = kwargs.get("conversation_id")
+    if conv_id is None:
+        return "Error: no active conversation_id (tool called out of context)."
+
+    if tool_input.get("clear"):
+        conv_mod.clear_conversation_model_override(conv_id)
+        return (
+            f"Cleared model pin on conversation #{conv_id}. "
+            "Subsequent turns will use the global default."
+        )
+
+    provider = (tool_input.get("provider") or "").strip()
+    model = (tool_input.get("model") or "").strip()
+    if not provider or not model:
+        return (
+            "Error: both 'provider' and 'model' are required (unless "
+            "clear=true)."
+        )
+
+    try:
+        conv_mod.set_conversation_model_override(conv_id, provider, model)
+    except ValueError as exc:
+        return f"Error: {exc}"
+
+    return (
+        f"Pinned conversation #{conv_id} to {provider}:{model}. "
+        "Only this conversation is affected; the global default is unchanged."
+    )
+
+
+@chat_tool(
+    description=(
+        "Show the current per-conversation model pin for THIS conversation, "
+        "or report that it is using the global default."
+    ),
+    input_schema={"type": "object", "properties": {}, "required": []},
+    capabilities=["database_read"],
+)
+def get_conversation_model(tool_input, **kwargs):
+    """Report the current model pin for this conversation."""
+    from carpenter.agent import conversation as conv_mod
+
+    conv_id = kwargs.get("conversation_id")
+    if conv_id is None:
+        return "Error: no active conversation_id (tool called out of context)."
+
+    pin = conv_mod.get_conversation_model_override(conv_id)
+    if pin is None:
+        return (
+            f"Conversation #{conv_id} has no model pin; using global default."
+        )
+    return f"Conversation #{conv_id} is pinned to {pin}."

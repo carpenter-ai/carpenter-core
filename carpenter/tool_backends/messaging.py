@@ -10,10 +10,9 @@ logger = logging.getLogger(__name__)
 def handle_send(params: dict) -> dict:
     """Handle messaging.send -- deliver message into the conversation.
 
-    Expects ``conversation_id`` in *params* (auto-injected by
-    ``_callback.py`` from the ``TC_CONVERSATION_ID`` env var).  If no
-    conversation context is available the message is logged but not
-    persisted.
+    Expects ``conversation_id`` in *params* (auto-injected by the dispatch
+    bridge from the caller arc's context).  If no conversation context is
+    available the message is logged but not persisted.
 
     Optionally accepts ``arc_id`` to tag the message as originating
     from an arc executor.

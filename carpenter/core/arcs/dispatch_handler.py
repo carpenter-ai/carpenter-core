@@ -42,11 +42,34 @@ async def handle_arc_dispatch(work_id: int, payload: dict):
     if arc_id is None:
         arc_id = event_payload.get("arc_id")
 
+    # Defensive unwrap: agents sometimes pass arc.create()'s raw dict result
+    # (``{"arc_id": <int>}``) directly as event_payload["arc_id"], producing
+    # a nested ``{"arc_id": {"arc_id": <int>}}``.  Tolerate one level of
+    # wrapping so the cron actually fires rather than crashing every minute
+    # with ``sqlite3.ProgrammingError: type 'dict' is not supported``.
+    # The KB still teaches ``result["arc_id"]`` as the canonical form;
+    # this unwrap is purely a safety net.
+    if isinstance(arc_id, dict) and "arc_id" in arc_id:
+        logger.warning(
+            "arc.dispatch: nested {'arc_id': dict} payload — unwrapping "
+            "to inner int. Caller likely passed raw arc.create() result. "
+            "Got: %s",
+            arc_id,
+        )
+        arc_id = arc_id["arc_id"]
+
     if arc_id is None:
         logger.error(
             "arc.dispatch: missing arc_id in payload. "
             'Expected event_payload={"arc_id": <int>}. Got: %s',
             payload,
+        )
+        return
+
+    if not isinstance(arc_id, int):
+        logger.error(
+            "arc.dispatch: arc_id must be int, got %s (%r). Payload: %s",
+            type(arc_id).__name__, arc_id, payload,
         )
         return
 
@@ -90,29 +113,42 @@ async def handle_arc_dispatch(work_id: int, payload: dict):
         return
 
     # Judge-verification arcs: Python-only boolean aggregation, no AI agent.
+    # Prefer step_role-based dispatch; fall back to name-equality for legacy
+    # verification arcs created before the step_role column was populated.
     from .verification import get_arc_name as _get_varc_name
-    if arc_info_early.get("name") == _get_varc_name("judge"):
+    _early_step_role = arc_info_early.get("step_role")
+    _is_judge_arc = (
+        _early_step_role == "judge"
+        if _early_step_role is not None
+        else arc_info_early.get("name") == _get_varc_name("judge")
+    )
+    if _is_judge_arc:
         await _handle_judge_verification(arc_id, arc_info_early)
         return
 
-    # Skill-KB review: Python-only steps (classify-source, text-review,
-    # human-escalation).
-    from ..workflows import skill_kb_review_handler
-    if skill_kb_review_handler.is_skill_kb_review_step(arc_info_early):
-        arc_name = arc_info_early.get("name")
-        if arc_name == "classify-source":
-            await skill_kb_review_handler.handle_classify_source(arc_id, arc_info_early)
-        elif arc_name == "text-review":
-            await skill_kb_review_handler.handle_text_review(arc_id, arc_info_early)
-        elif arc_name == "human-escalation":
-            await skill_kb_review_handler.handle_human_escalation(arc_id, arc_info_early)
-        return
-
-    # Reflection template save step: Python-only save and post-processing
-    from ..workflows import reflection_template_handler
-    if reflection_template_handler.is_reflection_save_step(arc_info_early):
-        await reflection_template_handler.handle_save_reflection(arc_id, arc_info_early)
-        return
+    # Generic template-supplied step handlers. Templates may register a
+    # Python handler for a (template, step) pair via the engine's
+    # handler_registry at load time; if one matches this arc, route to it
+    # and skip built-in dispatch. This is how feature-specific logic stays
+    # out of the engine — see the ``reflection`` and ``skill-kb-review``
+    # template packages for examples.
+    _template_id = arc_info_early.get("template_id")
+    _step_name = arc_info_early.get("name")
+    _step_role = arc_info_early.get("step_role")
+    if _template_id and (_step_role or _step_name):
+        from ..engine import handler_registry, template_manager
+        _template = template_manager.get_template(_template_id)
+        if _template:
+            _template_name = _template["name"]
+            # Prefer (template, step_role) when the arc has a role; fall
+            # back to (template, step_name) for legacy/role-less arcs.
+            _handler = (
+                handler_registry.lookup_step_handler(_template_name, _step_role)
+                if _step_role else None
+            ) or handler_registry.lookup_step_handler(_template_name, _step_name)
+            if _handler:
+                await _handler(arc_id, arc_info_early)
+                return
 
     # Track fallback models from policy-based selection for model failover
     _fallback_models = []  # list of SelectionResult, remaining alternatives
@@ -126,7 +162,7 @@ async def handle_arc_dispatch(work_id: int, payload: dict):
             arc_info = arc_manager.get_arc(arc_id)
             agent_type = (arc_info.get("agent_type", "EXECUTOR") if arc_info else "EXECUTOR")
             goal = (arc_info.get("goal") or arc_info.get("name") or f"Arc #{arc_id}") if arc_info else f"Arc #{arc_id}"
-            config_id = arc_info.get("agent_config_id") if arc_info else None
+            policy_id = arc_info.get("model_policy_id") if arc_info else None
 
             # JUDGE arcs: run deterministic platform code, not LLM agents
             if agent_type == "JUDGE":
@@ -150,54 +186,20 @@ async def handle_arc_dispatch(work_id: int, payload: dict):
                 )
                 return
 
-            # Resolve model config — prefer model_policy_id, fall back to agent_config_id
-            policy_id = arc_info.get("model_policy_id") if arc_info else None
-            agent_config = None
-
-            if policy_id is not None:
-                policy_row = arc_manager.get_model_policy(policy_id)
-                if policy_row:
-                    policy_json = policy_row.get("policy_json")
-                    if policy_json and not policy_row.get("model"):
-                        # Policy-based selection — get ranked list for fallback
-                        try:
-                            from ..models.selector import ModelPolicy, select_models
-                            policy = ModelPolicy.from_db_row(policy_row)
-                            ranked = select_models(policy)
-                            if not ranked:
-                                _fire_connectivity_degraded(arc_id)
-                                return
-                            # Use top-ranked model, keep rest as fallbacks
-                            top = ranked[0]
-                            _fallback_models = ranked[1:]
-                            _selected_model_id = top.model_id
-                            # Build agent_config-compatible dict from selection
-                            agent_config = {
-                                "model": top.model_id,
-                                "agent_role": policy_row.get("agent_role"),
-                                "temperature": policy_row.get("temperature"),
-                                "max_tokens": policy_row.get("max_tokens"),
-                            }
-                            logger.info(
-                                "Arc %d: model selector chose %s (%s), %d fallback(s)",
-                                arc_id, top.model_key, top.reason,
-                                len(_fallback_models),
-                            )
-                        except (ImportError, KeyError, ValueError, TypeError) as _exc:
-                            logger.exception("Arc %d: model selector failed, falling back", arc_id)
-                            agent_config = dict(policy_row)
-                    else:
-                        # Hard-pinned model in policy row
-                        agent_config = dict(policy_row)
-
-            if agent_config is None and config_id is not None:
-                agent_config = arc_manager.get_agent_config(config_id)
+            # Resolve model config from the arc's model_policy_id
+            from .dispatch_model_resolver import resolve_dispatch_model
+            agent_config, _fallback_models, _selected_model_id, _connectivity_degraded = (
+                resolve_dispatch_model(arc_id, arc_info or {})
+            )
+            if _connectivity_degraded:
+                _fire_connectivity_degraded(arc_id)
+                return
 
             # Decide whether to invoke an agent:
-            # - If arc has agent_config_id or model_policy_id: invoke with that model
-            # - If EXECUTOR without config: invoke with default model (backward compat)
-            # - Otherwise (PLANNER/REVIEWER without config): freeze immediately
-            should_invoke = agent_config is not None or config_id is not None or agent_type == "EXECUTOR"
+            # - If arc has model_policy_id: invoke with that model
+            # - If EXECUTOR without policy: invoke with default model (backward compat)
+            # - Otherwise (PLANNER/REVIEWER without policy): freeze immediately
+            should_invoke = agent_config is not None or policy_id is not None or agent_type == "EXECUTOR"
 
             if should_invoke:
                 conv_id = _find_arc_conversation(arc_id)
@@ -230,30 +232,29 @@ async def handle_arc_dispatch(work_id: int, payload: dict):
 
         # Post-verification-docs completion: transition the target coding-change
         # arc to "waiting" for human approval now that all verification + docs
-        # are done.
+        # are done. Prefer step_role-based dispatch with name-equality fallback
+        # for legacy arcs predating the step_role column.
         arc_info_post = arc_manager.get_arc(arc_id)
-        if arc_info_post and arc_info_post.get("name") == _get_varc_name("documentation"):
-            _handle_docs_completed(arc_id, arc_info_post)
+        if arc_info_post:
+            _post_step_role = arc_info_post.get("step_role")
+            _is_docs_arc = (
+                _post_step_role == "docs"
+                if _post_step_role is not None
+                else arc_info_post.get("name") == _get_varc_name("documentation")
+            )
+            if _is_docs_arc:
+                _handle_docs_completed(arc_id, arc_info_post)
 
         # Record successful model call (if model was used)
         if _selected_model_id:
-            try:
-                model_health.record_model_call(
-                    model_id=_selected_model_id,
-                    success=True,
-                )
-            except (ImportError, KeyError, ValueError) as _exc:
-                pass  # Don't fail dispatch over health tracking
+            _record_model_call(_selected_model_id, success=True)
         else:
             arc_info = arc_manager.get_arc(arc_id)
-            if arc_info and arc_info.get("agent_config_id"):
+            if arc_info and arc_info.get("model_policy_id"):
                 try:
-                    agent_config = arc_manager.get_agent_config(arc_info["agent_config_id"])
-                    if agent_config and agent_config.get("model"):
-                        model_health.record_model_call(
-                            model_id=agent_config["model"],
-                            success=True,
-                        )
+                    policy = arc_manager.get_model_policy(arc_info["model_policy_id"])
+                    if policy and policy.get("model"):
+                        _record_model_call(policy["model"], success=True)
                 except (ImportError, KeyError, ValueError) as _exc:
                     pass  # Don't fail dispatch over health tracking
 
@@ -266,15 +267,7 @@ async def handle_arc_dispatch(work_id: int, payload: dict):
 
         # Record failed model call (if model was used)
         failed_model_id = _selected_model_id or error_info.model
-        if failed_model_id:
-            try:
-                model_health.record_model_call(
-                    model_id=failed_model_id,
-                    success=False,
-                    error_type=error_info.type,
-                )
-            except (ImportError, KeyError, ValueError) as _exc:
-                pass  # Don't fail dispatch over health tracking
+        _record_model_call(failed_model_id, success=False, error_type=error_info.type)
 
         # ── Model failover: try next-best model before retry/escalation ──
         # If we have fallback models from policy-based selection and the
@@ -293,10 +286,13 @@ async def handle_arc_dispatch(work_id: int, payload: dict):
                 "Arc %d: model %s circuit breaker is OPEN, escalating immediately",
                 arc_id, error_info.model
             )
+            from .root_failure_handler import escalate_to_next_model
             try:
-                arc_manager._escalate_arc(arc_id)
-            except (ValueError, sqlite3.Error) as _exc:
+                new_arc_id = escalate_to_next_model(arc_id)
+            except (ValueError, sqlite3.Error):
                 logger.exception("Failed to escalate arc %d after circuit break", arc_id)
+                new_arc_id = None
+            if new_arc_id is None:
                 arc_manager.update_status(arc_id, "failed")
             return
 
@@ -333,10 +329,13 @@ async def handle_arc_dispatch(work_id: int, payload: dict):
             )
 
             if decision.escalate_on_exhaust:
+                from .root_failure_handler import escalate_to_next_model
                 try:
-                    arc_manager._escalate_arc(arc_id)
-                except (ValueError, sqlite3.Error) as _exc:
+                    new_arc_id = escalate_to_next_model(arc_id)
+                except (ValueError, sqlite3.Error):
                     logger.exception("Failed to escalate arc %d after retry exhaust", arc_id)
+                    new_arc_id = None
+                if new_arc_id is None:
                     arc_manager.update_status(arc_id, "failed")
                 _handle_failed_docs_arc(arc_id)
             else:
@@ -351,390 +350,14 @@ async def handle_arc_dispatch(work_id: int, payload: dict):
         return
 
 
-# ── Provider error detection and model failover ──────────────────
-
-
-# Error types that indicate provider unavailability (transient/connectivity).
-# These map to error_classifier.classify_error() output types.
-_PROVIDER_ERROR_TYPES = frozenset({
-    "NetworkError",       # ConnectError, TimeoutException (from error_classifier)
-    "APIOutageError",     # HTTP 5xx, CircuitBreakerError (from error_classifier)
-    "ConnectionError",    # Raw exception type name
-    "ConnectTimeout",     # Raw exception type name
-    "TimeoutError",       # Raw exception type name
-    "ConnectError",       # Raw exception type name (httpx)
-    "ServerError",        # Generic server error
-    "ServiceUnavailable", # HTTP 503
-})
-
-
-def _is_provider_error(error_info) -> bool:
-    """Check if an error indicates provider unavailability.
-
-    Returns True for connection errors, timeouts, and server errors
-    that suggest the provider is offline or unreachable. Returns False
-    for client errors (4xx), rate limits, auth failures, etc. that
-    would likely affect all providers or are not transient.
-    """
-    if error_info is None:
-        return False
-    error_type = getattr(error_info, "type", "") or ""
-    # Direct match against known provider error types
-    if error_type in _PROVIDER_ERROR_TYPES:
-        return True
-    # Heuristic: check for connection/timeout in the error type name
-    lower = error_type.lower()
-    return any(kw in lower for kw in ("connect", "timeout", "unavailable", "unreachable"))
-
-
-async def _try_fallback_models(
-    arc_id: int,
-    fallback_models: list,
-    original_agent_config: dict | None,
-    original_error_info,
-) -> bool:
-    """Try fallback models after primary model fails with a provider error.
-
-    Iterates through the remaining ranked models. For each, attempts to
-    invoke the agent. On success, records the model call as successful
-    and completes the arc. On provider error, records the failure and
-    continues to the next fallback.
-
-    Args:
-        arc_id: The arc being dispatched.
-        fallback_models: List of SelectionResult alternatives (score-descending).
-        original_agent_config: The agent_config dict from the primary attempt.
-        original_error_info: ErrorInfo from the primary failure.
-
-    Returns:
-        True if a fallback model succeeded, False if all fallbacks failed.
-    """
-    if not fallback_models or original_agent_config is None:
-        return False
-
-    arc_info = arc_manager.get_arc(arc_id)
-    if not arc_info:
-        return False
-
-    goal = arc_info.get("goal") or arc_info.get("name") or f"Arc #{arc_id}"
-    conv_id = _find_arc_conversation(arc_id)
-    if not conv_id:
-        return False
-
-    for fallback in fallback_models:
-        fallback_config = dict(original_agent_config)
-        fallback_config["model"] = fallback.model_id
-
-        logger.info(
-            "Arc %d: trying fallback model %s (%s)",
-            arc_id, fallback.model_key, fallback.reason,
-        )
-
-        try:
-            await _run_arc_agent(
-                arc_id, goal, conv_id, agent_config=fallback_config,
-            )
-
-            # Fallback succeeded — record success and complete the arc
-            try:
-                model_health.record_model_call(
-                    model_id=fallback.model_id, success=True,
-                )
-            except (ImportError, KeyError, ValueError):
-                pass
-
-            arc_manager.freeze_arc(arc_id)
-            _propagate_completion(arc_id)
-
-            logger.info(
-                "Arc %d: fallback model %s succeeded",
-                arc_id, fallback.model_key,
-            )
-            return True
-
-        except Exception as fb_exc:
-            fb_error = _extract_error_info(arc_id, fb_exc)
-
-            # Record the fallback model failure
-            try:
-                model_health.record_model_call(
-                    model_id=fallback.model_id,
-                    success=False,
-                    error_type=fb_error.type,
-                )
-            except (ImportError, KeyError, ValueError):
-                pass
-
-            if _is_provider_error(fb_error):
-                logger.warning(
-                    "Arc %d: fallback model %s also failed (provider error: %s), "
-                    "trying next",
-                    arc_id, fallback.model_key, fb_error.type,
-                )
-                continue
-            else:
-                # Non-provider error (e.g., auth, rate limit, content filter)
-                # — don't continue failover, let normal retry logic handle it
-                logger.warning(
-                    "Arc %d: fallback model %s failed with non-provider error "
-                    "(%s), stopping failover",
-                    arc_id, fallback.model_key, fb_error.type,
-                )
-                return False
-
-    logger.warning(
-        "Arc %d: all %d fallback models exhausted",
-        arc_id, len(fallback_models),
-    )
-    return False
-
-
-async def _handle_judge_verification(arc_id: int, arc_info: dict) -> None:
-    """Handle judge-verification arc with Python-only boolean aggregation.
-
-    Reads sibling verification arcs (verify-quality, verify-correctness),
-    aggregates their statuses, and produces a pass/fail verdict without
-    invoking an AI agent.
-
-    On PASS: marks judge completed, lets docs arc run via standard propagation.
-    On FAIL: marks judge completed, cancels docs arc, re-invokes the coding
-        agent with verification feedback (up to a configurable limit).
-    """
-    from .verification import (
-        get_arc_name as _get_vname, _get_verification_config,
-    )
-    from ..workflows.coding_change_handler import (
-        _get_arc_state, _set_arc_state, _notify_chat,
-    )
-
-    # Load truncation limits from config
-    _vcfg = _get_verification_config()
-    reason_max = _vcfg.get("feedback_reason_max_length", 300)
-    summary_max = _vcfg.get("feedback_summary_max_length", 500)
-
-    verification_target_id = arc_info.get("verification_target_id")
-    parent_id = arc_info.get("parent_id")
-
-    # Activate the arc (pending -> active)
-    if arc_info.get("status") == "pending":
-        arc_manager.update_status(arc_id, "active")
-
-    if verification_target_id is None:
-        logger.error("judge-verification arc %d has no verification_target_id", arc_id)
-        arc_manager.update_status(arc_id, "failed")
-        return
-
-    # Find sibling verification arcs via parent + verification_target_id
-    with db_connection() as db:
-        siblings = db.execute(
-            "SELECT id, name, status FROM arcs "
-            "WHERE parent_id = ? AND verification_target_id = ? "
-            "AND id != ?",
-            (parent_id, verification_target_id, arc_id),
-        ).fetchall()
-
-    # Collect check results
-    check_results = []
-    all_passed = True
-    feedback_parts = []
-
-    for sib in siblings:
-        sib_name = sib["name"]
-        sib_status = sib["status"]
-
-        # Skip docs arc — it depends on the judge, not the other way around
-        if sib_name == _get_vname("documentation"):
-            continue
-
-        if sib_name in (_get_vname("correctness_check"), _get_vname("quality_check")):
-            passed = sib_status in ("completed", "frozen")
-            check_results.append({
-                "name": sib_name,
-                "arc_id": sib["id"],
-                "status": sib_status,
-                "passed": passed,
-            })
-            if not passed:
-                all_passed = False
-                # Try to get failure reason from arc history
-                history = arc_manager.get_history(sib["id"])
-                error_entries = [
-                    h for h in history
-                    if h["entry_type"] in ("error", "failed", "verdict")
-                ]
-                reason = ""
-                if error_entries:
-                    last = error_entries[-1]
-                    data = last.get("data_json")
-                    if isinstance(data, str):
-                        try:
-                            data = json.loads(data)
-                        except (json.JSONDecodeError, TypeError):
-                            data = {}
-                    elif data is None:
-                        data = {}
-                    reason = data.get("message", "") or data.get("reason", "") or str(data)
-                feedback_parts.append(
-                    f"- {sib_name} (arc #{sib['id']}): FAILED ({sib_status})"
-                    + (f" — {reason[:reason_max]}" if reason else "")
-                )
-
-    verdict = "pass" if all_passed else "fail"
-    summary = {
-        "verdict": verdict,
-        "checks": check_results,
-        "feedback": "\n".join(feedback_parts) if feedback_parts else "",
-    }
-
-    # Store verdict in judge arc state and history
-    with db_transaction() as db:
-        db.execute(
-            "INSERT INTO arc_state (arc_id, key, value_json) VALUES (?, ?, ?) "
-            "ON CONFLICT(arc_id, key) DO UPDATE SET value_json = excluded.value_json, "
-            "updated_at = CURRENT_TIMESTAMP",
-            (arc_id, "verdict", json.dumps(summary)),
-        )
-
-    arc_manager.add_history(
-        arc_id, "judge_verdict",
-        {"verdict": verdict, "checks": check_results},
-    )
-
-    # Also store verification summary on the target coding-change arc
-    _set_arc_state(verification_target_id, "_verification_summary", summary)
-
-    if all_passed:
-        logger.info(
-            "judge-verification arc %d: PASS (%d checks passed) for target %d",
-            arc_id, len(check_results), verification_target_id,
-        )
-        # Mark judge completed — standard propagation will dispatch docs arc
-        arc_manager.update_status(arc_id, "completed")
-        arc_manager.freeze_arc(arc_id)
-        _propagate_completion(arc_id)
-    else:
-        logger.info(
-            "judge-verification arc %d: FAIL for target %d: %s",
-            arc_id, verification_target_id, feedback_parts,
-        )
-
-        # Use arc_retry to decide whether to rework
-        verification_feedback = "\n".join(feedback_parts)
-        error_info = error_classifier.ErrorInfo(
-            type="VerificationError",
-            retry_count=0,
-            source_location="arc_dispatch_handler._handle_judge_verification",
-            message=f"Verification failed: {verification_feedback[:summary_max]}",
-        )
-        decision = arc_retry.should_retry_arc(verification_target_id, error_info)
-
-        if decision.should_retry:
-            # Record retry attempt (increments _retry_count)
-            arc_retry.record_retry_attempt(
-                verification_target_id, error_info, decision.backoff_seconds,
-            )
-            retry_state = arc_retry.get_retry_state(verification_target_id)
-            retry_count = retry_state.get("_retry_count", 1)
-
-            # Cancel the docs arc (not needed yet)
-            for sib in siblings:
-                if sib["name"] == _get_vname("documentation") and sib["status"] == "pending":
-                    arc_manager.update_status(sib["id"], "cancelled")
-
-            # Also bump rework_count so workspace is reused
-            rework_count = _get_arc_state(verification_target_id, "rework_count", 0)
-            _set_arc_state(verification_target_id, "rework_count", rework_count + 1)
-
-            # Determine max retries for display
-            max_retries = retry_state.get("_max_retries", 2)
-
-            # Build verification feedback prompt
-            from ...agent import templates
-            original_prompt = _get_arc_state(
-                verification_target_id, "original_prompt", "",
-            )
-            source_dir = _get_arc_state(verification_target_id, "source_dir", "")
-            revised_prompt = templates.render(
-                "verification_feedback",
-                original_prompt=original_prompt,
-                retry_count=retry_count,
-                max_retries=max_retries,
-                verification_feedback=verification_feedback,
-            )
-
-            # Clear verification pending flag (new cycle will set it again)
-            _set_arc_state(verification_target_id, "_verification_pending", False)
-
-            # Determine the correct invoke-agent event type based on target arc
-            target_arc = arc_manager.get_arc(verification_target_id)
-            target_name = target_arc.get("name", "") if target_arc else ""
-            if target_name.startswith(f"external-{CODING_CHANGE_PREFIX}"):
-                invoke_event = f"external-{CODING_CHANGE_PREFIX}.invoke-agent"
-            else:
-                invoke_event = f"{CODING_CHANGE_PREFIX}.invoke-agent"
-
-            # Re-enqueue coding agent
-            work_queue.enqueue(
-                invoke_event,
-                {
-                    "arc_id": verification_target_id,
-                    "source_dir": source_dir,
-                    "prompt": revised_prompt,
-                    "coding_agent": _get_arc_state(
-                        verification_target_id, "coding_agent",
-                    ),
-                },
-                idempotency_key=f"{CODING_CHANGE_PREFIX}-vrework-{verification_target_id}-{int(time.time())}",
-                max_retries=work_queue.SINGLE_ATTEMPT,
-            )
-
-            _notify_chat(
-                verification_target_id,
-                f"Verification failed (attempt {retry_count}/{max_retries}). "
-                f"Re-invoking coding agent with feedback...",
-            )
-
-            # Mark judge completed
-            arc_manager.update_status(arc_id, "completed")
-            arc_manager.freeze_arc(arc_id)
-
-            logger.info(
-                "Verification rework %d/%d for target arc %d",
-                retry_count, max_retries, verification_target_id,
-            )
-        else:
-            # Rework limit reached — proceed to human review with failure noted
-            retry_state = arc_retry.get_retry_state(verification_target_id)
-            retry_count = retry_state.get("_retry_count", 0)
-            logger.warning(
-                "Verification rework limit reached for target arc %d "
-                "(%d attempts). Proceeding to human review.",
-                verification_target_id, retry_count,
-            )
-
-            # Cancel the docs arc (verification failed, skip docs)
-            for sib in siblings:
-                if sib["name"] == _get_vname("documentation") and sib["status"] == "pending":
-                    arc_manager.update_status(sib["id"], "cancelled")
-
-            # Clear verification pending flag
-            _set_arc_state(verification_target_id, "_verification_pending", False)
-
-            # Transition coding-change arc to waiting for human review
-            target_arc = arc_manager.get_arc(verification_target_id)
-            if target_arc and target_arc["status"] == "active":
-                arc_manager.update_status(verification_target_id, "waiting")
-
-            _notify_chat(
-                verification_target_id,
-                f"AI verification failed after {retry_count} rework attempts. "
-                f"Proceeding to human review.\n\n"
-                f"Verification issues:\n{chr(10).join(feedback_parts)}",
-            )
-
-            # Mark judge completed
-            arc_manager.update_status(arc_id, "completed")
-            arc_manager.freeze_arc(arc_id)
+# Re-exported from model_fallback / judge_verification for backward compatibility.
+from .model_fallback import (  # noqa: E402
+    _PROVIDER_ERROR_TYPES,
+    _is_provider_error,
+    _record_model_call,
+    _try_fallback_models,
+)
+from .judge_verification import _handle_judge_verification  # noqa: E402
 
 
 def _handle_failed_docs_arc(arc_id: int) -> None:
@@ -750,7 +373,15 @@ def _handle_failed_docs_arc(arc_id: int) -> None:
     arc_info = arc_manager.get_arc(arc_id)
     if arc_info is None:
         return
-    if arc_info.get("name") != _get_vname_docs("documentation"):
+    # Prefer step_role-based dispatch; fall back to name-equality for legacy
+    # verification arcs predating the step_role column.
+    _failed_step_role = arc_info.get("step_role")
+    _is_docs_arc = (
+        _failed_step_role == "docs"
+        if _failed_step_role is not None
+        else arc_info.get("name") == _get_vname_docs("documentation")
+    )
+    if not _is_docs_arc:
         return
 
     verification_target_id = arc_info.get("verification_target_id")
@@ -798,10 +429,13 @@ def _enqueue_ext_post_verification(arc_id: int, arc_info: dict) -> None:
     else:
         event_type = f"external-{CODING_CHANGE_PREFIX}.push-and-pr"
 
+    _arc_info = arc_manager.get_arc(arc_id)
+    _arc_priority = (_arc_info or {}).get("priority", 100)
     work_queue.enqueue(
         event_type,
         {"arc_id": arc_id},
         idempotency_key=f"ext-cc-post-verify-{arc_id}-{int(time.time())}",
+        priority=_arc_priority,
     )
     logger.info(
         "Enqueued %s for external-coding-change arc %d after verification",
@@ -887,7 +521,7 @@ def _clone_arc_for_cron(
     If the original arc was a PLANNER with children, we also clone the
     children so the recurring dispatch actually executes them. When any
     child is non-trusted, the children are re-materialised via
-    :func:`create_untrusted_batch` so the review chain (Fernet keys,
+    ``arc_backend.handle_create_batch`` so the review chain (Fernet keys,
     ``review_keys`` rows, ``_reviewer_profile`` / ``_review_target`` arc
     state) is rebuilt — without this, cron repeats of untrusted workflows
     silently produce orphan untrusted arcs.
@@ -917,7 +551,7 @@ def _clone_arc_for_cron(
             integrity_level=original_info.get("integrity_level", "trusted"),
             output_type=original_info.get("output_type", "python"),
             agent_type=original_info.get("agent_type", "EXECUTOR"),
-            agent_config_id=original_info.get("agent_config_id"),
+            model_policy_id=original_info.get("model_policy_id"),
             timeout_minutes=original_info.get("timeout_minutes"),
         )
         if conversation_id:
@@ -937,20 +571,21 @@ def _clone_arc_for_cron(
                 # Re-materialise the children atomically as a batch so the
                 # review chain (Fernet keys, review_keys rows, arc_state)
                 # is wired correctly.
-                from ..trust.batch import create_untrusted_batch
+                from ...tool_backends import arc as arc_backend
 
                 arc_specs = []
                 for child in original_children:
                     spec: dict = {
                         "name": child.get("name", "cloned-child"),
                         "goal": child.get("goal"),
+                        "parent_id": new_arc_id,
                         "integrity_level": child.get("integrity_level", "trusted"),
                         "output_type": child.get("output_type", "python"),
                         "agent_type": child.get("agent_type", "EXECUTOR"),
                         "step_order": child.get("step_order", 0),
                     }
-                    if child.get("agent_config_id") is not None:
-                        spec["agent_config_id"] = child["agent_config_id"]
+                    if child.get("model_policy_id") is not None:
+                        spec["model_policy_id"] = child["model_policy_id"]
                     if child.get("timeout_minutes") is not None:
                         spec["timeout_minutes"] = child["timeout_minutes"]
                     # Re-attach reviewer profile so JUDGE/REVIEWER arcs get
@@ -960,8 +595,8 @@ def _clone_arc_for_cron(
                         spec["reviewer_profile"] = rprofile
                     arc_specs.append(spec)
 
-                batch_result = create_untrusted_batch(
-                    arc_specs, parent_id=new_arc_id,
+                batch_result = arc_backend.handle_create_batch(
+                    {"arcs": arc_specs}
                 )
                 if "error" in batch_result:
                     logger.error(
@@ -982,7 +617,7 @@ def _clone_arc_for_cron(
                         integrity_level=child.get("integrity_level", "trusted"),
                         output_type=child.get("output_type", "python"),
                         agent_type=child.get("agent_type", "EXECUTOR"),
-                        agent_config_id=child.get("agent_config_id"),
+                        model_policy_id=child.get("model_policy_id"),
                         timeout_minutes=child.get("timeout_minutes"),
                     )
                     if conversation_id:
@@ -1002,7 +637,7 @@ def _clone_arc_for_cron(
 
 
 def _read_reviewer_profile(arc_id: int) -> str | None:
-    """Read the `_reviewer_profile` arc_state value for an arc, if any."""
+    """Read the ``_reviewer_profile`` arc_state value for an arc, if any."""
     try:
         with db_connection() as db:
             row = db.execute(
@@ -1191,7 +826,7 @@ async def _run_arc_agent(
     archives the ephemeral conversation.
 
     Args:
-        agent_config: Optional agent_configs row dict with 'model', 'agent_role',
+        agent_config: Optional model_policies row dict with 'model', 'agent_role',
                       'temperature', 'max_tokens'. When present, overrides the
                       default model for this invocation.
     """
@@ -1395,6 +1030,7 @@ def _enqueue_ready_children(parent_id: int):
             "arc.dispatch",
             {"arc_id": child["id"]},
             idempotency_key=f"arc_dispatch:{child['id']}",
+            priority=child.get("priority", 100),
         )
         logger.info("Enqueued arc %d for dispatch (child of %d)", child["id"], parent_id)
 
@@ -1415,7 +1051,7 @@ def scan_for_ready_arcs():
         # exclusively by coding_change_handler via its own work queue events.
         # Also skip arcs with a future wait_until timestamp (heartbeat guard).
         rows = db.execute(
-            "SELECT id, parent_id FROM arcs "
+            "SELECT id, parent_id, priority FROM arcs "
             "WHERE status = 'pending' "
             f"AND (name IS NULL OR name NOT LIKE '{CODING_CHANGE_PREFIX}%') "
             "AND (wait_until IS NULL OR wait_until <= datetime('now'))"
@@ -1450,6 +1086,7 @@ def scan_for_ready_arcs():
             "arc.dispatch",
             {"arc_id": arc_id},
             idempotency_key=f"arc_dispatch:{arc_id}",
+            priority=row["priority"] if "priority" in row.keys() else 100,
         )
         logger.info("Heartbeat: enqueued ready arc %d for dispatch", arc_id)
 
@@ -1522,12 +1159,17 @@ def _reenqueue_arc_dispatch(arc_id: int, backoff_seconds: float) -> None:
     # Schedule for future execution
     scheduled_at = datetime.now(timezone.utc) + timedelta(seconds=backoff_seconds)
 
+    # Preserve the arc's priority across retries
+    arc_info = arc_manager.get_arc(arc_id)
+    arc_priority = (arc_info or {}).get("priority", 100)
+
     work_queue.enqueue(
         event_type="arc.dispatch",
         payload={"arc_id": arc_id},
         idempotency_key=f"arc_dispatch_{arc_id}_{int(time.time())}",  # Unique per attempt
         max_retries=work_queue.SINGLE_ATTEMPT,
         scheduled_at=scheduled_at.isoformat(),
+        priority=arc_priority,
     )
 
 
@@ -1544,7 +1186,10 @@ def _fire_connectivity_degraded(arc_id: int) -> None:
             category="connectivity",
         )
     except Exception:  # broad catch: notification delivery may raise anything
-        pass
+        logger.debug(
+            "Failed to send connectivity-degraded notification for arc %d",
+            arc_id, exc_info=True,
+        )
     try:
         arc_manager.update_status(arc_id, "waiting")
     except (ValueError, sqlite3.Error) as _exc:

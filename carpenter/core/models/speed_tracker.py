@@ -4,7 +4,7 @@ Queries the api_calls table for recent latency data, computes median
 seconds-per-ktok-output per model, and updates the model registry with
 the measured speeds.
 
-Called from the daily reflection hook to keep registry data fresh.
+Called on a daily cadence to keep registry data fresh.
 """
 
 import logging
@@ -27,7 +27,7 @@ def compute_measured_speeds(days: int = 7) -> dict[str, float]:
         days: Number of days of data to consider.
 
     Returns:
-        Dict mapping model string (e.g., "claude-opus-4-6") to
+        Dict mapping model string (e.g., "claude-opus-4-7") to
         measured speed in seconds per ktok output.
     """
     cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()

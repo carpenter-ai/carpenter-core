@@ -14,6 +14,7 @@ import tempfile
 import time
 
 import dulwich.porcelain as porcelain
+from dulwich.errors import NotGitRepository
 from dulwich.repo import Repo
 
 from ..db import get_db, db_connection
@@ -116,8 +117,8 @@ def create_workspace(source_dir: str, label: str) -> tuple[str, str | None]:
     try:
         r = Repo(source_dir)
         base_sha = r.head().decode()
-    except Exception:
-        pass  # Not a git repo or no HEAD
+    except (NotGitRepository, KeyError):
+        pass  # Not a git repo, or repo has no HEAD ref yet
 
     workspaces_dir = config.CONFIG.get(
         "workspaces_dir",
@@ -214,7 +215,7 @@ def apply_to_source(workspace_path: str, source_dir: str) -> list[str]:
     if source_is_git:
         try:
             return _apply_via_file_copy(workspace_path, source_dir, changed)
-        except Exception as e:
+        except OSError as e:
             raise RuntimeError(
                 f"Patch failed to apply cleanly — source may have diverged "
                 f"in conflicting ways.\n{e}"
@@ -376,7 +377,8 @@ def _handle_merge_conflict(
         porcelain.diff(source_dir, outstream=buf)
         conflict_diff = buf.getvalue().decode("utf-8", errors="replace")
     except Exception:
-        logger.debug("Failed to capture conflict diff", exc_info=True)
+        # Suppression intentional: best-effort diff capture for diagnostics.
+        logger.info("Failed to capture conflict diff", exc_info=True)
 
     # Abort: reset to original branch state
     porcelain.reset(source_dir, "hard", f"refs/heads/{original_branch}")
@@ -402,7 +404,8 @@ def _cleanup_temp_branch(source_dir: str, temp_branch: str) -> None:
     try:
         porcelain.branch_delete(source_dir, temp_branch)
     except Exception:
-        logger.debug("Failed to delete temp branch during cleanup", exc_info=True)
+        # Suppression intentional: cleanup of throwaway temp branch.
+        logger.info("Failed to delete temp branch during cleanup", exc_info=True)
 
 
 def _cleanup_on_error(source_dir: str, temp_branch: str, original_branch: str) -> None:
@@ -416,7 +419,8 @@ def _cleanup_on_error(source_dir: str, temp_branch: str, original_branch: str) -
     try:
         porcelain.checkout(source_dir, target=original_branch.encode(), force=True)
     except Exception:
-        logger.debug("Failed to checkout original branch during error cleanup", exc_info=True)
+        # Suppression intentional: error-path cleanup, original error is what matters.
+        logger.info("Failed to checkout original branch during error cleanup", exc_info=True)
     
     _cleanup_temp_branch(source_dir, temp_branch)
 

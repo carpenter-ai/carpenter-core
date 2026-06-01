@@ -3,7 +3,7 @@
 When a root arc (no parent) completes, generates an AI summary of
 the work performed and writes it as a KB entry under work/.
 
-No pruning — deferred to the reflections phase.
+No pruning — deferred.
 """
 
 import logging

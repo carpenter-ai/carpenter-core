@@ -12,7 +12,7 @@ Models are defined in `model_registry.yaml` (synced from `config_seed/model-regi
 models:
   opus:
     provider: anthropic
-    model_id: claude-opus-4-6
+    model_id: claude-opus-4-7
     quality_tier: 5              # 1-5 scale
     cost_per_mtok_in: 15.0       # USD per million input tokens
     cost_per_mtok_out: 75.0      # USD per million output tokens
@@ -35,7 +35,7 @@ models:
 
 | Field | Type | Description |
 |---|---|---|
-| `provider` | string | `anthropic`, `ollama`, `local`, `tinfoil` |
+| `provider` | string | `anthropic`, `ollama`, `tinfoil` |
 | `model_id` | string | Provider-specific model identifier |
 | `quality_tier` | int | 1 (lowest) to 5 (highest) quality rating |
 | `cost_per_mtok_in` | float | Input cost in USD per million tokens |
@@ -179,7 +179,7 @@ ModelPolicy(
 
 ```python
 ModelPolicy(
-    model="anthropic:claude-sonnet-4-5-20250929",  # Bypasses selector entirely
+    model="anthropic:claude-sonnet-4-6",  # Bypasses selector entirely
 )
 ```
 

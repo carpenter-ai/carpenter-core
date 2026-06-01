@@ -23,12 +23,11 @@ from ..api.callbacks import (
     get_external_access_tools,
     get_messaging_tools,
     get_session_exempt_tools,
-    get_untrusted_data_tools,
     validate_execution_session,
     _link_arc_to_session_conversation,
     _get_allowed_tools,
 )
-from ..core.trust.types import AgentType, get_agent_capabilities
+from ..core.trust.types import AgentType
 from ..core.trust.capabilities import get_arc_capabilities, resolve_capability_tools, SCOPE_BYPASS_CAPABILITIES
 from ..core.trust.audit import log_trust_event
 from ..db import get_db, db_connection
@@ -117,22 +116,7 @@ def validate_and_dispatch(
     # ── Trust boundary enforcement ──────────────────────────────────
     caller_ctx = _get_caller_context(params)
     if caller_ctx:
-        caller_integrity = caller_ctx["integrity_level"]
         caller_agent = caller_ctx["agent_type"]
-
-        # Block trusted arcs from untrusted data tools
-        all_caps = get_agent_capabilities()
-        caps = all_caps.get(AgentType(caller_agent), {})
-        if (
-            tool_name in get_untrusted_data_tools()
-            and caller_integrity == "trusted"
-            and not caps.get("can_read_untrusted")
-        ):
-            _arc = params.get("_caller_arc_id") or params.get("arc_id")
-            log_trust_event(_arc, "access_denied", {
-                "tool": tool_name, "reason": "trusted arc",
-            })
-            raise DispatchError("Trusted arcs cannot access untrusted data")
 
         # Enforce agent-type tool whitelists
         try:

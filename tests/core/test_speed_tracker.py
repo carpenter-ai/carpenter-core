@@ -61,11 +61,11 @@ class TestComputeMeasuredSpeeds:
         assert compute_measured_speeds() == {}
 
     def test_single_call(self, speed_db):
-        _insert_call(speed_db, "claude-sonnet-4-5-20250929", 2000, 500)
+        _insert_call(speed_db, "claude-sonnet-4-6", 2000, 500)
         # 2s / 0.5ktok = 4.0 s/ktok
         speeds = compute_measured_speeds()
-        assert "claude-sonnet-4-5-20250929" in speeds
-        assert speeds["claude-sonnet-4-5-20250929"] == 4.0
+        assert "claude-sonnet-4-6" in speeds
+        assert speeds["claude-sonnet-4-6"] == 4.0
 
     def test_median_odd(self, speed_db):
         """Median of 3 values = middle value."""
@@ -116,7 +116,7 @@ class TestComputeMeasuredSpeeds:
 
 class TestUpdateRegistrySpeeds:
     def test_updates_registry(self, speed_db, monkeypatch):
-        _insert_call(speed_db, "claude-sonnet-4-5-20250929", 2000, 500)
+        _insert_call(speed_db, "claude-sonnet-4-6", 2000, 500)
 
         updated_keys = {}
 
@@ -126,7 +126,7 @@ class TestUpdateRegistrySpeeds:
         registry = {
             "sonnet": ModelEntry(
                 key="sonnet", provider="anthropic",
-                model_id="claude-sonnet-4-5-20250929",
+                model_id="claude-sonnet-4-6",
                 quality_tier=4, cost_per_mtok_in=3.0,
                 cost_per_mtok_out=15.0, cached_cost_per_mtok_in=0.3,
                 context_window=200000, capabilities=[],

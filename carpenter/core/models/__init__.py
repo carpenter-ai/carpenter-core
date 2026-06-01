@@ -6,7 +6,7 @@ Re-exports key public symbols for convenient access::
 """
 
 # Registry
-from .registry import ModelEntry, get_registry, load_registry, get_entry, get_entry_by_model_id, reload_registry, update_measured_speed, get_local_downloadable_models  # noqa: F401
+from .registry import ModelEntry, get_registry, load_registry, get_entry, get_entry_by_model_id, reload_registry, update_measured_speed  # noqa: F401
 
 # Selector
 from .selector import PolicyConstraints, ModelPolicy, SelectionResult, select_model, select_models, get_presets, PRESETS  # noqa: F401

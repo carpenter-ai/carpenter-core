@@ -55,48 +55,6 @@ Per-model health is tracked via a sliding window of the last 20 API call outcome
 
 ---
 
-## Local Fallback
-
-When all cloud retries are exhausted, the system can fall back to a local model (e.g., Ollama running on the network).
-
-### How It Works
-
-1. After `_call_with_retries()` exhausts all retry attempts (or all cloud models are circuit-open), it calls `_try_local_fallback()`
-2. Fallback is only attempted when `tools is None` (tool calling not supported in fallback)
-3. The function checks config-level operation filtering (allowed/blocked lists)
-4. Messages are converted from Anthropic to OpenAI format and truncated to fit the local model's context window
-5. A direct `httpx.post` call is made to the configured endpoint (bypassing client-level circuit breakers)
-6. Success/failure is recorded in model health under the `fallback:` prefix
-
-### Fast Detection ("All Cloud Down")
-
-Before entering the retry loop, `_call_with_retries()` checks `all_cloud_models_circuit_open()`. If all cloud models (cost > 0 in the registry) have open circuit breakers AND no tools are needed, it skips retries entirely and goes straight to local fallback. This avoids unnecessary retry delays when cloud is known to be down.
-
-### Per-Arc Override
-
-Individual arcs can control fallback behavior via `arc_state`:
-
-```python
-# Block fallback for this arc (e.g., security-sensitive operations)
-_set_arc_state(db, arc_id, "_fallback_allowed", False)
-
-# Explicitly allow (or leave absent for default behavior)
-_set_arc_state(db, arc_id, "_fallback_allowed", True)
-```
-
-When `_fallback_allowed` is `False`, the fallback is skipped regardless of config.
-
-### Operation Filtering
-
-The `local_fallback` config controls which operations can use fallback:
-
-- `allowed_operations`: Whitelist (if non-empty, only these are allowed)
-- `blocked_operations`: Blacklist (always checked first)
-
-Default: allow `chat`, `summarization`, `simple_code`; block `review`, `security_review`, `planning`.
-
----
-
 ## Provider-Level Health
 
 Health is also aggregated at the provider level:
@@ -143,27 +101,6 @@ arc_retry:
     default: false
 ```
 
-### `local_fallback` Section
-
-```yaml
-local_fallback:
-  enabled: false                     # Must be true to use fallback
-  provider: "ollama"
-  url: ""                            # e.g., "http://192.168.2.243:11434"
-  model: "qwen3.5:9b"
-  context_window: 16384
-  timeout: 300                       # HTTP timeout in seconds
-  max_tokens: 4096
-  allowed_operations:                # Whitelist (empty = allow all)
-    - chat
-    - summarization
-    - simple_code
-  blocked_operations:                # Blacklist (checked first)
-    - review
-    - security_review
-    - planning
-```
-
 ### Model Health Constants (in `model_health.py`)
 
 | Constant | Value | Description |
@@ -191,29 +128,19 @@ UPDATE arcs SET status = 'pending' WHERE id = ?;
 DELETE FROM arc_state WHERE arc_id = ? AND key IN ('_retry_count', '_backoff_until');
 ```
 
-### Fallback not activating
-
-**Check**:
-1. `local_fallback.enabled` is `true` in config
-2. `local_fallback.url` is set and reachable
-3. The operation type is in `allowed_operations` (or list is empty)
-4. The operation type is NOT in `blocked_operations`
-5. `tools` is `None` (fallback doesn't support tool calling)
-6. Arc doesn't have `_fallback_allowed = false` in `arc_state`
-
 ### Circuit breaker stuck open
 
 **Diagnosis**: Check model health:
 ```python
 from carpenter.core.model_health import get_model_health
-state = get_model_health("anthropic:claude-sonnet-4-5-20250929")
+state = get_model_health("anthropic:claude-sonnet-4-6")
 print(state.health, state.circuit_open_until)
 ```
 
 **Fix**: Manual reset:
 ```python
 from carpenter.core.model_health import reset_circuit_breaker
-reset_circuit_breaker("anthropic:claude-sonnet-4-5-20250929")
+reset_circuit_breaker("anthropic:claude-sonnet-4-6")
 ```
 
 ### Resetting all circuit breakers

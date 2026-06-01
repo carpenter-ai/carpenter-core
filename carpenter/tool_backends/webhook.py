@@ -1,16 +1,16 @@
 """Webhook subscription management tool backend.
 
 Provides subscribe/list/delete operations for webhook subscriptions.
-Subscribe also registers the webhook on the Forgejo side so everything
-is wired up in a single call.
+Subscribe also registers the webhook on the configured forge so
+everything is wired up in a single call.
 """
 import json
 import logging
 import secrets
 
 from ..core.workflows import webhook_dispatch_handler
-from . import forgejo_api as forgejo_api_backend
-from .. import config
+from ..forges import get_forge_provider
+from .. import config, constants
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +27,7 @@ def _build_webhook_target_url(webhook_id: str) -> str:
         host_part = tls_domain
     else:
         host = config.CONFIG.get("host", "127.0.0.1")
-        port = config.CONFIG.get("port", 7842)
+        port = config.CONFIG.get("port", constants.DEFAULT_API_PORT)
         scheme = "https" if config.CONFIG.get("tls_enabled") else "http"
         host_part = f"{host}:{port}"
 
@@ -48,7 +48,7 @@ def handle_subscribe(params: dict) -> dict:
 
     Returns: {webhook_id, subscription_id, forge_hook_id}
     """
-    source_type = params.get("source_type", "forgejo")
+    source_type = params.get("source_type") or config.CONFIG.get("forge", "forgejo")
     event_filter = params.get("event_filter", [])
     action_type = params.get("action_type", "create_arc")
     action_config = params.get("action_config", {})
@@ -59,19 +59,22 @@ def handle_subscribe(params: dict) -> dict:
     # Generate a unique webhook ID
     webhook_id = secrets.token_hex(16)
 
-    # Register webhook on Forgejo if repo info is provided
+    # Register webhook on the configured forge if repo info is provided
+    # AND a provider is registered for this source_type.
     forge_hook_id = None
-    if source_type == "forgejo" and repo_owner and repo_name:
-        target_url = _build_webhook_target_url(webhook_id)
-        hook_result = forgejo_api_backend.handle_create_repo_webhook({
-            "repo_owner": repo_owner,
-            "repo_name": repo_name,
-            "target_url": target_url,
-            "events": event_filter or ["push"],
-        })
-        if "error" in hook_result:
-            return {"error": f"Failed to register Forgejo webhook: {hook_result['error']}"}
-        forge_hook_id = hook_result.get("hook_id")
+    if repo_owner and repo_name:
+        provider = get_forge_provider(source_type)
+        if provider is not None:
+            target_url = _build_webhook_target_url(webhook_id)
+            hook_result = provider.create_repo_webhook({
+                "repo_owner": repo_owner,
+                "repo_name": repo_name,
+                "target_url": target_url,
+                "events": event_filter or ["push"],
+            })
+            if "error" in hook_result:
+                return {"error": f"Failed to register forge webhook: {hook_result['error']}"}
+            forge_hook_id = hook_result.get("hook_id")
 
     # Create the subscription in our database
     subscription_id = webhook_dispatch_handler.create_subscription(
@@ -142,7 +145,7 @@ def handle_delete(params: dict) -> dict:
         deleted = webhook_dispatch_handler.delete_subscription(webhook_id)
         return {"deleted": deleted}
 
-    # Delete Forgejo-side webhook if we have the hook ID and repo info
+    # Delete forge-side webhook if we have the hook ID and repo info
     forge_hook_id = sub.get("forge_hook_id")
     if forge_hook_id:
         source_config = sub.get("source_config", "{}")
@@ -156,17 +159,19 @@ def handle_delete(params: dict) -> dict:
         repo_name = source_config.get("repo_name", "")
 
         if repo_owner and repo_name:
-            delete_result = forgejo_api_backend.handle_delete_repo_webhook({
-                "repo_owner": repo_owner,
-                "repo_name": repo_name,
-                "hook_id": forge_hook_id,
-            })
-            if "error" in delete_result:
-                logger.warning(
-                    "Failed to delete Forgejo webhook %s: %s",
-                    forge_hook_id, delete_result["error"],
-                )
-                # Continue with local deletion even if Forgejo cleanup fails
+            provider = get_forge_provider(sub.get("source_type"))
+            if provider is not None:
+                delete_result = provider.delete_repo_webhook({
+                    "repo_owner": repo_owner,
+                    "repo_name": repo_name,
+                    "hook_id": forge_hook_id,
+                })
+                if "error" in delete_result:
+                    logger.warning(
+                        "Failed to delete forge webhook %s: %s",
+                        forge_hook_id, delete_result["error"],
+                    )
+                    # Continue with local deletion even if forge cleanup fails
 
     deleted = webhook_dispatch_handler.delete_subscription(webhook_id)
 

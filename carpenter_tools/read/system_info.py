@@ -1,4 +1,7 @@
-"""System information utilities - read-only tool."""
+"""System info tool declarations.
+
+See ``carpenter_tools`` package docstring for the invocation model.
+"""
 
 import socket
 import sys

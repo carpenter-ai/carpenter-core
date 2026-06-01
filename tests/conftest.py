@@ -159,7 +159,7 @@ def _get_template_db():
             "models": {
                 "opus": {
                     "provider": "anthropic",
-                    "model_id": "claude-opus-4-20250514",
+                    "model_id": "claude-opus-4-7",
                     "description": "Most capable model.",
                     "cost_tier": "high",
                     "context_window": 200000,
@@ -167,7 +167,7 @@ def _get_template_db():
                 },
                 "sonnet": {
                     "provider": "anthropic",
-                    "model_id": "claude-sonnet-4-20250514",
+                    "model_id": "claude-sonnet-4-6",
                     "description": "Balanced capability and cost.",
                     "cost_tier": "medium",
                     "context_window": 200000,
@@ -175,7 +175,7 @@ def _get_template_db():
                 },
                 "haiku": {
                     "provider": "anthropic",
-                    "model_id": "claude-haiku-4-5-20251001",
+                    "model_id": "claude-haiku-4-5",
                     "description": "Fast and cheap.",
                     "cost_tier": "low",
                     "context_window": 200000,
@@ -186,21 +186,8 @@ def _get_template_db():
                 "default": "", "chat": "", "default_step": "",
                 "title": "", "summary": "", "compaction": "",
                 "code_review": "", "review_judge": "",
-                "reflection_daily": "", "reflection_weekly": "", "reflection_monthly": "",
             },
             "memory_recent_hints": 3,
-            "reflection": {
-                "enabled": False,
-                "min_daily_conversations": 1,
-                "daily_cron": "0 23 * * *",
-                "weekly_cron": "0 23 * * 0",
-                "monthly_cron": "0 23 1 * *",
-                "auto_action": False,
-                "review_mode": "auto",
-                "tainted_review_mode": "human",
-                "max_actions_per_reflection": 10,
-                "max_actions_per_day": 50,
-            },
             "tool_output_max_bytes": 32768,
             "tool_output_head_lines": 50,
             "tool_output_tail_lines": 20,
@@ -379,7 +366,7 @@ def test_db(tmp_path, monkeypatch):
         "models": {
             "opus": {
                 "provider": "anthropic",
-                "model_id": "claude-opus-4-20250514",
+                "model_id": "claude-opus-4-7",
                 "description": "Most capable model.",
                 "cost_tier": "high",
                 "context_window": 200000,
@@ -387,7 +374,7 @@ def test_db(tmp_path, monkeypatch):
             },
             "sonnet": {
                 "provider": "anthropic",
-                "model_id": "claude-sonnet-4-20250514",
+                "model_id": "claude-sonnet-4-6",
                 "description": "Balanced capability and cost.",
                 "cost_tier": "medium",
                 "context_window": 200000,
@@ -395,7 +382,7 @@ def test_db(tmp_path, monkeypatch):
             },
             "haiku": {
                 "provider": "anthropic",
-                "model_id": "claude-haiku-4-5-20251001",
+                "model_id": "claude-haiku-4-5",
                 "description": "Fast and cheap.",
                 "cost_tier": "low",
                 "context_window": 200000,
@@ -406,16 +393,8 @@ def test_db(tmp_path, monkeypatch):
             "default": "", "chat": "", "default_step": "",
             "title": "", "summary": "", "compaction": "",
             "code_review": "", "review_judge": "",
-            "reflection_daily": "", "reflection_weekly": "", "reflection_monthly": "",
         },
         "memory_recent_hints": 3,
-        "reflection": {
-            "enabled": False,
-            "min_daily_conversations": 1,
-            "daily_cron": "0 23 * * *",
-            "weekly_cron": "0 23 * * 0",
-            "monthly_cron": "0 23 1 * *",
-        },
         "tool_output_max_bytes": 32768,
         "tool_output_head_lines": 50,
         "tool_output_tail_lines": 20,

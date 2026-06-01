@@ -1,18 +1,20 @@
 """Webhook dispatch handler — routes incoming webhooks to arc/work actions.
 
 When a webhook event is received (via /api/webhooks/{webhook_id}), this
-handler looks up the subscription, parses the payload by source_type,
-and executes the configured action (create arc from template or enqueue
-a work item).
+handler looks up the subscription, parses the payload via the configured
+forge provider, and executes the configured action (create arc from
+template or enqueue a work item).
 
-Source type parsers are pluggable. This module ships with Forgejo support;
-GitHub, GitLab, and generic parsers can be added later.
+Forge-specific payload parsing now lives on each
+:class:`carpenter.forges.protocol.ForgeProvider` implementation
+(``parse_webhook_legacy``).  ``"generic"`` source_type is handled inline.
 """
 
 import json
 import logging
 
 from ...db import get_db, db_connection, db_transaction
+from ...forges import get_forge_provider
 from ..arcs import manager as arc_manager
 from ..engine import work_queue
 
@@ -20,71 +22,38 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Payload parsers — one per source_type
+# Built-in parsers
 # ---------------------------------------------------------------------------
 
 
-def _parse_forgejo_payload(data: dict, event_filter: list) -> dict | None:
-    """Parse a Forgejo webhook payload.
+def _parse_generic_payload(data: dict, event_filter: list) -> dict | None:
+    """Passthrough parser for arbitrary JSON webhooks.
 
-    Returns a normalized event dict or None if the event should be ignored.
+    Returns a minimal normalized event dict.  The raw payload body is
+    preserved in ``data`` so downstream handlers (e.g. the Resource
+    wrap path) can write it untouched to the Resource blob.
     """
-    action = data.get("action", "")
-    event_type = None
-
-    # Determine event type from payload structure
-    if "pull_request" in data:
-        event_type = "pull_request"
-    elif "ref" in data and "commits" in data:
-        event_type = "push"
-    elif "issue" in data:
-        event_type = "issues"
-    elif "release" in data:
-        event_type = "release"
-    else:
-        event_type = "unknown"
-
-    # Filter check
-    if event_filter and event_type not in event_filter:
-        return None
-
-    result = {
-        "source_type": "forgejo",
-        "event_type": event_type,
-        "action": action,
+    return {
+        "source_type": "generic",
+        "event_type": "generic",
+        "action": "",
     }
 
-    # Extract PR details
-    if event_type == "pull_request":
-        pr = data.get("pull_request", {})
-        # Only process opened/synchronize/reopened actions
-        if action not in ("opened", "synchronize", "reopened", "edited"):
-            if event_filter and "pull_request" in event_filter:
-                # User wants PR events but this action isn't interesting
-                return None
-        result["pr_number"] = pr.get("number")
-        result["pr_title"] = pr.get("title", "")
-        result["pr_body"] = pr.get("body", "")
-        result["pr_state"] = pr.get("state", "")
-        result["pr_user"] = pr.get("user", {}).get("login", "")
-        result["head_branch"] = pr.get("head", {}).get("ref", "")
-        result["base_branch"] = pr.get("base", {}).get("ref", "")
-        result["html_url"] = pr.get("html_url", "")
-        # Repo info
-        repo = data.get("repository", {})
-        result["repo_owner"] = repo.get("owner", {}).get("login", "")
-        result["repo_name"] = repo.get("name", "")
 
-    elif event_type == "push":
-        result["ref"] = data.get("ref", "")
-        result["commits"] = len(data.get("commits", []))
+def _parse_payload(source_type: str, data: dict, event_filter: list) -> dict | None:
+    """Resolve the parser for ``source_type`` and apply it.
 
-    return result
-
-
-_PARSERS = {
-    "forgejo": _parse_forgejo_payload,
-}
+    For ``"generic"`` the built-in parser is used.  Any other
+    ``source_type`` is looked up in the forge-provider registry and the
+    provider's ``parse_webhook_legacy`` is invoked.  Returns ``None`` when
+    no provider handles the type (callers log + skip).
+    """
+    if source_type == "generic":
+        return _parse_generic_payload(data, event_filter)
+    provider = get_forge_provider(source_type)
+    if provider is None:
+        return None
+    return provider.parse_webhook_legacy(data, event_filter)
 
 
 # ---------------------------------------------------------------------------
@@ -101,8 +70,22 @@ def create_subscription(
     event_filter: list | None = None,
     conversation_id: int | None = None,
     forge_hook_id: int | None = None,
+    resource_content_type: str | None = None,
+    auto_approve_verdict: bool = False,
 ) -> int:
     """Create a webhook subscription.
+
+    Optional Phase B PR B2 params:
+        resource_content_type: when set, incoming webhook payloads are
+            wrapped as raw-ingest Resources with this content_type and a
+            REVIEWER (+JUDGE) template pipeline is spawned to process
+            them.  Must match a template's ``consumes_content_type`` in
+            ``config_seed/resource_templates.yaml`` — otherwise the
+            wrap path falls back to legacy behaviour.
+        auto_approve_verdict: config override to the "nothing starts
+            trusted" default.  When True, no JUDGE arc is spawned; the
+            REVIEWER's completion auto-marks the derived Resource as
+            approved.
 
     Returns the subscription ID.
     """
@@ -110,8 +93,9 @@ def create_subscription(
         cursor = db.execute(
             "INSERT INTO webhook_subscriptions "
             "(webhook_id, source_type, source_config, event_filter, "
-            " action_type, action_config, conversation_id, forge_hook_id) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            " action_type, action_config, conversation_id, forge_hook_id, "
+            " resource_content_type, auto_approve_verdict) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 webhook_id,
                 source_type,
@@ -121,6 +105,8 @@ def create_subscription(
                 json.dumps(action_config or {}),
                 conversation_id,
                 forge_hook_id,
+                resource_content_type,
+                1 if auto_approve_verdict else 0,
             ),
         )
         return cursor.lastrowid
@@ -197,15 +183,16 @@ async def handle_webhook_received(work_id: int, payload: dict):
     action_type = sub["action_type"]
     action_config = json.loads(sub["action_config"]) if isinstance(sub["action_config"], str) else sub["action_config"]
 
-    # Parse payload
-    parser = _PARSERS.get(source_type)
-    if parser is None:
-        logger.warning("No parser for source_type '%s'", source_type)
-        return
-
-    parsed = parser(data, event_filter)
+    # Parse payload via the forge-provider registry (or built-in generic).
+    parsed = _parse_payload(source_type, data, event_filter)
     if parsed is None:
-        logger.debug("Webhook %s event filtered out", webhook_id)
+        # Either no provider handles source_type, or the parser filtered
+        # the event out.  Log unknown-provider case loudly; filter case
+        # quietly.
+        if source_type != "generic" and get_forge_provider(source_type) is None:
+            logger.warning("No provider for source_type '%s'", source_type)
+        else:
+            logger.debug("Webhook %s event filtered out", webhook_id)
         return
 
     logger.info(
@@ -213,6 +200,23 @@ async def handle_webhook_received(work_id: int, payload: dict):
         webhook_id, parsed.get("event_type"), parsed.get("action", ""),
         action_type,
     )
+
+    # Phase B PR B2: Resource-wrap path.  When the subscription configures
+    # a ``resource_content_type``, wrap the payload as a raw-ingest
+    # Resource and spawn a template pipeline.  Falls back to legacy
+    # behaviour when the content_type has no registered template
+    # (wrap_webhook_as_resource returns None in that case).
+    if sub.get("resource_content_type"):
+        from .webhook_resource_wrap import wrap_webhook_as_resource
+        result = wrap_webhook_as_resource(
+            webhook_id=webhook_id,
+            payload=data,
+            parsed=parsed,
+            subscription=sub,
+        )
+        if result is not None:
+            return
+        # else: template missing — fall through to legacy path.
 
     # Execute action
     if action_type == "create_arc":

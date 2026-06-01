@@ -18,28 +18,30 @@ import json
 import logging
 import os
 from datetime import datetime, timezone
-from string import Template
-from typing import Any
 
 import yaml
 
-from ...db import db_connection, db_transaction
+from ...db import get_db, db_connection, db_transaction
 
 logger = logging.getLogger(__name__)
 
 
-def _parse_steps_json(raw_json: str) -> tuple[list, list]:
-    """Parse steps_json, handling both old list and new dict formats.
+def _parse_steps_json(raw_json: str) -> tuple[list, list, list]:
+    """Parse steps_json, handling legacy list and dict formats.
 
-    Returns (steps, capabilities) where capabilities defaults to []
-    for templates stored before the capability grant feature.
+    Returns (steps, capabilities, triggers). The older formats default
+    the missing fields to empty lists so previously stored templates
+    continue to deserialise.
     """
     parsed = json.loads(raw_json)
     if isinstance(parsed, list):
-        # Legacy format: plain list of steps, no template capabilities
-        return parsed, []
-    # New format: {"steps": [...], "capabilities": [...]}
-    return parsed.get("steps", []), parsed.get("capabilities", [])
+        # Legacy format: plain list of steps.
+        return parsed, [], []
+    return (
+        parsed.get("steps", []),
+        parsed.get("capabilities", []),
+        parsed.get("triggers", []),
+    )
 
 
 def load_template(yaml_path: str) -> int:
@@ -59,10 +61,15 @@ def load_template(yaml_path: str) -> int:
     required_for = data.get("required_for", [])
     steps = data.get("steps", [])
     capabilities = data.get("capabilities", [])
+    triggers = data.get("triggers", [])
 
     required_for_json = json.dumps(required_for)
-    # Store as dict with steps + template-level capabilities
-    steps_json = json.dumps({"steps": steps, "capabilities": capabilities})
+    # Store as dict with steps, template-level capabilities, and triggers.
+    steps_json = json.dumps({
+        "steps": steps,
+        "capabilities": capabilities,
+        "triggers": triggers,
+    })
 
     with db_transaction() as db:
         existing = db.execute(
@@ -130,7 +137,11 @@ def get_template(
         if row is None:
             return None
         result = dict(row)
-        result["steps"], result["capabilities"] = _parse_steps_json(result["steps_json"])
+        (
+            result["steps"],
+            result["capabilities"],
+            result["triggers"],
+        ) = _parse_steps_json(result["steps_json"])
         result["required_for"] = json.loads(result["required_for_json"]) if result["required_for_json"] else []
         return result
 
@@ -155,7 +166,7 @@ def list_templates() -> list[dict]:
         results = []
         for row in rows:
             d = dict(row)
-            d["steps"], d["capabilities"] = _parse_steps_json(d["steps_json"])
+            d["steps"], d["capabilities"], d["triggers"] = _parse_steps_json(d["steps_json"])
             d["required_for"] = json.loads(d["required_for_json"]) if d["required_for_json"] else []
             results.append(d)
         return results
@@ -174,7 +185,7 @@ def find_template_for_resource(resource: str) -> dict | None:
             required_for = json.loads(row["required_for_json"]) if row["required_for_json"] else []
             if resource in required_for:
                 result = dict(row)
-                result["steps"], result["capabilities"] = _parse_steps_json(result["steps_json"])
+                result["steps"], result["capabilities"], result["triggers"] = _parse_steps_json(result["steps_json"])
                 result["required_for"] = required_for
                 return result
         return None
@@ -200,196 +211,25 @@ def _enforce_min_tier(agent_model: str, model_min_tier: str) -> None:
         )
 
 
-def _substitute_bindings(
-    value: Any,
-    bindings: dict[str, Any],
-) -> Any:
-    """Apply ``$placeholder`` substitution to a string value.
-
-    Uses :class:`string.Template` (not ``str.format``) so embedded
-    Python-snippet braces in step descriptions render as-is.  Non-string
-    values pass through untouched.
-    """
-    if isinstance(value, str) and "$" in value:
-        return Template(value).safe_substitute(bindings)
-    return value
-
-
-def _apply_bindings_to_step(
-    step: dict,
-    bindings: dict[str, Any],
-) -> dict:
-    """Return a copy of ``step`` with bindings substituted into text fields.
-
-    Only the human-facing text fields (``name`` / ``description`` /
-    ``goal``) are templated.  Everything else passes through unchanged.
-    """
-    if not bindings:
-        return step
-    new_step = dict(step)
-    for field_name in ("name", "description", "goal"):
-        if field_name in new_step:
-            new_step[field_name] = _substitute_bindings(
-                new_step[field_name], bindings,
-            )
-    return new_step
-
-
-def _instantiate_via_batch(
-    steps: list[dict],
-    parent_arc_id: int,
-    template_id: int,
-    template_capabilities: list,
-) -> list[int]:
-    """Materialise a template through :func:`create_untrusted_batch`.
-
-    Used when any step in the template declares a non-trusted
-    ``integrity_level``: the batch helper is the only path that wires
-    Fernet keys, ``review_keys`` rows, and ``_reviewer_profile`` /
-    ``_review_target`` arc_state in a single transaction with the
-    invariant checks (one judge max, judge-highest-order, reviewer
-    coverage of every tainted target).
-
-    Trusted steps in the same template are included in the batch so
-    they share the parent_id and step_order space with the untrusted
-    EXECUTOR + reviewer chain.
-    """
-    from ..trust.batch import create_untrusted_batch
-
-    specs: list[dict[str, Any]] = []
-    for step in steps:
-        spec: dict[str, Any] = {
-            "name": step["name"],
-            # Template YAML uses ``description``; arc storage uses ``goal``.
-            "goal": step.get("goal", step.get("description")),
-            "parent_id": parent_arc_id,
-            "step_order": step.get("order", 0),
-            "template_id": template_id,
-            "from_template": True,
-            "template_mutable": step.get("mutable", False),
-        }
-        # Forward optional arc properties declared on the step.
-        for key in ("agent_type", "integrity_level", "output_type",
-                    "model", "model_role", "agent_role", "arc_role",
-                    "agent_model", "model_policy_id", "model_policy",
-                    "reviewer_profile"):
-            if key in step:
-                spec[key] = step[key]
-        specs.append(spec)
-
-    result = create_untrusted_batch(specs, parent_id=parent_arc_id)
-    if "error" in result:
-        raise ValueError(
-            f"Failed to instantiate untrusted batch for template "
-            f"{template_id}: {result['error']}"
-        )
-
-    arc_ids: list[int] = result["arc_ids"]
-
-    # Per-step post-processing: capabilities, activation_event,
-    # required_pass, model_min_tier.  Same conventions as the
-    # trusted-step path so existing tests / consumers see no diff.
-    with db_transaction() as db:
-        for step, arc_id in zip(steps, arc_ids):
-            step_capabilities = step.get("capabilities", [])
-            merged_caps = sorted(
-                set(template_capabilities) | set(step_capabilities)
-            )
-            if merged_caps:
-                db.execute(
-                    "INSERT OR REPLACE INTO arc_state "
-                    "(arc_id, key, value_json) VALUES (?, ?, ?)",
-                    (arc_id, "_capabilities", json.dumps(merged_caps)),
-                )
-
-            model_min_tier = step.get("model_min_tier")
-            if model_min_tier:
-                if step.get("agent_model"):
-                    _enforce_min_tier(step["agent_model"], model_min_tier)
-                db.execute(
-                    "INSERT OR REPLACE INTO arc_state "
-                    "(arc_id, key, value_json) VALUES (?, ?, ?)",
-                    (arc_id, "_model_min_tier", json.dumps(model_min_tier)),
-                )
-
-            if step.get("required_pass"):
-                db.execute(
-                    "INSERT OR REPLACE INTO arc_state "
-                    "(arc_id, key, value_json) VALUES (?, ?, ?)",
-                    (arc_id, "_required_pass", json.dumps(True)),
-                )
-
-            activation_event = step.get("activation_event")
-            if activation_event:
-                db.execute(
-                    "INSERT OR IGNORE INTO arc_activations "
-                    "(arc_id, event_type) VALUES (?, ?)",
-                    (arc_id, activation_event),
-                )
-
-    return arc_ids
-
-
-def instantiate_template(
-    template_id: int,
-    parent_arc_id: int,
-    bindings: dict[str, Any] | None = None,
-) -> list[int]:
+def instantiate_template(template_id: int, parent_arc_id: int) -> list[int]:
     """Instantiate a template as child arcs on a parent arc.
 
     Creates one child arc per step in the template. Each child arc has
     from_template=True and template_id set. If a step has an
     activation_event, it is registered in the arc_activations table.
 
-    Args:
-        template_id: ID of the template to instantiate.
-        parent_arc_id: Parent arc that owns the instantiated children.
-        bindings: Optional ``$placeholder`` substitutions applied to
-            step ``name`` / ``description`` / ``goal`` text fields
-            before arc creation. Used by runtime callers (e.g.
-            ``_handle_fetch_web_content``) to inject the user's request
-            into a templated REVIEWER instruction.
-
     Returns the list of created arc IDs.
-
-    Templates whose steps include any non-trusted ``integrity_level``
-    are routed through :func:`carpenter.core.trust.batch.create_untrusted_batch`
-    so the reviewer/judge chain, Fernet keys, and ``review_keys``
-    rows are wired atomically with batch-level invariant checks
-    (mirrors what ``arc.create_batch`` does at the tool layer).
-    Coding-time enforcement of those invariants now lives in
-    :mod:`carpenter.verify.yaml_template`.
     """
     from ..arcs import manager as arc_manager
-    from ..trust.integrity import is_non_trusted
 
     template = get_template(template_id)
     if template is None:
         raise ValueError(f"Template {template_id} not found")
 
-    raw_steps = template["steps"]
+    steps = template["steps"]
     template_capabilities = template.get("capabilities", [])
-
-    # Apply bindings substitution up front so both code paths see the
-    # same step text.
-    steps = [_apply_bindings_to_step(s, bindings or {}) for s in raw_steps]
-
-    # If any step declares a non-trusted integrity level, the entire
-    # template must be created through the batch helper — that is the
-    # only path that wires the reviewer chain + Fernet keys atomically.
-    has_untrusted = any(
-        is_non_trusted(s.get("integrity_level", "trusted"))
-        for s in steps
-    )
-    if has_untrusted:
-        return _instantiate_via_batch(
-            steps=steps,
-            parent_arc_id=parent_arc_id,
-            template_id=template_id,
-            template_capabilities=template_capabilities,
-        )
-
     arc_ids = []
+
     for step in steps:
         # Pass through optional arc properties from the step definition
         extra_kwargs = {}
@@ -433,6 +273,7 @@ def instantiate_template(
             goal=step.get("description"),
             parent_id=parent_arc_id,
             template_id=template_id,
+            step_role=step.get("role"),
             from_template=True,
             template_mutable=step.get("mutable", False),
             step_order=step.get("order", 0),
@@ -529,14 +370,161 @@ def validate_template_rigidity(parent_arc_id: int) -> bool:
 def load_templates_from_dir(dir_path: str) -> int:
     """Load all YAML templates from a directory.
 
-    Scans for .yaml and .yml files and calls load_template for each.
+    Flat ``.yaml`` / ``.yml`` files are loaded as before. Subdirectories
+    are treated as template packages: every YAML file in the package is
+    loaded, and if the package contains an ``__init__.py`` with a
+    ``register_handlers(registry)`` function, it is imported and called
+    with the engine's handler_registry module. This lets templates ship
+    Python step handlers alongside their YAML.
 
     Returns the count of templates loaded.
     """
     count = 0
-    for filename in sorted(os.listdir(dir_path)):
-        if filename.endswith((".yaml", ".yml")):
-            filepath = os.path.join(dir_path, filename)
-            load_template(filepath)
+    for name in sorted(os.listdir(dir_path)):
+        full = os.path.join(dir_path, name)
+        if os.path.isfile(full) and name.endswith((".yaml", ".yml")):
+            load_template(full)
             count += 1
+        elif os.path.isdir(full) and not name.startswith((".", "_")):
+            # Only treat a subdir as a template package if it declares
+            # itself as one via __init__.py. This keeps the loader safe
+            # when templates_dir sits next to unrelated directories
+            # (tools, prompts, etc. — common in test fixtures and in
+            # ad-hoc operator layouts).
+            if os.path.isfile(os.path.join(full, "__init__.py")):
+                count += _load_template_package(full, name)
     return count
+
+
+def _load_template_package(pkg_dir: str, pkg_name: str) -> int:
+    """Load every YAML in a package dir and invoke its handler hook.
+
+    Returns the count of YAML files loaded.
+    """
+    yaml_files = sorted(
+        f for f in os.listdir(pkg_dir) if f.endswith((".yaml", ".yml"))
+    )
+    count = 0
+    for yaml_file in yaml_files:
+        load_template(os.path.join(pkg_dir, yaml_file))
+        count += 1
+
+    init_path = os.path.join(pkg_dir, "__init__.py")
+    if os.path.isfile(init_path):
+        _import_package_and_register(pkg_name, pkg_dir, init_path)
+    return count
+
+
+_TEMPLATE_PKG_ROOT = "carpenter_template_packages"
+
+
+def _ensure_pkg_root_in_sys_modules() -> None:
+    """Register a synthetic root namespace for template packages.
+
+    Template packages are loaded via :func:`importlib.util.spec_from_file_location`
+    under the dotted name ``carpenter_template_packages.<pkg_name>``. When
+    code inside a loaded package performs a deferred relative import
+    (e.g. ``from . import sibling`` inside a step handler called after
+    startup), Python's import machinery walks the parent chain from the
+    root. Without a ``carpenter_template_packages`` entry in
+    ``sys.modules``, that walk raises ``ModuleNotFoundError``. Inserting
+    a module-shaped namespace object once, up front, is enough to make
+    deferred relative imports inside template packages resolve.
+    """
+    import sys
+    import types
+
+    if _TEMPLATE_PKG_ROOT in sys.modules:
+        return
+    root = types.ModuleType(_TEMPLATE_PKG_ROOT)
+    root.__path__ = []  # mark as a (namespace) package
+    sys.modules[_TEMPLATE_PKG_ROOT] = root
+
+
+def _import_package_and_register(
+    pkg_name: str, pkg_dir: str, init_path: str,
+) -> None:
+    """Import a template package by file path and call register_handlers."""
+    import importlib.util
+    import sys
+
+    from . import handler_registry
+
+    _ensure_pkg_root_in_sys_modules()
+
+    module_name = f"{_TEMPLATE_PKG_ROOT}.{pkg_name}"
+    spec = importlib.util.spec_from_file_location(
+        module_name, init_path,
+        submodule_search_locations=[pkg_dir],
+    )
+    if spec is None or spec.loader is None:
+        logger.warning(
+            "Template package %r: could not build import spec for %s",
+            pkg_name, init_path,
+        )
+        return
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        logger.exception(
+            "Template package %r: failed to import %s", pkg_name, init_path,
+        )
+        sys.modules.pop(module_name, None)
+        return
+
+    register_fn = getattr(module, "register_handlers", None)
+    if register_fn is None:
+        return
+    try:
+        register_fn(handler_registry)
+        logger.info("Template package %r: handlers registered", pkg_name)
+    except Exception:
+        logger.exception(
+            "Template package %r: register_handlers raised", pkg_name,
+        )
+
+
+def collect_template_triggers() -> list[dict]:
+    """Gather ``triggers`` declarations from every loaded template.
+
+    Each trigger entry is a subscription config fragment (same shape
+    accepted by ``subscriptions.load_subscriptions``). Templates declare
+    their triggers under a top-level ``triggers:`` key in their YAML so
+    that the coordinator no longer has to enumerate feature-specific
+    cadences in Python.
+
+    Subscription ``name`` is auto-namespaced as
+    ``{template_name}:{trigger_name}`` when the trigger does not already
+    include a colon, so two templates cannot accidentally clash on a
+    shared short name.
+
+    Returns a flat list of subscription configs, ready to hand to
+    ``subscriptions.load_subscriptions``.
+    """
+    configs: list[dict] = []
+    for tmpl in list_templates():
+        tmpl_name = tmpl["name"]
+        for trigger in tmpl.get("triggers", []) or []:
+            cfg = dict(trigger)
+            raw_name = cfg.get("name") or f"trigger-{len(configs)}"
+            if ":" not in raw_name:
+                cfg["name"] = f"{tmpl_name}:{raw_name}"
+            configs.append(cfg)
+    return configs
+
+
+def load_template_triggers() -> int:
+    """Register subscriptions declared in every loaded template's ``triggers:``.
+
+    Thin wrapper that calls :func:`collect_template_triggers` and hands
+    the result to :func:`subscriptions.load_subscriptions`. Returns the
+    number of subscriptions loaded.
+    """
+    from . import subscriptions
+
+    configs = collect_template_triggers()
+    if not configs:
+        return 0
+    return subscriptions.load_subscriptions(configs)

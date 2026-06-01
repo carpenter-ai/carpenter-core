@@ -44,17 +44,17 @@ def _make_registry():
     """Standard test registry with cloud + local models."""
     return {
         "opus": ModelEntry(
-            key="opus", provider="anthropic", model_id="claude-opus-4-6",
+            key="opus", provider="anthropic", model_id="claude-opus-4-7",
             quality_tier=5, cost_per_mtok_in=15.0, cost_per_mtok_out=75.0,
             cached_cost_per_mtok_in=1.5, context_window=200000,
         ),
         "sonnet": ModelEntry(
-            key="sonnet", provider="anthropic", model_id="claude-sonnet-4-5-20250929",
+            key="sonnet", provider="anthropic", model_id="claude-sonnet-4-6",
             quality_tier=4, cost_per_mtok_in=3.0, cost_per_mtok_out=15.0,
             cached_cost_per_mtok_in=0.3, context_window=200000,
         ),
         "haiku": ModelEntry(
-            key="haiku", provider="anthropic", model_id="claude-haiku-4-5-20251001",
+            key="haiku", provider="anthropic", model_id="claude-haiku-4-5",
             quality_tier=2, cost_per_mtok_in=0.8, cost_per_mtok_out=4.0,
             cached_cost_per_mtok_in=0.08, context_window=200000,
         ),
@@ -75,18 +75,18 @@ class TestAllCloudCircuitOpen:
         """Returns True when all cloud models are CIRCUIT_OPEN."""
         mock_reg.return_value = _make_registry()
         # Mark all three anthropic models as CIRCUIT_OPEN
-        _make_state("anthropic:claude-opus-4-6", ModelHealth.CIRCUIT_OPEN)
-        _make_state("anthropic:claude-sonnet-4-5-20250929", ModelHealth.CIRCUIT_OPEN)
-        _make_state("anthropic:claude-haiku-4-5-20251001", ModelHealth.CIRCUIT_OPEN)
+        _make_state("anthropic:claude-opus-4-7", ModelHealth.CIRCUIT_OPEN)
+        _make_state("anthropic:claude-sonnet-4-6", ModelHealth.CIRCUIT_OPEN)
+        _make_state("anthropic:claude-haiku-4-5", ModelHealth.CIRCUIT_OPEN)
         assert all_cloud_models_circuit_open() is True
 
     @patch("carpenter.core.models.registry.get_registry")
     def test_all_cloud_circuit_open_false_one_healthy(self, mock_reg):
         """Returns False when at least one cloud model is not CIRCUIT_OPEN."""
         mock_reg.return_value = _make_registry()
-        _make_state("anthropic:claude-opus-4-6", ModelHealth.CIRCUIT_OPEN)
-        _make_state("anthropic:claude-sonnet-4-5-20250929", ModelHealth.HEALTHY)
-        _make_state("anthropic:claude-haiku-4-5-20251001", ModelHealth.CIRCUIT_OPEN)
+        _make_state("anthropic:claude-opus-4-7", ModelHealth.CIRCUIT_OPEN)
+        _make_state("anthropic:claude-sonnet-4-6", ModelHealth.HEALTHY)
+        _make_state("anthropic:claude-haiku-4-5", ModelHealth.CIRCUIT_OPEN)
         assert all_cloud_models_circuit_open() is False
 
     @patch("carpenter.core.models.registry.get_registry")

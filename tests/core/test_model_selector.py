@@ -24,21 +24,21 @@ def _make_registry():
     """Build a standard test registry."""
     return {
         "opus": ModelEntry(
-            key="opus", provider="anthropic", model_id="claude-opus-4-6",
+            key="opus", provider="anthropic", model_id="claude-opus-4-7",
             quality_tier=5, cost_per_mtok_in=15.0, cost_per_mtok_out=75.0,
             cached_cost_per_mtok_in=1.5, context_window=200000,
             capabilities=["planning", "review", "code", "security_review"],
             measured_speed=2.0,
         ),
         "sonnet": ModelEntry(
-            key="sonnet", provider="anthropic", model_id="claude-sonnet-4-5-20250929",
+            key="sonnet", provider="anthropic", model_id="claude-sonnet-4-6",
             quality_tier=4, cost_per_mtok_in=3.0, cost_per_mtok_out=15.0,
             cached_cost_per_mtok_in=0.3, context_window=200000,
             capabilities=["planning", "review", "code", "documentation"],
             measured_speed=1.0,
         ),
         "haiku": ModelEntry(
-            key="haiku", provider="anthropic", model_id="claude-haiku-4-5-20251001",
+            key="haiku", provider="anthropic", model_id="claude-haiku-4-5",
             quality_tier=2, cost_per_mtok_in=0.8, cost_per_mtok_out=4.0,
             cached_cost_per_mtok_in=0.08, context_window=200000,
             capabilities=["summarization", "documentation", "simple_code"],
@@ -148,10 +148,10 @@ class TestConstraints:
 
 class TestSelection:
     def test_hard_pin_bypass(self, no_health_check):
-        policy = ModelPolicy(model="anthropic:claude-opus-4-6")
+        policy = ModelPolicy(model="anthropic:claude-opus-4-7")
         result = select_model(policy)
         assert result is not None
-        assert result.model_id == "anthropic:claude-opus-4-6"
+        assert result.model_id == "anthropic:claude-opus-4-7"
         assert result.reason == "hard-pinned"
 
     def test_quality_heavy_prefers_opus(self, no_health_check):
@@ -240,7 +240,7 @@ class TestCacheLossPenalty:
         result_without = select_model(policy)
         result_with = select_model(
             policy,
-            current_model="anthropic:claude-sonnet-4-5-20250929",
+            current_model="anthropic:claude-sonnet-4-6",
             cached_tokens=50000,
         )
         # Both should prefer opus (quality-heavy)
@@ -258,7 +258,7 @@ class TestCacheLossPenalty:
         # Large cache from anthropic provider — switching away is penalized
         result_cached = select_model(
             policy,
-            current_model="anthropic:claude-sonnet-4-5-20250929",
+            current_model="anthropic:claude-sonnet-4-6",
             cached_tokens=100000,
         )
         # Both results should be valid
@@ -273,7 +273,7 @@ class TestCircuitBreaker:
     def test_circuit_open_excluded(self, monkeypatch):
         """CIRCUIT_OPEN models should be excluded from selection."""
         def mock_circuit_break(model_id):
-            return model_id == "anthropic:claude-opus-4-6"
+            return model_id == "anthropic:claude-opus-4-7"
 
         monkeypatch.setattr(
             "carpenter.core.models.health.should_circuit_break",
@@ -402,14 +402,14 @@ class TestPolicySerialization:
         row = {
             "id": 2,
             "name": "",
-            "model": "anthropic:claude-sonnet-4-5-20250929",
+            "model": "anthropic:claude-sonnet-4-6",
             "agent_role": None,
             "temperature": 0.7,
             "max_tokens": 4096,
             "policy_json": None,
         }
         policy = ModelPolicy.from_db_row(row)
-        assert policy.model == "anthropic:claude-sonnet-4-5-20250929"
+        assert policy.model == "anthropic:claude-sonnet-4-6"
         assert policy.constraints is None
         assert policy.preference == (0.3, 0.4, 0.3)
 
@@ -569,10 +569,10 @@ class TestSelectModels:
 
     def test_hard_pin_returns_single(self, no_health_check):
         """Hard-pinned policy returns single-element list."""
-        policy = ModelPolicy(model="anthropic:claude-opus-4-6")
+        policy = ModelPolicy(model="anthropic:claude-opus-4-7")
         results = select_models(policy)
         assert len(results) == 1
-        assert results[0].model_id == "anthropic:claude-opus-4-6"
+        assert results[0].model_id == "anthropic:claude-opus-4-7"
         assert results[0].reason == "hard-pinned"
 
     def test_empty_registry_returns_empty(self, monkeypatch, no_health_check):
@@ -615,7 +615,7 @@ class TestSelectModels:
     def test_circuit_breaker_excludes_model(self, monkeypatch):
         """CIRCUIT_OPEN model is excluded from ranked list."""
         def mock_circuit_break(model_id):
-            return model_id == "anthropic:claude-opus-4-6"
+            return model_id == "anthropic:claude-opus-4-7"
 
         monkeypatch.setattr(
             "carpenter.core.models.health.should_circuit_break",

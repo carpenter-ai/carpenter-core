@@ -1,8 +1,7 @@
-"""Knowledge Base modification tools. Tier 1: callback to platform.
+"""Knowledge Base modification tool declarations.
 
-Action tools only — navigation is via chat tools (kb_describe, kb_search).
+See ``carpenter_tools`` package docstring for the invocation model.
 """
-from .._callback import callback
 from ..tool_meta import tool
 
 
@@ -19,11 +18,7 @@ def edit(path: str, content: str, description: str = "") -> dict:
     Returns:
         Dict with status message.
     """
-    return callback("kb.edit", {
-        "path": path,
-        "content": content,
-        "description": description,
-    })
+    ...
 
 
 @tool(local=True, readonly=False, side_effects=True,
@@ -40,12 +35,7 @@ def add(path: str, content: str, description: str, entry_type: str = "knowledge"
     Returns:
         Dict with status message.
     """
-    return callback("kb.add", {
-        "path": path,
-        "content": content,
-        "description": description,
-        "entry_type": entry_type,
-    })
+    ...
 
 
 @tool(local=True, readonly=False, side_effects=True,
@@ -59,4 +49,4 @@ def delete(path: str) -> dict:
     Returns:
         Dict with status message.
     """
-    return callback("kb.delete", {"path": path})
+    ...

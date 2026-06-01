@@ -531,3 +531,79 @@ class TestJudgeVerificationMissingTarget:
         # Should fail gracefully
         judge = arc_manager.get_arc(judge_id)
         assert judge["status"] == "failed"
+
+
+class TestVerificationDispatchByRole:
+    """D2 PR-β: dispatch routes by step_role, with name-equality fallback.
+
+    These tests pin the contract that:
+    - When step_role is set, dispatch keys on it (custom names still work).
+    - When step_role IS NULL (legacy arcs), dispatch falls back to name.
+    """
+
+    def test_docs_completion_dispatches_by_step_role_with_custom_name(
+        self, test_db, monkeypatch,
+    ):
+        """An arc with step_role='docs' but a custom name still triggers
+        the docs-completion path."""
+        # Configure a non-default docs name to prove role drives dispatch.
+        import carpenter.config
+        cfg = dict(carpenter.config.CONFIG)
+        cfg["verification"] = {
+            "enabled": True,
+            "arc_names": {"documentation": "wrap-up-doc"},
+        }
+        monkeypatch.setattr("carpenter.config.CONFIG", cfg)
+
+        parent = arc_manager.create_arc("project", goal="Test")
+        target = arc_manager.add_child(parent, "coding-change", goal="Implement")
+        arc_manager.update_status(target, "active")
+
+        # Arc carries the canonical step_role="docs" but a custom name.
+        docs_id = arc_manager.create_arc(
+            name="wrap-up-doc",
+            goal="Write docs",
+            parent_id=parent,
+            step_role="docs",
+            verification_target_id=target,
+            agent_type="EXECUTOR",
+        )
+
+        docs_info = arc_manager.get_arc(docs_id)
+        # _handle_failed_docs_arc keys off step_role; should match.
+        _set_arc_state(target, "_verification_pending", True)
+        arc_dispatch_handler._handle_failed_docs_arc(docs_id)
+
+        target_arc = arc_manager.get_arc(target)
+        assert target_arc["status"] == "waiting"
+        assert _get_arc_state(target, "_verification_pending") is False
+
+    def test_docs_failure_unblock_falls_back_to_name_when_role_null(
+        self, test_db,
+    ):
+        """Legacy arc with step_role IS NULL still dispatches via name fallback.
+
+        Ensures backward compat for verification arcs created before this PR.
+        """
+        parent = arc_manager.create_arc("project", goal="Test")
+        target = arc_manager.add_child(parent, "coding-change", goal="Implement")
+        arc_manager.update_status(target, "active")
+        _set_arc_state(target, "_verification_pending", True)
+
+        # Legacy-style: matches docs by name only, step_role is None.
+        docs_id = arc_manager.create_arc(
+            name=DOCUMENTATION_ARC,
+            goal="Write docs",
+            parent_id=parent,
+            verification_target_id=target,
+            agent_type="EXECUTOR",
+        )
+
+        legacy_info = arc_manager.get_arc(docs_id)
+        assert legacy_info["step_role"] is None  # confirm no role on legacy arc
+
+        arc_dispatch_handler._handle_failed_docs_arc(docs_id)
+
+        target_arc = arc_manager.get_arc(target)
+        assert target_arc["status"] == "waiting"
+        assert _get_arc_state(target, "_verification_pending") is False

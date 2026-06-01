@@ -19,7 +19,6 @@ from carpenter.core.trust.encryption import (
     generate_arc_key,
     encrypt_output,
     decrypt_for_reviewer,
-    decrypt_after_promotion,
 )
 from carpenter.db import get_db
 
@@ -143,44 +142,3 @@ def test_decrypt_denied_audit_event():
 
     events = get_trust_events(arc_id=target, event_type="decryption_denied")
     assert len(events) >= 1
-
-
-# ── decrypt_after_promotion ──────────────────────────────────────────
-
-def test_decrypt_after_promotion():
-    parent = arc_manager.create_arc("parent")
-    target = arc_manager.add_child(parent, "target", integrity_level="untrusted")
-    reviewer = arc_manager.add_child(parent, "reviewer", integrity_level="trusted")
-    key = generate_arc_key(target, [reviewer])
-
-    plaintext = "promoted data"
-    ciphertext = encrypt_output(key, plaintext)
-
-    result = decrypt_after_promotion(target, ciphertext)
-    assert result == plaintext
-
-
-def test_decrypt_after_promotion_no_keys():
-    parent = arc_manager.create_arc("parent")
-    target = arc_manager.add_child(parent, "target", integrity_level="untrusted")
-    key = Fernet.generate_key()
-    ciphertext = encrypt_output(key, "data")
-
-    with pytest.raises(PermissionError, match="No encryption keys"):
-        decrypt_after_promotion(target, ciphertext)
-
-
-def test_decrypt_after_promotion_multiple_reviewers():
-    """Any reviewer's key can be used for post-promotion decryption."""
-    parent = arc_manager.create_arc("parent")
-    target = arc_manager.add_child(parent, "target", integrity_level="untrusted")
-    r1 = arc_manager.add_child(parent, "r1", integrity_level="trusted")
-    r2 = arc_manager.add_child(parent, "r2", integrity_level="trusted")
-    key = generate_arc_key(target, [r1, r2])
-
-    plaintext = "shared secret"
-    ciphertext = encrypt_output(key, plaintext)
-
-    # Both reviewers have the same key, so promotion should work
-    result = decrypt_after_promotion(target, ciphertext)
-    assert result == plaintext

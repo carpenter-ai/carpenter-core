@@ -420,3 +420,52 @@ def test_format_messages_system_only():
     api_msgs = conversation.format_messages_for_api(messages)
     assert len(api_msgs) == 1
     assert api_msgs[0] == {"role": "user", "content": "[System notification: Arc started]"}
+
+
+# ─── Per-conversation model override ───────────────────────────────────────
+
+def test_set_and_get_conversation_model_override():
+    """set/get round-trip returns 'provider:model' string."""
+    conv_id = conversation.create_conversation()
+    assert conversation.get_conversation_model_override(conv_id) is None
+    conversation.set_conversation_model_override(conv_id, "ollama", "qwen3.5:9b")
+    assert conversation.get_conversation_model_override(conv_id) == "ollama:qwen3.5:9b"
+
+
+def test_clear_conversation_model_override():
+    """clear resets the pin to None."""
+    conv_id = conversation.create_conversation()
+    conversation.set_conversation_model_override(conv_id, "anthropic", "claude-haiku-4-5")
+    assert conversation.get_conversation_model_override(conv_id) is not None
+    conversation.clear_conversation_model_override(conv_id)
+    assert conversation.get_conversation_model_override(conv_id) is None
+
+
+def test_set_conversation_model_rejects_unknown_provider():
+    """Unknown providers are rejected with ValueError."""
+    conv_id = conversation.create_conversation()
+    with pytest.raises(ValueError):
+        conversation.set_conversation_model_override(conv_id, "bogus", "model")
+
+
+def test_set_conversation_model_rejects_empty_model():
+    """Empty model string is rejected."""
+    conv_id = conversation.create_conversation()
+    with pytest.raises(ValueError):
+        conversation.set_conversation_model_override(conv_id, "ollama", "")
+    with pytest.raises(ValueError):
+        conversation.set_conversation_model_override(conv_id, "ollama", "   ")
+
+
+def test_conversation_model_override_scoped_to_conversation():
+    """Override on one conversation does not affect another."""
+    conv_a = conversation.create_conversation()
+    conv_b = conversation.create_conversation()
+    conversation.set_conversation_model_override(conv_a, "ollama", "qwen3.5:9b")
+    assert conversation.get_conversation_model_override(conv_a) == "ollama:qwen3.5:9b"
+    assert conversation.get_conversation_model_override(conv_b) is None
+
+
+def test_get_conversation_model_override_unknown_conv_returns_none():
+    """Missing conversation returns None, not an error."""
+    assert conversation.get_conversation_model_override(999_999) is None

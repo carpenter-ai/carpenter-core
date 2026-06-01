@@ -217,6 +217,46 @@ def test_instantiate_template_registers_activation_events(tmp_path):
         db.close()
 
 
+# ── D2 PR-α: instantiate_template populates step_role ─────────────
+
+
+SAMPLE_YAML_WITH_ROLES = """\
+name: roles-workflow
+description: A workflow whose steps declare roles
+steps:
+  - name: gather-inputs
+    description: First
+    role: prepare
+    order: 0
+  - name: compute
+    description: Second
+    role: analyze
+    order: 1
+  - name: write-output
+    description: Third
+    # intentionally no role — column should be NULL for this arc
+    order: 2
+"""
+
+
+def test_instantiate_template_populates_step_role(tmp_path):
+    """Children of a templated parent carry arcs.step_role per the YAML."""
+    yaml_file = tmp_path / "wf.yaml"
+    yaml_file.write_text(SAMPLE_YAML_WITH_ROLES)
+    tid = template_manager.load_template(str(yaml_file))
+
+    parent_id = arc_manager.create_arc("parent", template_id=tid)
+    arc_ids = template_manager.instantiate_template(tid, parent_id)
+    assert len(arc_ids) == 3
+
+    children = arc_manager.get_children(parent_id)
+    by_name = {c["name"]: c for c in children}
+    assert by_name["gather-inputs"]["step_role"] == "prepare"
+    assert by_name["compute"]["step_role"] == "analyze"
+    # Step without a declared role → NULL column.
+    assert by_name["write-output"]["step_role"] is None
+
+
 # ── validate_template_rigidity ─────────────────────────────────────
 
 def test_validate_template_rigidity_valid(tmp_path):

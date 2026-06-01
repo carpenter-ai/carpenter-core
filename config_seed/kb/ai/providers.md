@@ -4,9 +4,9 @@ Carpenter supports multiple AI backends.
 
 ## Available providers
 - **anthropic** — Claude models via Anthropic API (native format)
-- **ollama** — Local models via Ollama (OpenAI-compatible format)
-- **local** — llama.cpp server managed by the platform (OpenAI-compatible)
+- **ollama** — Models served by an Ollama server over HTTP (OpenAI-compatible format)
 - **tinfoil** — Tinfoil encrypted inference (OpenAI-compatible)
+- **chain** — Virtual provider that chains multiple backends (see inference_chain config)
 
 ## API standard normalization
 Each provider maps to an API standard: `"anthropic"` or `"openai"`. The normalization layer translates tool definitions and responses automatically.

@@ -210,6 +210,101 @@ class TestUpdateArcCounters:
         assert root["descendant_executions"] == 1
 
 
+class TestRecountTokens:
+    """update_arc_counters should sum api_calls tokens for descendant arcs.
+
+    Tokens can be linked to an arc two ways:
+      (a) Via conversation_arcs (chat-loop calls have a conversation_id)
+      (b) Directly via api_calls.arc_id (arc-only calls have conversation_id IS NULL,
+          e.g. coding executor calls added in PR #359)
+    """
+
+    def _insert_api_call(self, conversation_id, arc_id, in_tok, out_tok):
+        db = get_db()
+        try:
+            db.execute(
+                "INSERT INTO api_calls "
+                "(conversation_id, arc_id, model, input_tokens, output_tokens) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (conversation_id, arc_id, "claude-test", in_tok, out_tok),
+            )
+            db.commit()
+        finally:
+            db.close()
+
+    def _link_conversation_to_arc(self, conversation_id, arc_id):
+        db = get_db()
+        try:
+            db.execute(
+                "INSERT INTO conversation_arcs (conversation_id, arc_id) "
+                "VALUES (?, ?)",
+                (conversation_id, arc_id),
+            )
+            db.commit()
+        finally:
+            db.close()
+
+    def _create_conversation(self):
+        db = get_db()
+        try:
+            cur = db.execute(
+                "INSERT INTO conversations (title) VALUES (?)", ("t",)
+            )
+            db.commit()
+            return cur.lastrowid
+        finally:
+            db.close()
+
+    def test_recount_tokens_via_conversation_arcs(self):
+        """Chat-loop call: conversation_id set, joined via conversation_arcs."""
+        root_id = arc_manager.create_arc("root", goal="root")
+        child_id = arc_manager.add_child(root_id, "child")
+        conv_id = self._create_conversation()
+        self._link_conversation_to_arc(conv_id, child_id)
+        self._insert_api_call(conv_id, None, 100, 200)
+
+        arc_manager.update_arc_counters(root_id)
+        root = arc_manager.get_arc(root_id)
+        assert root["descendant_tokens"] == 300
+
+    def test_recount_tokens_arc_only_call(self):
+        """Arc-only call: conversation_id IS NULL, arc_id set directly.
+
+        This is the regression case fixed in this PR — before the UNION,
+        these rows were invisible to the rollup.
+        """
+        root_id = arc_manager.create_arc("root", goal="root")
+        child_id = arc_manager.add_child(root_id, "child")
+        # Arc-only API call (e.g. from coding executor): no conversation_id.
+        self._insert_api_call(None, child_id, 400, 600)
+
+        arc_manager.update_arc_counters(root_id)
+        root = arc_manager.get_arc(root_id)
+        assert root["descendant_tokens"] == 1000
+
+    def test_recount_tokens_both_sources_no_double_count(self):
+        """Mixed: chat-loop call AND arc-only call for same subtree.
+
+        The conversation-linked row also has arc_id set (because the chat
+        loop knows which arc it's working on). The fix must NOT count it
+        twice — the arc-only branch is gated on conversation_id IS NULL.
+        """
+        root_id = arc_manager.create_arc("root", goal="root")
+        child_id = arc_manager.add_child(root_id, "child")
+        conv_id = self._create_conversation()
+        self._link_conversation_to_arc(conv_id, child_id)
+
+        # Chat-loop row: BOTH conversation_id and arc_id populated.
+        self._insert_api_call(conv_id, child_id, 100, 200)
+        # Arc-only row: only arc_id populated.
+        self._insert_api_call(None, child_id, 50, 70)
+
+        arc_manager.update_arc_counters(root_id)
+        root = arc_manager.get_arc(root_id)
+        # 100+200 from chat-loop + 50+70 from arc-only = 420. NOT 720.
+        assert root["descendant_tokens"] == 420
+
+
 class TestCountersInGetArcDetail:
     """Performance counters should be visible in get_arc_detail output."""
 

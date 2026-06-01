@@ -16,6 +16,7 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse
 from starlette.routing import Route
 
+from .. import constants
 from ..db import get_db, db_connection, db_transaction
 from ..core.arcs import CODING_CHANGE_PREFIX, manager as arc_manager
 from .static import read_asset, load_template
@@ -105,6 +106,7 @@ class DiffReviewRequest:
 class ReviewDecision:
     decision: str  # "approved", "rejected", or "revise"
     comment: str = ""
+    followup_goal: str = ""
 
 
 async def create_review_link(request: Request):
@@ -157,6 +159,7 @@ def create_diff_review(
     filename_map: dict[str, str] | None = None,
     attempt_count: int | None = None,
     review_type: str = "diff",
+    qqr_signal: object | None = None,
 ) -> dict:
     """Create a diff review link programmatically (called from handlers).
 
@@ -188,6 +191,9 @@ def create_diff_review(
         "outcome": outcome,
         "filename_map": filename_map or {},
         "attempt_count": attempt_count,
+        # Quarantined Quality Reviewer signal (None / QqrSignal). Rendered
+        # in the human-review panel alongside the main reviewer's verdict.
+        "qqr_signal": qqr_signal,
     }
 
     return {
@@ -284,6 +290,47 @@ def _render_code_review_page(review_id: str, review: dict) -> HTMLResponse:
     return HTMLResponse(content=html)
 
 
+def _render_qqr_block(qqr_signal: object) -> str:
+    """Render a small panel for the Quarantined Quality Reviewer verdict.
+
+    ``qqr_signal`` is expected to be either None or a
+    :class:`carpenter.review.qqr.QqrSignal`. ``reason_html`` is already
+    HTML-escaped by the QqrSignal layer; we only frame it.
+    """
+    if qqr_signal is None:
+        return ""
+    try:
+        verdict = getattr(qqr_signal, "verdict", None)
+        category = getattr(qqr_signal, "category", "none")
+        confidence = getattr(qqr_signal, "confidence", "low")
+        reason_html = getattr(qqr_signal, "reason_html", "")
+    except Exception:  # pragma: no cover — defensive
+        return ""
+    verdict_str = getattr(verdict, "value", str(verdict)).upper() if verdict else "UNKNOWN"
+    color = {
+        "APPROVE": "#a6e22e",
+        "MINOR": "#e6db74",
+        "MAJOR": "#f92672",
+        "ABSTAIN": "#75715e",
+    }.get(verdict_str, "#75715e")
+    return (
+        '<div style="margin: 15px 0;">'
+        '<h3 style="color: #66d9ef; margin-bottom: 10px;">'
+        'Quarantined Quality Reviewer (QQR)</h3>'
+        f'<div style="background: #1e1e1e; padding: 12px; border-radius: 4px; '
+        f'margin: 8px 0; border-left: 3px solid {color};">'
+        f'<div style="margin: 4px 0;"><strong>Verdict:</strong> '
+        f'<span style="color: {color}; font-weight: bold;">{verdict_str}</span></div>'
+        f'<div style="margin: 4px 0; color: #ccc;"><strong>Category:</strong> {category} '
+        f'<span style="margin-left: 12px;"><strong>Confidence:</strong> {confidence}</span></div>'
+        f'<div style="margin: 8px 0; color: #ddd;">{reason_html}</div>'
+        '<div style="margin: 8px 0; font-size: 11px; color: #888;">'
+        'QQR sees only sanitised code + a deterministic, T-only summary of '
+        'the user request. It does NOT see chat history.'
+        '</div></div></div>'
+    )
+
+
 def _render_diff_review_page(review_id: str, review: dict) -> HTMLResponse:
     """Render the diff review HTML page with colored diff lines."""
     title = review.get("title", "Diff Review")
@@ -309,7 +356,10 @@ def _render_diff_review_page(review_id: str, review: dict) -> HTMLResponse:
         }
         color = badge_colors.get(outcome, "#75715e")
         icon = badge_icons.get(outcome, "\u2022")
-        attempt_text = f" (Attempt {attempt_count}/3)" if outcome == "REWORK" and attempt_count else ""
+        attempt_text = (
+            f" (Attempt {attempt_count}/{constants.MAX_REWORK_RETRIES})"
+            if outcome == "REWORK" and attempt_count else ""
+        )
         outcome_badge = f'<div class="outcome-badge" style="background: {color};">{icon} {outcome}{attempt_text}</div>'
 
     # Build filename mapping display (for internal reference)
@@ -369,6 +419,14 @@ def _render_diff_review_page(review_id: str, review: dict) -> HTMLResponse:
                 )
             cards_html = "".join(cards)
             ai_reviews_html = f'<div style="margin: 15px 0;"><h3 style="color: #66d9ef; margin-bottom: 10px;">AI Reviews</h3>{cards_html}</div>'
+
+    # Build QQR (Quarantined Quality Reviewer) panel.
+    # Rendered alongside the main reviewer card so a human can see whether
+    # both reviewers concurred. ``reason_html`` is already HTML-escaped at
+    # the QqrSignal layer; we only style it.
+    qqr_html = _render_qqr_block(review.get("qqr_signal"))
+    if qqr_html:
+        ai_reviews_html = ai_reviews_html + qqr_html
 
     # Build action buttons
     action_buttons = (
@@ -459,6 +517,57 @@ async def submit_decision(request: Request):
             )
             wake_signal.set()
 
+    # Optional: trigger a follow-up PLANNER arc when approving with a
+    # follow-up goal. The review screen is trusted human input, so the new
+    # arc is created at trusted integrity. It is a sibling of the current
+    # arc (same parent_id) — or a new root if the current arc is a root.
+    new_followup_arc_id: int | None = None
+    if (
+        review.get("arc_id")
+        and decision.decision == "approve"
+        and decision.followup_goal
+        and decision.followup_goal.strip()
+    ):
+        try:
+            current_arc = arc_manager.get_arc(review["arc_id"])
+            sibling_parent_id = current_arc.get("parent_id") if current_arc else None
+            new_followup_arc_id = arc_manager.create_arc(
+                name="followup-from-review",
+                goal=decision.followup_goal.strip(),
+                parent_id=sibling_parent_id,
+                integrity_level="trusted",
+                agent_type="PLANNER",
+            )
+            # If the new arc is a root (no parent), create_arc only auto-enqueues
+            # arc.dispatch for root arcs that have a code_file_id. Manually
+            # enqueue to ensure the planner starts promptly.
+            if sibling_parent_id is None:
+                from ..core.engine import work_queue
+                from ..core.engine.main_loop import wake_signal
+                work_queue.enqueue(
+                    "arc.dispatch",
+                    {"arc_id": new_followup_arc_id},
+                    idempotency_key=f"arc_dispatch:{new_followup_arc_id}",
+                )
+                wake_signal.set()
+            arc_manager.add_history(
+                review["arc_id"],
+                "followup_triggered",
+                {
+                    "child_arc_id": new_followup_arc_id,
+                    "goal": decision.followup_goal.strip(),
+                    "parent_id": sibling_parent_id,
+                },
+                actor=review.get("reviewer", "user"),
+            )
+        except (sqlite3.Error, ValueError, KeyError) as exc:
+            logger.warning(
+                "Failed to create follow-up arc for review %s: %s", review_id, exc
+            )
+            new_followup_arc_id = None
+
+    if review.get("arc_id"):
+
         # Inject immediate chat notification so user sees it on next poll
         from ..core.workflows.coding_change_handler import _get_arc_state
         from ..agent import conversation
@@ -471,11 +580,14 @@ async def submit_decision(request: Request):
                 msg += f" Feedback: {decision.comment}"
             conversation.add_message(int(conv_id), "system", msg, arc_id=review["arc_id"])
 
-    return JSONResponse(content={
+    response_body: dict = {
         "review_id": review_id,
         "decision": decision.decision,
         "recorded": True,
-    })
+    }
+    if new_followup_arc_id is not None:
+        response_body["followup_arc_id"] = new_followup_arc_id
+    return JSONResponse(content=response_body)
 
 
 @attrs.define
@@ -492,7 +604,7 @@ def _get_ai_reviews(arc_id: int) -> list[dict]:
     """
     with db_connection() as db:
         rows = db.execute(
-            "SELECT a.id, a.name, a.status, a.agent_config_id "
+            "SELECT a.id, a.name, a.status, a.model_policy_id "
             "FROM arcs a "
             "WHERE a.parent_id = ? "
             "  AND a.agent_type = 'REVIEWER' "
@@ -511,15 +623,15 @@ def _get_ai_reviews(arc_id: int) -> list[dict]:
                 "findings": None,
             }
 
-            # Get model name from agent_configs
-            if row["agent_config_id"]:
-                config_row = db.execute(
-                    "SELECT model FROM agent_configs WHERE id = ?",
-                    (row["agent_config_id"],),
+            # Get model name from model_policies
+            if row["model_policy_id"]:
+                policy_row = db.execute(
+                    "SELECT model FROM model_policies WHERE id = ?",
+                    (row["model_policy_id"],),
                 ).fetchone()
-                if config_row:
+                if policy_row and policy_row["model"]:
                     # Extract short name from "provider:model_id"
-                    model_str = config_row["model"]
+                    model_str = policy_row["model"]
                     review["model"] = model_str.split(":")[-1] if ":" in model_str else model_str
 
             # Get findings from arc_state if completed

@@ -45,8 +45,10 @@ def get_db(*, _allow_during_transaction: bool = False) -> sqlite3.Connection:
     """Get a database connection with WAL mode and Row factory.
 
     If ``db_encryption_key`` is set in config and pysqlcipher3 is
-    available, uses SQLCipher for at-rest encryption. Falls back to
-    plain sqlite3 with a warning if pysqlcipher3 is not installed.
+    available, uses SQLCipher for at-rest encryption. Raises
+    ``RuntimeError`` if ``db_encryption_key`` is set but pysqlcipher3
+    is not installed (fail closed — never silently downgrade an
+    explicitly-requested encryption to plaintext).
 
     Raises:
         RuntimeError: If called while a ``db_transaction()`` is active
@@ -84,12 +86,23 @@ def get_db(*, _allow_during_transaction: bool = False) -> sqlite3.Connection:
         conn.row_factory = sqlite3.Row
         conn.execute(f"PRAGMA key='{encryption_key}'")
     elif encryption_key and _sqlcipher_module is None:
-        logger.warning(
-            "db_encryption_key is set but pysqlcipher3 is not installed. "
-            "Database will NOT be encrypted. Install with: pip install pysqlcipher3"
+        # Fail closed. An operator who configured db_encryption_key has
+        # explicitly opted into at-rest encryption; silently downgrading
+        # to plaintext SQLite would write sensitive material (including
+        # the raw Fernet keys in review_keys, see I7 in
+        # docs/trust-invariants.md) to disk in clear text. Refuse to
+        # start instead.
+        raise RuntimeError(
+            "db_encryption_key is set in config but pysqlcipher3 is not "
+            "installed. Refusing to fall back to plaintext SQLite, which "
+            "would store sensitive data (including review_keys Fernet "
+            "keys) in clear text on disk. Install the SQLCipher backend "
+            "with `pip install pysqlcipher3` (it requires libsqlcipher-dev "
+            "or equivalent on Debian/Ubuntu/macOS), or remove "
+            "db_encryption_key from your config to acknowledge that the "
+            "DB is intentionally unencrypted. See docs/trust-invariants.md "
+            "section I7 for the threat model."
         )
-        conn = sqlite3.connect(db_path, timeout=30)
-        conn.row_factory = sqlite3.Row
     else:
         conn = sqlite3.connect(db_path, timeout=30)
         conn.row_factory = sqlite3.Row
@@ -260,28 +273,14 @@ def _config_seed_dir() -> Path:
 def install_data_models_defaults(data_models_dir: str) -> dict:
     """Copy config_seed/data_models/ to data_models_dir if it doesn't exist.
 
-    Same pattern as prompts.install_prompt_defaults(). Only copies on first install.
+    Thin wrapper that delegates to :func:`carpenter.seed.install_single_target`.
+    Only copies on first install.
 
     Returns:
         {"status": "installed"|"exists"|"no_defaults", "copied": int}
     """
-    if os.path.isdir(data_models_dir):
-        return {"status": "exists", "copied": 0}
-
-    seed_dir = str(_config_seed_dir() / "data_models")
-    if not os.path.isdir(seed_dir):
-        logger.warning("Data models seed directory not found: %s", seed_dir)
-        return {"status": "no_defaults", "copied": 0}
-
-    try:
-        import shutil
-        shutil.copytree(seed_dir, data_models_dir)
-        count = sum(1 for _ in Path(data_models_dir).glob("*.py"))
-        logger.info("Installed data model defaults: %d files to %s", count, data_models_dir)
-        return {"status": "installed", "copied": count}
-    except OSError as e:
-        logger.error("Failed to install data model defaults: %s", e)
-        return {"status": "error", "error": str(e), "copied": 0}
+    from .seed import install_single_target
+    return install_single_target("data_models", data_models_dir)
 
 
 def _sync_credential_registry(base_dir: str) -> None:

@@ -1,7 +1,7 @@
 """Model string parsing and escalation stack resolution.
 
 Provides utilities for:
-- Parsing provider:model strings (e.g., "anthropic:claude-haiku-4.5")
+- Parsing provider:model strings (e.g., "anthropic:claude-haiku-4-5")
 - Looking up escalation stacks for task types
 - Finding the next model in an escalation chain
 - Creating client modules for specific models
@@ -127,23 +127,59 @@ def get_model_for_role(slot: str) -> str:
         from .providers import chain as chain_client
         model = chain_client.get_model()
         return f"chain:{model}" if model else "chain:default"
-    elif provider == "local":
-        import os
-        model_path = config.CONFIG.get("local_model_path", "")
-        if model_path:
-            basename = os.path.splitext(os.path.basename(model_path))[0]
-            return f"local:{basename}"
-        return "local:default"
     else:
         anthropic_model = config.CONFIG.get("anthropic_model", "claude-sonnet-4-6")
         return f"anthropic:{anthropic_model}"
+
+
+def resolve_arc_creation_model(
+    model: str | None,
+    agent_model: str | None,
+    model_role: str | None,
+    agent_role: str | None,
+    temperature: float | None,
+    max_tokens: int | None,
+    model_policy_id: int | None,
+    db,
+) -> tuple[str | None, int | None]:
+    """Resolve the model string and model_policy_id at arc creation time.
+
+    Mirrors the logic previously inlined at the top of ``create_arc``:
+    - If ``agent_model`` is a short identifier and no ``model`` is given,
+      resolve ``agent_model`` to a ``provider:model_id`` string.
+    - If ``model_policy_id`` is not set and any model input is given,
+      resolve a concrete model (falling back through ``model_role`` then
+      ``default_step``) and create/reuse a hard-pinned ``model_policies`` row.
+
+    Returns (resolved_model, model_policy_id).
+    """
+    from ..core.arcs import manager as arc_manager
+
+    if agent_model and not model:
+        model = resolve_model_identifier(agent_model)
+
+    if model_policy_id is None and (model or model_role or agent_role):
+        resolved_model = model
+        if not resolved_model and model_role:
+            resolved_model = get_model_for_role(model_role)
+        if not resolved_model:
+            resolved_model = get_model_for_role("default_step")
+        model_policy_id = arc_manager.get_or_create_model_policy(
+            model=resolved_model,
+            agent_role=agent_role,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            _db_conn=db,
+        )
+
+    return model, model_policy_id
 
 
 def parse_model_string(model_str: str) -> tuple[str, str]:
     """Parse a model string into (provider, model_name).
 
     Args:
-        model_str: Format "provider:model" (e.g., "anthropic:claude-haiku-4.5")
+        model_str: Format "provider:model" (e.g., "anthropic:claude-haiku-4-5")
                    or "provider:model:variant" for Ollama (e.g., "ollama:qwen2.5-coder:32b")
 
     Returns:
@@ -191,7 +227,7 @@ def get_next_model(current_model: str, task_type: str) -> str | None:
     """Find the next model in the escalation stack.
 
     Args:
-        current_model: Current model string (e.g., "anthropic:claude-haiku-4.5").
+        current_model: Current model string (e.g., "anthropic:claude-haiku-4-5").
         task_type: Task type for stack selection.
 
     Returns:
@@ -257,9 +293,6 @@ def create_client_for_model(model_str: str):
     elif provider == "chain":
         from .providers import chain as chain_client
         return chain_client
-    elif provider == "local":
-        from .providers import local as local_client
-        return local_client
     else:
         raise ValueError(f"Unknown AI provider: {provider}")
 
@@ -304,10 +337,10 @@ def estimate_cost_multiplier(current_model: str, target_model: str) -> str:
     current_pricing = pricing.get(current_model)
     target_pricing = pricing.get(target_model)
 
-    # If either model is not in pricing, check if they're free (Ollama/local)
+    # If either model is not in pricing, check if they're free (Ollama)
     if current_pricing is None or target_pricing is None:
-        # Ollama and local models are free
-        if target_model.startswith("ollama:") or target_model.startswith("local:"):
+        # Ollama models are free
+        if target_model.startswith("ollama:"):
             return "free"
         # Unknown pricing
         return "unknown cost"

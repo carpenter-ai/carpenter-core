@@ -18,6 +18,11 @@
     <pre>{diff_html}</pre>
     <textarea id="comment" placeholder="Feedback (required for revise)..."></textarea>
     <div class="feedback-note">Provide feedback when requesting revisions.</div>
+    <details class="followup-section">
+        <summary>Trigger further work after approval</summary>
+        <textarea id="followup-goal" rows="3" placeholder="Describe the follow-up work for the planner..."></textarea>
+        <button class="btn btn-accept-followup" onclick="acceptAndTrigger()">Accept and trigger further work</button>
+    </details>
     <div class="actions">
         {action_buttons}
         <div class="ai-review-controls">

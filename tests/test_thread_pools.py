@@ -62,6 +62,15 @@ class TestGetPoolsBeforeInit:
 
 
 class TestRunInWorkPool:
+    # NOTE: Use ``asyncio.run()`` rather than
+    # ``asyncio.get_event_loop().run_until_complete(...)``.  Under xdist with
+    # pytest-asyncio in auto mode, earlier tests in the same worker may have
+    # closed or unset the thread's event loop, causing
+    # ``get_event_loop()`` to raise ``RuntimeError: There is no current event
+    # loop in thread 'MainThread'``.  ``asyncio.run()`` always creates a
+    # fresh loop and tears it down cleanly, so it is robust to that
+    # cross-test pollution.
+
     def test_runs_function_in_work_pool(self):
         thread_pools.init_pools()
 
@@ -72,9 +81,7 @@ class TestRunInWorkPool:
             results["thread"] = threading.current_thread().name
             return 42
 
-        result = asyncio.get_event_loop().run_until_complete(
-            thread_pools.run_in_work_pool(capture_thread)
-        )
+        result = asyncio.run(thread_pools.run_in_work_pool(capture_thread))
         assert result == 42
         assert "tc-work" in results["thread"]
 
@@ -84,9 +91,7 @@ class TestRunInWorkPool:
         def add(a, b):
             return a + b
 
-        result = asyncio.get_event_loop().run_until_complete(
-            thread_pools.run_in_work_pool(add, 3, 7)
-        )
+        result = asyncio.run(thread_pools.run_in_work_pool(add, 3, 7))
         assert result == 10
 
     def test_passes_kwargs(self):
@@ -95,7 +100,7 @@ class TestRunInWorkPool:
         def greet(name, greeting="hello"):
             return f"{greeting} {name}"
 
-        result = asyncio.get_event_loop().run_until_complete(
+        result = asyncio.run(
             thread_pools.run_in_work_pool(greet, "world", greeting="hi")
         )
         assert result == "hi world"
@@ -107,9 +112,7 @@ class TestRunInWorkPool:
             raise ValueError("boom")
 
         with pytest.raises(ValueError, match="boom"):
-            asyncio.get_event_loop().run_until_complete(
-                thread_pools.run_in_work_pool(fail)
-            )
+            asyncio.run(thread_pools.run_in_work_pool(fail))
 
 
 class TestShutdownPools:

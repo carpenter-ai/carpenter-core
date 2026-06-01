@@ -1,4 +1,7 @@
-"""Write file tools. Tier 2: runs directly, no callback."""
+"""Write-side file tool declarations.
+
+See ``carpenter_tools`` package docstring for the invocation model.
+"""
 import os
 
 from ..tool_meta import tool

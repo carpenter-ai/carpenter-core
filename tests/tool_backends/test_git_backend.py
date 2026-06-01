@@ -1,11 +1,14 @@
-"""Tests for carpenter.tool_backends.git and carpenter.tool_backends.forgejo_api."""
+"""Tests for carpenter.tool_backends.git and carpenter.forges.forgejo."""
 import os
 from unittest.mock import patch, MagicMock, call
 
 import dulwich.porcelain as porcelain
 
 from carpenter.tool_backends import git
-from carpenter.tool_backends import forgejo_api
+from carpenter.forges.forgejo import ForgejoProvider
+
+# Module-level instance reused across tests — provider is stateless.
+forgejo_api = ForgejoProvider()
 
 
 # ---------------------------------------------------------------------------
@@ -180,9 +183,9 @@ def test_create_pr():
         "html_url": "https://forge.example.com/owner/repo/pulls/42",
     }
 
-    with patch("carpenter.tool_backends.forgejo_api.httpx") as mock_httpx:
+    with patch("carpenter.forges.forgejo.httpx") as mock_httpx:
         mock_httpx.post.return_value = mock_response
-        result = forgejo_api.handle_create_pr({
+        result = forgejo_api.create_pr({
             "repo_owner": "owner",
             "repo_name": "repo",
             "branch_name": "feature-x",
@@ -228,9 +231,9 @@ def test_list_prs():
         },
     ]
 
-    with patch("carpenter.tool_backends.forgejo_api.httpx") as mock_httpx:
+    with patch("carpenter.forges.forgejo.httpx") as mock_httpx:
         mock_httpx.get.return_value = mock_response
-        result = forgejo_api.handle_list_prs({
+        result = forgejo_api.list_prs({
             "repo_owner": "owner",
             "repo_name": "repo",
         })
@@ -258,9 +261,9 @@ def test_merge_pr():
     mock_response.json.return_value = {"merged": True}
     mock_response.text = ""
 
-    with patch("carpenter.tool_backends.forgejo_api.httpx") as mock_httpx:
+    with patch("carpenter.forges.forgejo.httpx") as mock_httpx:
         mock_httpx.post.return_value = mock_response
-        result = forgejo_api.handle_merge_pr({
+        result = forgejo_api.merge_pr({
             "repo_owner": "owner",
             "repo_name": "repo",
             "pr_number": 42,
@@ -286,10 +289,10 @@ def test_close_pr():
     mock_comment_response = MagicMock()
     mock_comment_response.status_code = 201
 
-    with patch("carpenter.tool_backends.forgejo_api.httpx") as mock_httpx:
+    with patch("carpenter.forges.forgejo.httpx") as mock_httpx:
         mock_httpx.post.return_value = mock_comment_response
         mock_httpx.patch.return_value = mock_patch_response
-        result = forgejo_api.handle_close_pr({
+        result = forgejo_api.close_pr({
             "repo_owner": "owner",
             "repo_name": "repo",
             "pr_number": 7,
@@ -329,9 +332,9 @@ def test_get_pr():
         "html_url": "https://forge.example.com/owner/repo/pulls/5",
     }
 
-    with patch("carpenter.tool_backends.forgejo_api.httpx") as mock_httpx:
+    with patch("carpenter.forges.forgejo.httpx") as mock_httpx:
         mock_httpx.get.return_value = mock_response
-        result = forgejo_api.handle_get_pr({
+        result = forgejo_api.get_pr({
             "repo_owner": "owner",
             "repo_name": "repo",
             "pr_number": 5,
@@ -356,9 +359,9 @@ def test_get_pr_not_found():
     mock_response.text = "Not Found"
     mock_response.json.return_value = {"message": "pull request not found"}
 
-    with patch("carpenter.tool_backends.forgejo_api.httpx") as mock_httpx:
+    with patch("carpenter.forges.forgejo.httpx") as mock_httpx:
         mock_httpx.get.return_value = mock_response
-        result = forgejo_api.handle_get_pr({
+        result = forgejo_api.get_pr({
             "repo_owner": "owner",
             "repo_name": "repo",
             "pr_number": 999,
@@ -386,9 +389,9 @@ def test_get_pr_diff():
     mock_response.status_code = 200
     mock_response.text = diff_text
 
-    with patch("carpenter.tool_backends.forgejo_api.httpx") as mock_httpx:
+    with patch("carpenter.forges.forgejo.httpx") as mock_httpx:
         mock_httpx.get.return_value = mock_response
-        result = forgejo_api.handle_get_pr_diff({
+        result = forgejo_api.get_pr_diff({
             "repo_owner": "owner",
             "repo_name": "repo",
             "pr_number": 5,
@@ -405,9 +408,9 @@ def test_get_pr_diff_error():
     mock_response = MagicMock()
     mock_response.status_code = 404
 
-    with patch("carpenter.tool_backends.forgejo_api.httpx") as mock_httpx:
+    with patch("carpenter.forges.forgejo.httpx") as mock_httpx:
         mock_httpx.get.return_value = mock_response
-        result = forgejo_api.handle_get_pr_diff({
+        result = forgejo_api.get_pr_diff({
             "repo_owner": "owner",
             "repo_name": "repo",
             "pr_number": 999,
@@ -430,9 +433,9 @@ def test_post_pr_review():
         "state": "APPROVED",
     }
 
-    with patch("carpenter.tool_backends.forgejo_api.httpx") as mock_httpx:
+    with patch("carpenter.forges.forgejo.httpx") as mock_httpx:
         mock_httpx.post.return_value = mock_response
-        result = forgejo_api.handle_post_pr_review({
+        result = forgejo_api.post_pr_review({
             "repo_owner": "owner",
             "repo_name": "repo",
             "pr_number": 5,
@@ -460,9 +463,9 @@ def test_post_pr_review_with_line_comments():
         {"path": "src/widget.py", "body": "Consider renaming", "new_position": 10},
     ]
 
-    with patch("carpenter.tool_backends.forgejo_api.httpx") as mock_httpx:
+    with patch("carpenter.forges.forgejo.httpx") as mock_httpx:
         mock_httpx.post.return_value = mock_response
-        result = forgejo_api.handle_post_pr_review({
+        result = forgejo_api.post_pr_review({
             "repo_owner": "owner",
             "repo_name": "repo",
             "pr_number": 5,
@@ -482,9 +485,9 @@ def test_post_pr_review_error():
     mock_response.status_code = 422
     mock_response.json.return_value = {"message": "invalid event"}
 
-    with patch("carpenter.tool_backends.forgejo_api.httpx") as mock_httpx:
+    with patch("carpenter.forges.forgejo.httpx") as mock_httpx:
         mock_httpx.post.return_value = mock_response
-        result = forgejo_api.handle_post_pr_review({
+        result = forgejo_api.post_pr_review({
             "repo_owner": "owner",
             "repo_name": "repo",
             "pr_number": 5,
@@ -509,9 +512,9 @@ def test_create_repo_webhook():
         "active": True,
     }
 
-    with patch("carpenter.tool_backends.forgejo_api.httpx") as mock_httpx:
+    with patch("carpenter.forges.forgejo.httpx") as mock_httpx:
         mock_httpx.post.return_value = mock_response
-        result = forgejo_api.handle_create_repo_webhook({
+        result = forgejo_api.create_repo_webhook({
             "repo_owner": "owner",
             "repo_name": "repo",
             "target_url": "https://tc.example.com/api/webhooks/abc123",
@@ -538,9 +541,9 @@ def test_create_repo_webhook_error():
     mock_response.status_code = 403
     mock_response.json.return_value = {"message": "forbidden"}
 
-    with patch("carpenter.tool_backends.forgejo_api.httpx") as mock_httpx:
+    with patch("carpenter.forges.forgejo.httpx") as mock_httpx:
         mock_httpx.post.return_value = mock_response
-        result = forgejo_api.handle_create_repo_webhook({
+        result = forgejo_api.create_repo_webhook({
             "repo_owner": "owner",
             "repo_name": "repo",
             "target_url": "https://tc.example.com/api/webhooks/abc123",
@@ -560,9 +563,9 @@ def test_delete_repo_webhook():
     mock_response.status_code = 204
     mock_response.text = ""
 
-    with patch("carpenter.tool_backends.forgejo_api.httpx") as mock_httpx:
+    with patch("carpenter.forges.forgejo.httpx") as mock_httpx:
         mock_httpx.delete.return_value = mock_response
-        result = forgejo_api.handle_delete_repo_webhook({
+        result = forgejo_api.delete_repo_webhook({
             "repo_owner": "owner",
             "repo_name": "repo",
             "hook_id": 77,
@@ -581,9 +584,9 @@ def test_delete_repo_webhook_error():
     mock_response.text = "Not Found"
     mock_response.json.return_value = {"message": "hook not found"}
 
-    with patch("carpenter.tool_backends.forgejo_api.httpx") as mock_httpx:
+    with patch("carpenter.forges.forgejo.httpx") as mock_httpx:
         mock_httpx.delete.return_value = mock_response
-        result = forgejo_api.handle_delete_repo_webhook({
+        result = forgejo_api.delete_repo_webhook({
             "repo_owner": "owner",
             "repo_name": "repo",
             "hook_id": 999,

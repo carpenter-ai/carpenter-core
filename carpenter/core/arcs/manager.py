@@ -88,6 +88,7 @@ def create_arc(
     parent_id: int | None = None,
     code_file_id: int | None = None,
     template_id: int | None = None,
+    step_role: str | None = None,
     from_template: bool = False,
     template_mutable: bool = False,
     timeout_minutes: int | None = None,
@@ -101,12 +102,12 @@ def create_arc(
     agent_model: str | None = None,
     temperature: float | None = None,
     max_tokens: int | None = None,
-    agent_config_id: int | None = None,
     model_policy_id: int | None = None,
     wait_until: str | None = None,
     output_contract: str | None = None,
     arc_role: str = "worker",
     verification_target_id: int | None = None,
+    priority: int | None = None,
     _db_conn=None,
     _audit_queue: list | None = None,
 ) -> int:
@@ -115,8 +116,8 @@ def create_arc(
     Auto-calculates depth from parent (parent.depth + 1, or 0 if root).
 
     Rejects creation of non-trusted arcs: untrusted/constrained arcs must
-    be created via :func:`carpenter.core.trust.batch.create_untrusted_batch`
-    (or, internally, :func:`add_child` and :func:`_insert_arc`) so the
+    be created via :func:`carpenter.tool_backends.arc.handle_create_batch`
+    (or, internally, via :func:`add_child` or :func:`_insert_arc`) so the
     reviewer + judge chain is established atomically.
 
     Args:
@@ -136,8 +137,10 @@ def create_arc(
     agent_type = validate_agent_type(agent_type)
 
     # Reject individual non-trusted arc creation: untrusted arcs must be
-    # created via a batch-builder (create_untrusted_batch / add_child) so
-    # the reviewer + judge chain is wired atomically.
+    # created via a batch-builder (handle_create_batch / add_child) so the
+    # reviewer + judge chain is wired atomically. Internal batch-builders
+    # call ``_insert_arc`` directly to bypass this guard after running
+    # their own batch-level validation.
     if is_non_trusted(integrity_level):
         raise ValueError(
             "Cannot create individual untrusted arc. Use arc.create_batch to create "
@@ -150,6 +153,7 @@ def create_arc(
         parent_id=parent_id,
         code_file_id=code_file_id,
         template_id=template_id,
+        step_role=step_role,
         from_template=from_template,
         template_mutable=template_mutable,
         timeout_minutes=timeout_minutes,
@@ -163,12 +167,12 @@ def create_arc(
         agent_model=agent_model,
         temperature=temperature,
         max_tokens=max_tokens,
-        agent_config_id=agent_config_id,
         model_policy_id=model_policy_id,
         wait_until=wait_until,
         output_contract=output_contract,
         arc_role=arc_role,
         verification_target_id=verification_target_id,
+        priority=priority,
         _db_conn=_db_conn,
         _audit_queue=_audit_queue,
     )
@@ -180,6 +184,7 @@ def _insert_arc(
     parent_id: int | None = None,
     code_file_id: int | None = None,
     template_id: int | None = None,
+    step_role: str | None = None,
     from_template: bool = False,
     template_mutable: bool = False,
     timeout_minutes: int | None = None,
@@ -193,25 +198,25 @@ def _insert_arc(
     agent_model: str | None = None,
     temperature: float | None = None,
     max_tokens: int | None = None,
-    agent_config_id: int | None = None,
     model_policy_id: int | None = None,
     wait_until: str | None = None,
     output_contract: str | None = None,
     arc_role: str = "worker",
     verification_target_id: int | None = None,
+    priority: int | None = None,
     _db_conn=None,
     _audit_queue: list | None = None,
 ) -> int:
     """Internal: insert an arc row + history entry without the integrity guard.
 
-    Callers must already have validated that creating a non-trusted arc is
-    permissible (e.g. as part of a batch with a reviewer chain, or as a
-    child of an arc whose parent has validated the wider structure). External
-    code MUST go through :func:`create_arc` so the guard fires.
+    Callers must already have validated that creating a non-trusted arc
+    is permissible (e.g. as part of a batch with a reviewer chain, or as
+    a child of an arc whose parent has validated the wider structure).
+    External code MUST go through :func:`create_arc` so the guard fires.
 
     Performs the same model-config resolution, depth calculation, history
     log, retry-state init, audit event, and root-enqueue side-effects as
-    the public ``create_arc`` used to.
+    the public ``create_arc``.
     """
     from ..trust.types import validate_integrity_level, validate_output_type, validate_agent_type
     from ..trust.integrity import is_non_trusted
@@ -220,37 +225,37 @@ def _insert_arc(
     output_type = validate_output_type(output_type)
     agent_type = validate_agent_type(agent_type)
 
-    # Resolve agent_model short identifier to provider:model_id
-    if agent_model and not model:
-        from ...agent.model_resolver import resolve_model_identifier
-        model = resolve_model_identifier(agent_model)
-
     owns_connection = _db_conn is None
     db = _db_conn if _db_conn else get_db()
 
-    # Resolve agent_config_id if model params provided
-    if agent_config_id is None and (model or model_role or agent_role):
-        from ...agent.model_resolver import get_model_for_role
-        resolved_model = model
-        if not resolved_model and model_role:
-            resolved_model = get_model_for_role(model_role)
-        if not resolved_model:
-            resolved_model = get_model_for_role("default_step")
-        agent_config_id = get_or_create_agent_config(
-            model=resolved_model,
-            agent_role=agent_role,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            _db_conn=db,
-        )
+    from ...agent.model_resolver import resolve_arc_creation_model
+    model, model_policy_id = resolve_arc_creation_model(
+        model=model,
+        agent_model=agent_model,
+        model_role=model_role,
+        agent_role=agent_role,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        model_policy_id=model_policy_id,
+        db=db,
+    )
     try:
         depth = 0
+        parent_priority: int | None = None
         if parent_id is not None:
             parent = db.execute(
-                "SELECT depth FROM arcs WHERE id = ?", (parent_id,)
+                "SELECT depth, priority FROM arcs WHERE id = ?", (parent_id,)
             ).fetchone()
             if parent is not None:
                 depth = parent["depth"] + 1
+                parent_priority = parent["priority"]
+
+        # Priority inheritance: explicit value wins; else inherit from parent
+        # if one exists; else default to 100.
+        if priority is None:
+            resolved_priority = parent_priority if parent_priority is not None else 100
+        else:
+            resolved_priority = priority
 
         # Validate arc_role
         valid_arc_roles = {"coordinator", "worker", "verifier"}
@@ -266,23 +271,19 @@ def _insert_arc(
                 db, verification_target_id, parent_id, arc_id=None,
             )
 
-        # Sync model_policy_id from agent_config_id if not explicitly set
-        if model_policy_id is None and agent_config_id is not None:
-            model_policy_id = agent_config_id
-
         now = datetime.now(timezone.utc).isoformat()
         cursor = db.execute(
             "INSERT INTO arcs "
-            "(name, goal, parent_id, code_file_id, template_id, "
+            "(name, goal, parent_id, code_file_id, template_id, step_role, "
             " from_template, template_mutable, timeout_minutes, step_order, depth, "
-            " integrity_level, output_type, agent_type, agent_config_id, model_policy_id, "
-            " wait_until, output_contract, arc_role, verification_target_id, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " integrity_level, output_type, agent_type, model_policy_id, "
+            " wait_until, output_contract, arc_role, verification_target_id, priority, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
-                name, goal, parent_id, code_file_id, template_id,
+                name, goal, parent_id, code_file_id, template_id, step_role,
                 from_template, template_mutable, timeout_minutes, step_order, depth,
-                integrity_level, output_type, agent_type, agent_config_id, model_policy_id,
-                wait_until, output_contract, arc_role, verification_target_id, now,
+                integrity_level, output_type, agent_type, model_policy_id,
+                wait_until, output_contract, arc_role, verification_target_id, resolved_priority, now,
             ),
         )
         arc_id = cursor.lastrowid
@@ -366,6 +367,7 @@ def _insert_arc(
                     "arc.dispatch",
                     {"arc_id": arc_id},
                     idempotency_key=f"arc_dispatch:{arc_id}",
+                    priority=resolved_priority,
                 )
                 logger.debug("Enqueued root arc %d for immediate dispatch", arc_id)
                 from ..engine import main_loop as _ml
@@ -489,10 +491,15 @@ def add_child(
                     # Enqueue for dispatch
                     try:
                         from ..engine import work_queue as _wq
+                        child_row = db.execute(
+                            "SELECT priority FROM arcs WHERE id = ?", (child_id,),
+                        ).fetchone()
+                        child_priority = child_row["priority"] if child_row else 100
                         _wq.enqueue(
                             "arc.dispatch",
                             {"arc_id": child_id},
                             idempotency_key=f"arc_dispatch:{child_id}",
+                            priority=child_priority,
                         )
                         logger.info("Enqueued newly created arc %d for immediate dispatch", child_id)
                         # Wake main loop
@@ -612,7 +619,11 @@ def update_status(
 
         # Read metadata needed by post-transition hooks while we have the connection
         _arc_meta_for_hooks = db.execute(
-            "SELECT name, arc_role, parent_id, agent_type FROM arcs WHERE id = ?",
+            "SELECT a.name, a.arc_role, a.parent_id, a.agent_type, "
+            "       t.name AS template_name "
+            "FROM arcs a "
+            "LEFT JOIN workflow_templates t ON a.template_id = t.id "
+            "WHERE a.id = ?",
             (arc_id,),
         ).fetchone()
         if _arc_meta_for_hooks:
@@ -633,6 +644,7 @@ def update_status(
                 arc_role=_arc_meta_for_hooks["arc_role"],
                 parent_id=_arc_meta_for_hooks["parent_id"],
                 agent_type=_arc_meta_for_hooks["agent_type"],
+                template_name=_arc_meta_for_hooks.get("template_name"),
             )
         except Exception:  # broad catch: event emission must not break status updates
             logger.debug("Failed to emit arc lifecycle event for arc %d", arc_id, exc_info=True)
@@ -676,6 +688,24 @@ def update_status(
             _notify_parent_of_failure(arc_id)
         except Exception:  # broad catch: notification chain may raise anything
             logger.exception("Failed to notify parent of arc %d failure", arc_id)
+
+    # Post-transition: webhook Resource auto-approve path (Phase B PR B2).
+    # When a REVIEWER arc completes AND its state carries
+    # `_auto_approve_resource_id` (set by the webhook Resource-wrap path
+    # on subscriptions with auto_approve_verdict=1), mark the derived
+    # Resource's template_verdict as 'approved' — no JUDGE is spawned in
+    # that config.  Wrapped in a try/except so a malformed Resource link
+    # never blocks the status transition.
+    if new_status == "completed":
+        try:
+            from ..workflows.webhook_resource_wrap import (
+                apply_auto_approve_on_completion,
+            )
+            apply_auto_approve_on_completion(arc_id)
+        except Exception:  # broad catch: verdict side-effect must not break status
+            logger.debug(
+                "webhook auto-approve hook failed for arc %d", arc_id, exc_info=True,
+            )
 
 
 def _cascade_cancel(db, arc_id: int, actor: str) -> int:
@@ -987,20 +1017,9 @@ def _notify_parent_of_failure(arc_id: int) -> None:
         return
 
     if policy == "escalate":
-        # Escalate the failed child arc via _escalate_arc
-        from ...agent.model_resolver import get_model_for_role, get_next_model
-        # Find current model
-        current_model = None
-        child_config_id = arc.get("agent_config_id")
-        if child_config_id:
-            cfg = get_agent_config(child_config_id)
-            if cfg:
-                current_model = cfg["model"]
-        if not current_model:
-            current_model = get_model_for_role("default_step")
-        next_model = get_next_model(current_model, "general")
-        if next_model:
-            _escalate_arc(arc_id, next_model)
+        # Escalate the failed child arc to the next model in its chain.
+        from .root_failure_handler import escalate_to_next_model
+        escalate_to_next_model(arc_id)
         return
 
     # policy == "replan" (default): enqueue work item for parent re-invocation
@@ -1022,275 +1041,12 @@ def _notify_parent_of_failure(arc_id: int) -> None:
         logger.exception("Failed to enqueue child_failed work item for arc %d", arc_id)
 
 
-def _escalate_arc(arc_id: int, next_model: str) -> int | None:
-    """Create an escalated sibling arc with a stronger model.
-
-    - If root arc (no parent): creates a new root arc with next_model
-    - If child arc: creates a sibling with same step_order + parent_id
-    - Marks original arc as 'escalated'
-    - Stores _escalated_from metadata
-
-    Returns the new arc ID, or None on failure.
-    """
-    arc = get_arc(arc_id)
-    if arc is None:
-        return None
-
-    # Build new agent config for the escalated model
-    new_config_id = get_or_create_agent_config(model=next_model)
-
-    # Create the escalated arc
-    new_arc_id = create_arc(
-        name=f"{arc['name']} (escalated)",
-        goal=arc["goal"],
-        parent_id=arc["parent_id"],
-        step_order=arc["step_order"],
-        agent_config_id=new_config_id,
-        agent_type=arc["agent_type"],
-        integrity_level=arc["integrity_level"],
-        output_type=arc["output_type"],
-    )
-
-    # Mark original as escalated
-    try:
-        update_status(arc_id, "escalated")
-    except ValueError:
-        logger.warning("Could not transition arc %d to escalated", arc_id)
-
-    # Store escalation metadata
-    with db_transaction() as db:
-        db.execute(
-            "INSERT INTO arc_state (arc_id, key, value_json) VALUES (?, ?, ?)",
-            (new_arc_id, "_escalated_from", json.dumps(arc_id)),
-        )
-
-    # Grant read access so escalated arc can inspect predecessor
-    try:
-        grant_read_access(
-            new_arc_id, arc_id,
-            depth="subtree",
-            reason="Platform escalation",
-            granted_by="platform",
-        )
-    except (ValueError, sqlite3.Error) as _exc:
-        logger.exception("Failed to grant read access during escalation %d -> %d", arc_id, new_arc_id)
-
-    logger.info(
-        "Escalated arc %d -> %d (model: %s)",
-        arc_id, new_arc_id, next_model,
-    )
-    return new_arc_id
-
-
-def _handle_root_failure(arc_id: int) -> None:
-    """Handle failure of a root arc (no parent).
-
-    Two escalation paths:
-    1. Policy-aware: If arc has model_policy_id with policy_json, creates
-       escalated sibling with min_quality bumped by 1.
-    2. Legacy stack: Checks escalation.stacks config for hardcoded model chains.
-
-    Falls back to notifying human if no escalation path exists.
-
-    Note: Coding-change arcs are excluded from escalation because they have
-    specialized workflow requirements (workspace, review, apply) that don't
-    transfer to escalated arcs. A failed coding-change indicates workflow
-    failure, not insufficient model quality.
-    """
-    from ... import config as _config
-
-    arc = get_arc(arc_id)
-    if arc is None:
-        return
-
-    # Skip escalation for coding-change arcs — they have specialized workflows
-    # that don't benefit from model escalation. If a coding-change fails, it
-    # indicates a workflow problem (missing workspace, dirty tree, etc.), not
-    # an AI quality issue.
-    from . import CODING_CHANGE_PREFIX
-    arc_name = arc.get("name", "")
-    if arc_name.startswith(CODING_CHANGE_PREFIX):
-        logger.info(
-            "Skipping escalation for coding-change arc %d (workflow-specific failure)",
-            arc_id,
-        )
-        try:
-            from .. import notifications
-            notifications.notify(
-                f"Coding-change arc #{arc_id} failed. "
-                f"This typically indicates a workflow issue rather than model quality. "
-                f"Check logs for details.",
-                priority="normal",
-                category="coding_change_failure",
-            )
-        except Exception:  # broad catch: notification delivery may raise anything
-            logger.exception("Failed to send coding-change failure notification")
-        return
-
-    # Try policy-aware escalation first
-    policy_id = arc.get("model_policy_id")
-    if policy_id is not None:
-        policy_row = get_model_policy(policy_id)
-        if policy_row and policy_row.get("policy_json"):
-            try:
-                escalated = _policy_aware_escalation(arc_id, arc, policy_row)
-                if escalated:
-                    return
-            except (ImportError, KeyError, ValueError, sqlite3.Error) as _exc:
-                logger.exception("Policy-aware escalation failed for arc %d, trying legacy", arc_id)
-
-    # Legacy escalation via stacks config
-    escalation_config = _config.CONFIG.get("escalation", {})
-    stacks = escalation_config.get("stacks", {})
-
-    if not stacks:
-        try:
-            from .. import notifications
-            notifications.notify(
-                f"Root arc #{arc_id} '{arc['name']}' failed with no escalation path.",
-                priority="normal",
-                category="root_failure",
-            )
-        except Exception:  # broad catch: notification delivery may raise anything
-            logger.exception("Failed to send root failure notification for arc %d", arc_id)
-        return
-
-    # Find current model from agent_config or arc_state
-    current_model = None
-    config_id = arc.get("agent_config_id")
-    if config_id:
-        cfg = get_agent_config(config_id)
-        if cfg:
-            current_model = cfg["model"]
-
-    if not current_model:
-        # Legacy fallback: check arc_state
-        with db_connection() as db:
-            row = db.execute(
-                "SELECT value_json FROM arc_state WHERE arc_id = ? AND key = '_model'",
-                (arc_id,),
-            ).fetchone()
-        if row:
-            current_model = json.loads(row["value_json"])
-
-    if not current_model:
-        from ...agent.model_resolver import get_model_for_role
-        current_model = get_model_for_role("chat")
-
-    # Find a stack that contains the current model
-    next_model = None
-    for stack_name, stack_models in stacks.items():
-        if current_model in stack_models:
-            idx = stack_models.index(current_model)
-            if idx + 1 < len(stack_models):
-                next_model = stack_models[idx + 1]
-            break
-
-    if next_model is None:
-        try:
-            from .. import notifications
-            notifications.notify(
-                f"Root arc #{arc_id} '{arc['name']}' failed at top of escalation stack.",
-                priority="urgent",
-                category="root_failure",
-            )
-        except Exception:  # broad catch: notification delivery may raise anything
-            logger.exception("Failed to send escalation notification for arc %d", arc_id)
-        return
-
-    new_arc_id = _escalate_arc(arc_id, next_model)
-    if new_arc_id is None:
-        logger.error("Failed to escalate arc %d", arc_id)
-
-
-def _policy_aware_escalation(arc_id: int, arc: dict, policy_row: dict) -> bool:
-    """Escalate an arc by bumping min_quality in its model policy.
-
-    Creates an escalated sibling with min_quality incremented by 1
-    in the policy constraints. If already at max quality (5), returns False.
-
-    Args:
-        arc_id: Original arc ID.
-        arc: Arc dict.
-        policy_row: Model policy dict with policy_json.
-
-    Returns:
-        True if escalation succeeded, False if no escalation possible.
-    """
-    from ..models.selector import ModelPolicy, select_model
-
-    policy = ModelPolicy.from_db_row(policy_row)
-    constraints = policy.constraints
-    if constraints is None:
-        from ..models.selector import PolicyConstraints
-        constraints = PolicyConstraints()
-
-    current_min = constraints.min_quality
-    if current_min >= 5:
-        return False  # Already at max quality
-
-    # Bump min_quality
-    new_min = current_min + 1
-    constraints.min_quality = new_min
-    policy.constraints = constraints
-
-    # Check if any model qualifies with the new constraints
-    result = select_model(policy)
-    if result is None:
-        return False  # No model available at higher quality
-
-    # Create escalated policy
-    new_policy_json = policy.to_policy_json()
-    new_policy_id = get_or_create_model_policy(
-        model=None,
-        agent_role=policy_row.get("agent_role"),
-        temperature=policy_row.get("temperature"),
-        max_tokens=policy_row.get("max_tokens"),
-        policy_json=new_policy_json,
-        name=f"{policy_row.get('name', '')} (escalated q>={new_min})",
-    )
-
-    # Create the escalated arc
-    new_arc_id = create_arc(
-        name=f"{arc['name']} (escalated q>={new_min})",
-        goal=arc["goal"],
-        parent_id=arc["parent_id"],
-        step_order=arc["step_order"],
-        model_policy_id=new_policy_id,
-        agent_type=arc["agent_type"],
-        integrity_level=arc["integrity_level"],
-        output_type=arc["output_type"],
-    )
-
-    # Mark original as escalated
-    try:
-        update_status(arc_id, "escalated")
-    except ValueError:
-        logger.warning("Could not transition arc %d to escalated", arc_id)
-
-    # Store escalation metadata
-    with db_transaction() as db:
-        db.execute(
-            "INSERT INTO arc_state (arc_id, key, value_json) VALUES (?, ?, ?)",
-            (new_arc_id, "_escalated_from", json.dumps(arc_id)),
-        )
-
-    # Grant read access so escalated arc can inspect predecessor
-    try:
-        grant_read_access(
-            new_arc_id, arc_id,
-            depth="subtree",
-            reason="Policy-aware escalation",
-            granted_by="platform",
-        )
-    except (ValueError, sqlite3.Error) as _exc:
-        logger.exception("Failed to grant read access during policy escalation %d -> %d", arc_id, new_arc_id)
-
-    logger.info(
-        "Policy-aware escalation: arc %d -> %d (min_quality: %d -> %d, selected: %s)",
-        arc_id, new_arc_id, current_min, new_min, result.model_key,
-    )
-    return True
+# Re-exported from root_failure_handler for backward compatibility.
+from .root_failure_handler import (  # noqa: E402
+    _escalate_arc,
+    _handle_root_failure,
+    _policy_aware_escalation,
+)
 
 
 def check_dependencies_detailed(arc_id: int) -> dict:
@@ -1359,139 +1115,17 @@ def check_dependencies_detailed(arc_id: int) -> dict:
 # ── Performance counters ──────────────────────────────────────────
 
 
-def _walk_ancestors(db, arc_id: int) -> list[int]:
-    """Return list of ancestor arc IDs (parent, grandparent, ...).
-
-    Walks up the parent chain from the given arc.
-    Does not include the arc itself.
-    """
-    ancestors = []
-    current_id = arc_id
-    while True:
-        row = db.execute(
-            "SELECT parent_id FROM arcs WHERE id = ?", (current_id,)
-        ).fetchone()
-        if row is None or row["parent_id"] is None:
-            break
-        ancestors.append(row["parent_id"])
-        current_id = row["parent_id"]
-    return ancestors
+# Re-exported from performance_counters for backward compatibility.
+from .performance_counters import (  # noqa: E402
+    _walk_ancestors,
+    increment_ancestor_arc_count,
+    increment_ancestor_executions,
+    increment_ancestor_tokens,
+)
 
 
-def increment_ancestor_arc_count(arc_id: int, _db_conn=None) -> None:
-    """Increment descendant_arc_count for all ancestors of the given arc.
 
-    Called after a new arc is created as a child.
-    """
-    owns_connection = _db_conn is None
-    db = _db_conn if _db_conn else get_db()
-    try:
-        ancestors = _walk_ancestors(db, arc_id)
-        now = datetime.now(timezone.utc).isoformat()
-        for ancestor_id in ancestors:
-            db.execute(
-                "UPDATE arcs SET descendant_arc_count = descendant_arc_count + 1, "
-                "updated_at = ? WHERE id = ?",
-                (now, ancestor_id),
-            )
-        if owns_connection:
-            db.commit()
-    finally:
-        if owns_connection:
-            db.close()
-
-
-def increment_ancestor_executions(arc_id: int) -> None:
-    """Increment descendant_executions for the arc and all its ancestors.
-
-    Called after a code execution completes for the given arc.
-    The arc itself also gets incremented (it is its own ancestor for
-    counting purposes when viewed from a parent).
-    """
-    with db_transaction() as db:
-        now = datetime.now(timezone.utc).isoformat()
-        ancestors = _walk_ancestors(db, arc_id)
-        for ancestor_id in ancestors:
-            db.execute(
-                "UPDATE arcs SET descendant_executions = descendant_executions + 1, "
-                "updated_at = ? WHERE id = ?",
-                (now, ancestor_id),
-            )
-
-
-def increment_ancestor_tokens(arc_id: int, tokens: int) -> None:
-    """Increment descendant_tokens for all ancestors of the given arc.
-
-    Called after an API call completes for work associated with the given arc.
-
-    Args:
-        arc_id: The arc that consumed tokens.
-        tokens: Total tokens (input + output) to add.
-    """
-    if tokens <= 0:
-        return
-    with db_transaction() as db:
-        now = datetime.now(timezone.utc).isoformat()
-        ancestors = _walk_ancestors(db, arc_id)
-        for ancestor_id in ancestors:
-            db.execute(
-                "UPDATE arcs SET descendant_tokens = descendant_tokens + ?, "
-                "updated_at = ? WHERE id = ?",
-                (tokens, now, ancestor_id),
-            )
-
-
-# ── Agent config helpers ───────────────────────────────────────────
-
-
-def get_or_create_agent_config(
-    model: str,
-    agent_role: str | None = None,
-    temperature: float | None = None,
-    max_tokens: int | None = None,
-    _db_conn=None,
-) -> int:
-    """Get or create an agent_config row. Returns the config ID.
-
-    Uses INSERT OR IGNORE + SELECT with COALESCE-based dedup to ensure
-    identical parameter sets share a single row.
-
-    Args:
-        _db_conn: Optional existing database connection (reuses transaction).
-    """
-    owns_connection = _db_conn is None
-    db = _db_conn if _db_conn else get_db()
-    try:
-        db.execute(
-            "INSERT OR IGNORE INTO agent_configs "
-            "(model, agent_role, temperature, max_tokens) "
-            "VALUES (?, ?, ?, ?)",
-            (model, agent_role, temperature, max_tokens),
-        )
-        if owns_connection:
-            db.commit()
-
-        row = db.execute(
-            "SELECT id FROM agent_configs "
-            "WHERE model = ? "
-            "AND COALESCE(agent_role, '') = COALESCE(?, '') "
-            "AND COALESCE(temperature, -1) = COALESCE(?, -1) "
-            "AND COALESCE(max_tokens, -1) = COALESCE(?, -1)",
-            (model, agent_role, temperature, max_tokens),
-        ).fetchone()
-        return row["id"]
-    finally:
-        if owns_connection:
-            db.close()
-
-
-def get_agent_config(config_id: int) -> dict | None:
-    """Get an agent_config by ID. Returns dict or None."""
-    with db_connection() as db:
-        row = db.execute(
-            "SELECT * FROM agent_configs WHERE id = ?", (config_id,)
-        ).fetchone()
-        return dict(row) if row else None
+# ── Model policy helpers ──────────────────────────────────────────
 
 
 def get_or_create_model_policy(
@@ -1508,7 +1142,7 @@ def get_or_create_model_policy(
     For policies with policy_json (selector-based), deduplicates by
     (model, agent_role, temperature, max_tokens, policy_json).
     For hard-pinned policies (no policy_json), deduplicates by
-    (model, agent_role, temperature, max_tokens) like agent_configs.
+    (model, agent_role, temperature, max_tokens).
 
     Args:
         _db_conn: Optional existing database connection (reuses transaction).
@@ -1668,7 +1302,8 @@ def get_policy_id_by_name(name: str, _db_conn=None) -> int | None:
         _db_conn: Optional existing DB connection. Callers inside a
             ``db_transaction()`` should pass their connection so this
             read reuses the transaction's snapshot rather than opening
-            a second connection.
+            a second connection (which would trip the get_db transaction
+            guard).
 
     Returns:
         Policy ID or None if not found
@@ -1745,7 +1380,13 @@ def update_arc_counters(arc_id: int) -> None:
         ).fetchone()
         desc_executions = row["cnt"] if row else 0
 
-        # Sum tokens for descendant arcs (via conversation_arcs link)
+        # Sum tokens for descendant arcs. Two sources, disjoint by design:
+        #   (a) Chat-loop API calls: linked via conversation_arcs (conversation_id
+        #       is set on the api_calls row).
+        #   (b) Arc-only API calls (e.g. coding executor): no conversation_id,
+        #       but arc_id is set directly on the api_calls row (added in #359).
+        # Branch (b) is restricted to conversation_id IS NULL so we never
+        # double-count a chat-loop row that happens to have arc_id set too.
         row = db.execute(
             "WITH RECURSIVE subtree AS ( "
             "  SELECT id FROM arcs WHERE parent_id = ? "
@@ -1753,10 +1394,18 @@ def update_arc_counters(arc_id: int) -> None:
             "  SELECT a.id FROM arcs a "
             "  INNER JOIN subtree s ON a.parent_id = s.id "
             ") "
-            "SELECT COALESCE(SUM(ac.input_tokens + ac.output_tokens), 0) AS total "
-            "FROM api_calls ac "
-            "INNER JOIN conversation_arcs ca ON ac.conversation_id = ca.conversation_id "
-            "WHERE ca.arc_id IN (SELECT id FROM subtree)",
+            "SELECT COALESCE(SUM(input_tokens + output_tokens), 0) AS total FROM ( "
+            "  SELECT ac.input_tokens, ac.output_tokens "
+            "  FROM api_calls ac "
+            "  INNER JOIN conversation_arcs ca "
+            "    ON ac.conversation_id = ca.conversation_id "
+            "  WHERE ca.arc_id IN (SELECT id FROM subtree) "
+            "  UNION ALL "
+            "  SELECT ac.input_tokens, ac.output_tokens "
+            "  FROM api_calls ac "
+            "  WHERE ac.conversation_id IS NULL "
+            "    AND ac.arc_id IN (SELECT id FROM subtree) "
+            ")",
             (arc_id,),
         ).fetchone()
         desc_tokens = row["total"] if row else 0

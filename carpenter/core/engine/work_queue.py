@@ -28,6 +28,7 @@ def enqueue(
     idempotency_key: str | None = None,
     max_retries: int = 3,
     scheduled_at: str | None = None,
+    priority: int = 100,
 ) -> int | None:
     """Add a work item to the queue.
 
@@ -41,6 +42,10 @@ def enqueue(
             re-enqueued (e.g. arc re-dispatch after server restart).
         max_retries: Maximum retry attempts for this work item
         scheduled_at: Optional ISO8601 timestamp for delayed execution
+        priority: Dispatch priority (lower = higher priority, Unix-nice
+            style). Defaults to 100. ``claim()`` orders by priority first,
+            then ``created_at`` — so items with the same priority still
+            dispatch in FIFO order.
 
     Returns the work item ID, or None if idempotency_key already exists
     in a pending/claimed state.
@@ -60,9 +65,9 @@ def enqueue(
 
         cursor = db.execute(
             "INSERT OR IGNORE INTO work_queue "
-            "(event_type, payload_json, idempotency_key, max_retries, scheduled_at) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (event_type, json.dumps(payload), idempotency_key, max_retries, scheduled_at),
+            "(event_type, payload_json, idempotency_key, max_retries, scheduled_at, priority) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (event_type, json.dumps(payload), idempotency_key, max_retries, scheduled_at, priority),
         )
         if cursor.rowcount == 0:
             db.commit()  # Commit the DELETE even if INSERT was ignored
@@ -90,7 +95,7 @@ def claim() -> dict | None:
             "  SELECT id FROM work_queue "
             "  WHERE status = 'pending' "
             "  AND (scheduled_at IS NULL OR datetime(scheduled_at) <= datetime('now')) "
-            "  ORDER BY created_at ASC LIMIT 1"
+            "  ORDER BY priority ASC, created_at ASC LIMIT 1"
             ") RETURNING *"
         ).fetchone()
 

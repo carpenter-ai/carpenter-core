@@ -79,7 +79,7 @@ def notify(message: str, priority: str = "normal", category: str | None = None) 
     """Send a notification through the appropriate channel(s).
 
     Priority levels: urgent, normal, low, fyi
-    Categories: reflection_actions, review_needed, security_events, etc.
+    Categories: review_needed, security_events, etc.
 
     The log channel (notifications table) is always written to.
     Other channels are determined by priority and config routing overrides.

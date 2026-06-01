@@ -195,7 +195,9 @@ def analyze_histogram_with_llm(extracted: dict) -> list[str]:
                 logger.debug("Histogram LLM: %s is SAFE", source_name)
 
         except Exception:  # broad catch: AI review may raise anything
-            logger.debug(
+            # Intentionally swallow: histogram LLM is advisory only;
+            # failure means we don't add an advisory flag for this source.
+            logger.info(
                 "Histogram LLM analysis failed for %s — assuming safe",
                 source_name,
                 exc_info=True,

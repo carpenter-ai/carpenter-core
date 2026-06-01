@@ -22,7 +22,7 @@ from .coding_change_handler import (
 )
 from ...agent import coding_dispatch
 from ...tool_backends import git as git_backend
-from ...tool_backends import forgejo_api as forgejo_api_backend
+from ...forges import get_forge_provider
 
 logger = logging.getLogger(__name__)
 
@@ -144,7 +144,9 @@ async def handle_invoke_agent(work_id: int, payload: dict):
     try:
         # Run the coding agent in the work-handler pool (long-running)
         result = await thread_pools.run_in_work_pool(
-            coding_dispatch.invoke_coding_agent, workspace, prompt, agent_name,
+            coding_dispatch.invoke_coding_agent,
+            workspace, prompt, agent_name,
+            arc_id=arc_id,
         )
         _set_arc_state(arc_id, "agent_result", result)
 
@@ -306,7 +308,7 @@ async def handle_push_and_pr(work_id: int, payload: dict):
                 arc = arc_manager.get_arc(arc_id)
                 pr_title = arc.get("goal", "Changes by Carpenter") if arc else "Changes by Carpenter"
 
-            pr_result = forgejo_api_backend.handle_create_pr({
+            pr_result = get_forge_provider().create_pr({
                 "repo_owner": repo_owner,
                 "repo_name": repo_name,
                 "branch_name": branch_name,

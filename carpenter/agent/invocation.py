@@ -18,11 +18,11 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .. import config
+from .. import config, constants
 from ..core import code_manager
 from ..db import get_db, db_connection, db_transaction
 from . import templates, conversation, model_resolver, api_standard, error_classifier
-from .providers import anthropic as claude_client, ollama as ollama_client, tinfoil as tinfoil_client, local as local_client
+from .providers import anthropic as claude_client, ollama as ollama_client, tinfoil as tinfoil_client
 
 logger = logging.getLogger(__name__)
 
@@ -155,8 +155,8 @@ def _auto_search_for_prompt(messages: list[dict] | None = None) -> str:
                 for r in combined_results:
                     lines.append(f"- [[{r['path']}]] — {r['description']}")
                 parts.append("\n".join(lines))
-    except Exception as _exc:
-        logger.debug("KB search failed (search backend may be unavailable): %s", _exc)
+    except Exception:
+        logger.warning("KB search failed (search backend may be unavailable)", exc_info=True)
         return ""
 
     # Heuristic: if any user message contains an http(s) URL, force-include
@@ -186,15 +186,22 @@ def _auto_search_for_prompt(messages: list[dict] | None = None) -> str:
 
 
 def _select_chat_tools(context_budget: int | None = None) -> list[dict]:
-    """Select chat tools based on context budget and usage frequency.
+    """Select chat tools based on context budget.
 
     Tool definitions come from user-configurable Python modules loaded
     by chat_tool_loader.
 
-    Always-available tools are always present. Other tools are sorted by
-    usage frequency and included until budget is exhausted.
+    Always-available (core) tools are always present. Other tools are
+    selected in deterministic alphabetical order by name until the
+    budget is exhausted, and the final ordering is also alphabetical.
 
-    Returns the selected tool definitions.
+    Deterministic ordering matters for prompt caching: the tool list is
+    part of the cached prefix on the Anthropic API. Sorting tools by
+    usage frequency caused the cached prefix to drift as 30-day stats
+    rotated, invalidating the cache on every turn. Alphabetical order
+    is stable across turns and across processes.
+
+    Returns the selected tool definitions, sorted alphabetically by name.
     """
     if context_budget is None:
         context_budget = _DEFAULT_CONTEXT_WINDOW
@@ -239,31 +246,26 @@ def _select_chat_tools(context_budget: int | None = None) -> list[dict]:
     tokens_per_tool = 150 if context_budget <= 16384 else 80
     max_tools = max(len(_CORE_TOOLS), tool_budget_tokens // tokens_per_tool)
 
+    # Sort everything alphabetically up front for stable cache hits
+    tool_defs_sorted = sorted(tool_defs, key=lambda t: t["name"])
+
     if max_tools >= total_count:
         # All tools fit
-        return tool_defs
+        return tool_defs_sorted
 
-    # Separate core and non-core
-    core_tools = [t for t in tool_defs if t["name"] in _CORE_TOOLS]
-    non_core_tools = [t for t in tool_defs if t["name"] not in _CORE_TOOLS]
-
-    # Sort non-core by usage frequency (from tool_calls table, 30-day window)
-    try:
-        with db_connection() as db:
-            rows = db.execute(
-                "SELECT tool_name, COUNT(*) as cnt FROM tool_calls "
-                "WHERE created_at > datetime('now', '-30 days') "
-                "GROUP BY tool_name ORDER BY cnt DESC"
-            ).fetchall()
-            freq = {row["tool_name"]: row["cnt"] for row in rows}
-        non_core_tools.sort(key=lambda t: freq.get(t["name"], 0), reverse=True)
-    except (sqlite3.Error, KeyError, ValueError) as _exc:
-        pass  # Use default order
+    # Separate core and non-core (both already alphabetical)
+    core_tools = [t for t in tool_defs_sorted if t["name"] in _CORE_TOOLS]
+    non_core_tools = [t for t in tool_defs_sorted if t["name"] not in _CORE_TOOLS]
 
     remaining_slots = max_tools - len(core_tools)
+    # Take the alphabetically-first non-core tools as a deterministic subset.
+    # Prior implementation used 30-day usage frequency, but that rotated the
+    # tool list across turns and invalidated the prompt cache. If a different
+    # selection policy is desired, it should be configured (allowlist) rather
+    # than computed from runtime state.
     selected_non_core = non_core_tools[:remaining_slots] if remaining_slots > 0 else []
 
-    return core_tools + selected_non_core
+    return sorted(core_tools + selected_non_core, key=lambda t: t["name"])
 
 
 def _load_prompt_parts_from_templates(
@@ -346,26 +348,46 @@ def _build_chat_system_prompt(
     messages: list[dict] | None = None,
     is_arc_step: bool = False,
 ) -> str:
-    """Build the chat system prompt from composable sections + KB.
+    """Build the **stable, cacheable** chat system prompt.
 
-    Includes:
-    - Static prompt sections (identity, security, etc.)
+    This output is what occupies the ``cache_control: ephemeral`` slot on
+    Anthropic's prompt cache. It MUST be invariant across turns within a
+    conversation (and ideally across all chat conversations) — otherwise
+    every turn pays full input cost.
+
+    What goes here:
+    - Static prompt sections (identity, security, communication style, ...)
     - KB navigation guide
-    - KB root index (top-level themes)
-    - Auto-search results for user messages
-    - Recent conversation hints
+    - KB root index (top-level themes — KB content changes rarely)
+    - Tool count indicator (function of selected tools, alphabetically stable)
+    - Language directive (config-driven)
+
+    What does **not** go here (moved to ``_build_per_turn_context_block`` and
+    appended to the live user message):
+
+    - Current date/time. Even daily-quantized timestamps cost a cache miss
+      at midnight; the per-turn slot is the right home. If the agent needs
+      finer time, it can call a future ``get_current_time()`` read tool.
+    - Auto-search results keyed off the latest user message.
+    - "Recent Conversations" hints (rotates as new conversations land).
+    - Active arcs summary (rotates as arcs change state).
 
     When context_budget < 16384 (small local models), uses a compact
     prompt with just identity, security, KB navigation, and tools.
 
     When is_arc_step is True (arc PLANNER/EXECUTOR/REVIEWER agents),
-    skips sections not needed by ephemeral arc conversations: recent
-    conversations, KB root index, and auto-search results.
+    skips sections not needed by ephemeral arc conversations: KB root
+    index. (Auto-search and recent-conversations were already gated on
+    is_arc_step before this refactor; they now live in the per-turn block
+    which arc steps simply don't get.)
 
     Args:
         context_budget: Total context window in tokens.
         model_name: The model ID being used for this invocation.
-        messages: Conversation messages for auto-search.
+        messages: Conversation messages — only used for compact-mode KB
+            prepopulation on small local models, which are not on the
+            Anthropic cache path. Ignored for non-compact (cached) paths
+            so the cached prefix stays stable across turns.
         is_arc_step: True when building prompt for an arc step agent.
     """
     if context_budget is None:
@@ -377,8 +399,11 @@ def _build_chat_system_prompt(
     # and KB search few-shot example (compact only).
     parts = _load_prompt_parts_from_templates(compact, model_name, is_arc_step)
 
-    # Dynamic: KB prepopulation for compact mode.
-    # Pre-inject search results so small models don't need to call kb_search.
+    # Compact-mode KB prepopulation. This path runs on small local models
+    # (e.g. Ollama) which do not benefit from Anthropic prompt caching, so
+    # injecting per-turn results here does not cost cache hits. The
+    # non-compact (Anthropic) path deliberately does NOT inject auto-search
+    # into the cached system prompt — see _build_per_turn_context_block.
     if compact and messages:
         user_query = _extract_last_user_text(messages)
         if user_query:
@@ -395,7 +420,8 @@ def _build_chat_system_prompt(
             except (ImportError, KeyError, ValueError) as _exc:
                 pass
 
-    # Dynamic: KB root index (top-level themes from the KB)
+    # Stable: KB root index (top-level themes from the KB). KB structure
+    # changes rarely (human-edited), so this stays in the cached prefix.
     kb_config = config.CONFIG.get("kb", {})
     if kb_config.get("enabled", True) and not compact and not is_arc_step:
         try:
@@ -411,32 +437,9 @@ def _build_chat_system_prompt(
         except (ImportError, KeyError, ValueError) as _exc:
             pass
 
-    # Dynamic: auto-search for user messages
-    if not compact and not is_arc_step:
-        try:
-            search_section = _auto_search_for_prompt(messages)
-            if search_section:
-                parts.append(search_section)
-        except (ImportError, KeyError, ValueError) as _exc:
-            pass
-
-    # Dynamic: recent conversation hints for memory (skip for arc steps)
-    if not is_arc_step:
-        try:
-            hint_count = config.CONFIG.get("memory_recent_hints", 3)
-            recent = conversation.get_recent_conversations(limit=hint_count)
-            if recent:
-                hint_lines = ["## Recent Conversations"]
-                for c in recent:
-                    title = c.get("title") or "(untitled)"
-                    date = (c.get("last_message_at") or "")[:10]
-                    has_summary = "summary available" if c.get("summary") else "no summary"
-                    hint_lines.append(f"- conv#{c['id']} [{date}] {title} ({has_summary})")
-                parts.append("\n".join(hint_lines))
-        except (sqlite3.Error, KeyError, ValueError) as _exc:
-            pass
-
-    # Dynamic: tool count indicator
+    # Stable: tool count indicator. With deterministic alphabetical tool
+    # ordering (see _select_chat_tools), the count is stable across turns
+    # for a given context budget.
     selected_tools = _select_chat_tools(context_budget)
     from ..chat_tool_loader import get_total_count
     total_tools = get_total_count()
@@ -449,38 +452,7 @@ def _build_chat_system_prompt(
     else:
         parts.append(f"(all {total_tools} tools shown)")
 
-    # Dynamic: current date/time and timezone context
-    # The agent needs this to construct correct timestamps for scheduling,
-    # date-relative queries, and general time awareness.
-    now_local = datetime.now().astimezone()  # local time with tzinfo
-    tz_name = now_local.strftime("%Z")       # e.g. "BST", "GMT"
-    tz_offset = now_local.strftime("%z")     # e.g. "+0100", "+0000"
-    try:
-        import zoneinfo
-        tz_iana = str(now_local.tzinfo)      # e.g. "Europe/London"
-    except ImportError:
-        tz_iana = ""
-    # Try to get IANA name from /etc/timezone as a more reliable source
-    if not tz_iana or tz_iana.startswith("UTC"):
-        try:
-            with open("/etc/timezone") as f:
-                tz_iana = f.read().strip()
-        except OSError:
-            pass
-    tz_display = f"{tz_name} (UTC{tz_offset[:3]}:{tz_offset[3:]})"
-    if tz_iana:
-        tz_display += f" — IANA: {tz_iana}"
-    parts.append(
-        f"## Current Date & Time\n\n"
-        f"Local time: {now_local.strftime('%Y-%m-%d %H:%M:%S')} {tz_name}\n"
-        f"UTC time: {now_local.astimezone(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC\n"
-        f"Timezone: {tz_display}\n\n"
-        f"When scheduling, use local time as a naive ISO timestamp "
-        f"(e.g. '{now_local.strftime('%Y-%m-%d')}T14:30:00') — "
-        f"the platform converts local time to UTC automatically."
-    )
-
-    # Dynamic: language directive
+    # Stable: language directive (config-driven)
     chat_language = config.CONFIG.get("chat_language", "")
     if chat_language:
         lang_code = chat_language.strip().lower()
@@ -492,6 +464,162 @@ def _build_chat_system_prompt(
         )
 
     return "\n\n".join(parts)
+
+
+def _build_per_turn_context_block(
+    messages: list[dict] | None,
+    arcs_summary: str = "",
+    prior_context_tail: str = "",
+) -> str:
+    """Build the per-turn context block prepended to the live user message.
+
+    This content varies turn-to-turn and so MUST NOT live in the cached
+    system prompt slot — placing it there guarantees a cache miss on every
+    turn, paying full input cost on Sonnet ($3/Mtok) when most of the
+    prefix is identical.
+
+    Wrapped in a clearly-delimited block so the model can identify the
+    boundary between current-turn context and the user's actual message.
+
+    Includes (when non-empty):
+    - Current date and timezone (date-only — no second/minute precision).
+    - Active arcs summary.
+    - Prior conversation summary tail (mode-2 single-medium chats).
+    - Auto-search results for the latest user message.
+    - "Recent Conversations" hints for memory.
+
+    Returns the rendered block, or an empty string if there is nothing
+    to add (so callers can no-op cheaply).
+    """
+    sections: list[str] = []
+
+    # Current date + timezone. Date-only is intentional: any sub-day
+    # quantization pays a cache miss at the boundary (midnight, hour, etc.).
+    # Day-level granularity is sufficient for chat scheduling. If finer
+    # time is needed, the agent can use a `get_current_time()` read tool.
+    now_local = datetime.now().astimezone()
+    tz_name = now_local.strftime("%Z")
+    tz_offset = now_local.strftime("%z")
+    try:
+        tz_iana = str(now_local.tzinfo)
+    except Exception:
+        tz_iana = ""
+    if not tz_iana or tz_iana.startswith("UTC"):
+        try:
+            with open("/etc/timezone") as f:
+                tz_iana = f.read().strip()
+        except OSError:
+            pass
+    tz_display = f"{tz_name} (UTC{tz_offset[:3]}:{tz_offset[3:]})"
+    if tz_iana:
+        tz_display += f" — IANA: {tz_iana}"
+    today_local = now_local.strftime("%Y-%m-%d")
+    sections.append(
+        f"## Current Date\n\n"
+        f"Today (local): {today_local} ({tz_display})\n"
+        f"When scheduling, use local time as a naive ISO timestamp "
+        f"(e.g. '{today_local}T14:30:00') — the platform converts local "
+        f"time to UTC automatically. If you need the current hour/minute, "
+        f"call a clock-reading tool rather than relying on this block."
+    )
+
+    # Active arcs summary
+    if arcs_summary and arcs_summary.strip():
+        sections.append(f"## Active Work\n{arcs_summary}")
+
+    # Prior conversation summary (mode-2 single-medium handoff)
+    if prior_context_tail and prior_context_tail.strip():
+        sections.append(f"## Prior Context (summary)\n{prior_context_tail}")
+
+    # Auto-search keyed off the latest user message
+    try:
+        search_section = _auto_search_for_prompt(messages)
+        if search_section:
+            sections.append(search_section)
+    except (ImportError, KeyError, ValueError):
+        pass
+
+    # Recent conversations memory hint
+    try:
+        hint_count = config.CONFIG.get("memory_recent_hints", 3)
+        recent = conversation.get_recent_conversations(limit=hint_count)
+        if recent:
+            hint_lines = ["## Recent Conversations"]
+            for c in recent:
+                title = c.get("title") or "(untitled)"
+                date = (c.get("last_message_at") or "")[:10]
+                has_summary = "summary available" if c.get("summary") else "no summary"
+                hint_lines.append(f"- conv#{c['id']} [{date}] {title} ({has_summary})")
+            sections.append("\n".join(hint_lines))
+    except (sqlite3.Error, KeyError, ValueError):
+        pass
+
+    if not sections:
+        return ""
+
+    body = "\n\n".join(sections)
+    return (
+        "[per-turn context — not part of the user's message]\n"
+        f"{body}\n"
+        "[/per-turn context]"
+    )
+
+
+def _attach_per_turn_context(api_messages: list[dict], context_block: str) -> list[dict]:
+    """Prepend ``context_block`` to the content of the last user message.
+
+    The block is attached only to the **final** user-role message in the
+    list; previous user messages remain identical to what is stored in the
+    DB so the cached prefix (system + tools + history up to penultimate
+    user) stays stable across turns.
+
+    Mutates and returns ``api_messages``. If the list has no user message,
+    or the context block is empty, the list is returned unchanged.
+    """
+    if not context_block or not api_messages:
+        return api_messages
+
+    # Find the index of the last user-role message
+    last_user_idx: int | None = None
+    for i in range(len(api_messages) - 1, -1, -1):
+        if api_messages[i].get("role") == "user":
+            last_user_idx = i
+            break
+    if last_user_idx is None:
+        return api_messages
+
+    target = api_messages[last_user_idx]
+    content = target.get("content")
+    block_dict = {"type": "text", "text": context_block}
+
+    if isinstance(content, str):
+        # Wrap into structured content so the per-turn block is a separate
+        # text block prepended to the user's message text.
+        target["content"] = [
+            block_dict,
+            {"type": "text", "text": content},
+        ]
+    elif isinstance(content, list):
+        # Structured content (e.g. tool_result blocks). If any tool_result
+        # is present the per-turn block must go AFTER existing blocks:
+        # Anthropic requires the message that follows a tool_use to begin
+        # with the matching tool_result, and prepending a text block here
+        # triggers a 400 "tool_use ids were found without tool_result
+        # blocks immediately after" error. When there's no tool_result we
+        # prepend as before so the context appears before the user's text.
+        has_tool_result = any(
+            isinstance(b, dict) and b.get("type") == "tool_result"
+            for b in content
+        )
+        if has_tool_result:
+            target["content"] = [*content, block_dict]
+        else:
+            target["content"] = [block_dict, *content]
+    else:
+        # Unknown shape — leave alone rather than corrupting it.
+        pass
+
+    return api_messages
 
 def _truncate_tool_output(result_text: str, tool_name: str) -> str:
     """Truncate large tool output to avoid flooding the context window.
@@ -722,7 +850,7 @@ def _execute_chat_tool(
 
         return f"Unknown tool: {tool_name}"
     except Exception as e:  # broad catch: tool handlers may raise anything
-        logger.error("Chat tool %s error: %s", tool_name, e)
+        logger.exception("Chat tool %s error", tool_name)
         return f"Error: {e}"
 
 
@@ -809,8 +937,10 @@ def _handle_submit_code(
                     '"integrity_level": Label("untrusted"). '
                     "See KB [[web/trust-warning]] for details."
                 )
-        except Exception as _exc:  # broad catch: fail-open pre-check
-            pass
+        except Exception:  # broad catch: fail-open pre-check
+            # Intentional swallow: pre-check is best-effort; the post-execution
+            # taint check (below) is the fail-closed gate.
+            logger.info("Pre-execution taint check failed; deferring to post-exec check", exc_info=True)
 
     prefix = ""
     if pipeline_result.status == "minor_concern":
@@ -1012,11 +1142,11 @@ def _handle_escalate(
         return f"Error: Arc #{executor_arc_id} is already frozen (status: {arc['status']})."
 
     current_model = None
-    config_id = arc.get("agent_config_id")
-    if config_id:
-        cfg = _am.get_agent_config(config_id)
-        if cfg:
-            current_model = cfg["model"]
+    policy_id = arc.get("model_policy_id")
+    if policy_id:
+        policy = _am.get_model_policy(policy_id)
+        if policy:
+            current_model = policy.get("model")
     if not current_model:
         current_model = model_resolver.get_model_for_role("default_step")
 
@@ -1038,16 +1168,17 @@ def _handle_escalate(
         f"{child_summary}"
     )
 
-    new_config_id = _am.get_or_create_agent_config(model=next_model)
+    new_policy_id = _am.get_or_create_model_policy(model=next_model)
     new_arc_id = _am.create_arc(
         name=f"{arc['name']} (escalated)",
         goal=enhanced_goal,
         parent_id=arc["parent_id"],
         step_order=arc["step_order"],
-        agent_config_id=new_config_id,
+        model_policy_id=new_policy_id,
         agent_type="PLANNER",
         integrity_level=arc["integrity_level"],
         output_type=arc["output_type"],
+        priority=arc["priority"],
     )
 
     try:
@@ -1071,21 +1202,35 @@ def _handle_escalate(
     return f"Escalated to {next_model}. Arc #{new_arc_id} created. This arc is now frozen."
 
 
-# The pre-verified fetch script the EXECUTOR is told to ``submit_code``
-# for.  Kept as a module-level constant so dry-run / verified-hash
-# tooling and ``test_fetch_script_runs_in_restricted_sandbox`` can
-# import it directly.  The text is duplicated in
-# ``config_seed/templates/fetch_web.yaml`` (the runtime authoring
-# source); they MUST stay in sync — the verifier in
-# ``carpenter/verify/yaml_template.py`` plus the regression test in
-# ``tests/core/test_fetch_web_template.py`` enforce that the runtime
-# arc batch matches the shipped template.
+# Pre-verified fetch script.  The URL and the raw output Resource's file
+# path are read from arc state (set by the platform before dispatch) so
+# the script body is identical for every fetch, keeping a single hash in
+# verified_code_hashes.
+#
+# The script:
+#   1. Reads fetch_url + raw_resource_path + raw_resource_id from state.
+#   2. Calls web.fetch_webpage to retrieve the page HTML.
+#   3. Writes the HTML to raw_resource_path (the EXECUTOR's output Resource blob).
+#   4. Calls resource.finalize to populate byte_size/content_hash on the
+#      Resource row.
+#
+# The REVIEWER then reads the raw blob by file_path, produces a cleaned
+# summary, writes it to the derived Resource's file_path, and calls
+# resource.finalize(..., deprecate_inputs=True).  JUDGE approval
+# (resource.submit_verdict) is what promotes the derived Resource to
+# trusted (via review_manager's _review_target_resource_id wiring).
 _FETCH_SCRIPT = """\
 from carpenter_tools.declarations import Label
 url_result = dispatch(Label("state.get"), {"key": Label("fetch_url")})
 url = url_result[Label("value")]
+path_result = dispatch(Label("state.get"), {"key": Label("raw_resource_path")})
+output_path = path_result[Label("value")]
+rid_result = dispatch(Label("state.get"), {"key": Label("raw_resource_id")})
+raw_resource_id = rid_result[Label("value")]
 result = dispatch(Label("web.fetch_webpage"), {"url": url})
-dispatch(Label("state.set"), {"key": Label("fetched_content"), "value": result})
+content = result[Label("content")]
+dispatch(Label("files.write"), {"path": output_path, "content": content})
+dispatch(Label("resource.finalize"), {"resource_id": raw_resource_id})
 """
 
 
@@ -1095,21 +1240,65 @@ def _handle_fetch_web_content(
 ) -> str:
     """Handle fetch_web_content — create an untrusted arc batch to fetch a URL.
 
-    Creates a parent PLANNER arc plus the three children declared by
-    the shipped ``fetch_web`` workflow template
-    (``config_seed/templates/fetch_web.yaml``):
-
-      1. EXECUTOR (untrusted) — fetches the URL using a pre-verified script
-      2. REVIEWER (trusted) — extracts the relevant info from the fetched output
-      3. JUDGE (trusted) — validates the reviewer's extraction
+    Creates a parent PLANNER arc with three children:
+      1. EXECUTOR (untrusted) — fetches the URL using a pre-verified
+         script and writes the HTML to a raw Resource blob on disk.
+      2. REVIEWER (trusted) — reads the raw HTML Resource, extracts the
+         user's goal-relevant info, writes a derived Resource summary
+         file, and submits its verdict.
+      3. JUDGE (trusted) — validates the review and (via resource.submit_verdict)
+         flips the derived Resource's template_verdict, which is what
+         makes the summary trusted under the Resource-provenance model.
 
     The parent arc completes when all children finish, triggering
     arc.chat_notify to deliver results back to the conversation.
+
+    Resource wiring (PR3):
+      - A raw html Resource is pre-created with file_path pointing at
+        a deterministic location (``{storage_root}/<rid>/blob``) so the
+        EXECUTOR script can write there.  produced_by_arc_id=EXECUTOR,
+        produced_by_template=NULL (raw ingest is forever untrusted).
+      - A derived text-summary Resource is pre-created with
+        produced_by_template='html_to_summary', template_verdict='pending'.
+        file_path again points at a deterministic location.
+        produced_by_arc_id=REVIEWER.
+      - arc_resources links: EXECUTOR -> raw (output); REVIEWER -> raw
+        (input) + derived (output).
+      - Parent PLANNER gets ``_primary_resource_id = <derived_id>`` in
+        state so the chat notify path (PR4) can surface it.
+      - Reviewer-as-JUDGE verdict wiring: the JUDGE arc's
+        ``_review_target_resource_id`` is set to the derived Resource id
+        so PR2's review_manager.submit_verdict side-effect flips the
+        derived Resource's template_verdict on approve/reject.
+
+    Decisions (documented here for the PR reviewer):
+      - File layout: ``{resource_storage_dir}/<resource_id>/blob`` —
+        one subdir per Resource so sweep-delete is ``rmtree`` of a
+        single dir.  ``resource_storage_dir()`` anchors on
+        ``database_path`` so Resources co-locate with the DB.
+      - Resource row pre-allocation (decision (a) in the PR plan): we
+        create the row BEFORE the file so the row id can be used in the
+        path.  ``byte_size`` / ``content_hash`` start NULL and are
+        populated by the producer via the new ``resource.finalize``
+        dispatch tool after the blob is on disk.
+      - Auto-deprecation: the REVIEWER calls
+        ``resource.finalize(deprecate_inputs=True)`` after writing the
+        derived summary, which marks the raw html Resource deprecated.
+        This fires unconditionally on REVIEWER commit, BEFORE the JUDGE
+        verdict — per the plan, auto-deprecation is triggered by
+        "trusted arc successfully commits its output Resources", not by
+        JUDGE outcome.
     """
     from ..core.arcs import manager as _am
-    from ..core.engine import template_manager as _tm
     from ..core.engine import work_queue as _wq
+    from ..core.resources import (
+        create_resource as _create_resource,
+        derive_resource as _derive_resource,
+        link_arc_resource as _link_arc_resource,
+        resource_storage_path as _resource_storage_path,
+    )
     from ..core.workflows._arc_state import set_arc_state
+    from ..tool_backends import arc as arc_backend
 
     url = tool_input.get("url", "").strip()
     goal = tool_input.get("goal", "").strip()
@@ -1134,38 +1323,157 @@ def _handle_fetch_web_content(
     # Activate parent so freeze_arc() can transition it
     _am.update_status(parent_id, "active")
 
-    # Look up the shipped template and instantiate it on the parent.
-    # The template loader runs at coordinator startup so by the time a
-    # chat tool fires the row is in place.
-    template = _tm.get_template_by_name("fetch_web")
-    if template is None:
+    # Create children via create_batch (handles Fernet keys, review_keys, etc.)
+    batch_result = arc_backend.handle_create_batch({
+        "arcs": [
+            {
+                "name": "Fetch web content",
+                "goal": (
+                    "Submit this EXACT code via submit_code "
+                    "(do not modify it):\n"
+                    "```python\n" + _FETCH_SCRIPT + "```\n"
+                    "The URL and output path have been pre-set in arc state "
+                    "as 'fetch_url', 'raw_resource_path', and 'raw_resource_id'."
+                ),
+                "parent_id": parent_id,
+                "integrity_level": "untrusted",
+                "output_type": "json",
+                "agent_type": "EXECUTOR",
+                "step_order": 0,
+            },
+            {
+                "name": "Review fetched content",
+                # Note: goal references the raw Resource's on-disk path
+                # via arc state key raw_resource_path (set below) and
+                # writes the derived summary to derived_resource_path.
+                "goal": (
+                    f"Read the untrusted html file at the path in arc state "
+                    f"key 'raw_resource_path'. Extract the relevant "
+                    f"information the user wanted: {goal}. Write a clean "
+                    f"text summary to the path in arc state key "
+                    f"'derived_resource_path', then call resource.finalize "
+                    f"with the derived_resource_id from arc state and "
+                    f"deprecate_inputs=True. Store the summary text in arc "
+                    f"state under key '_agent_response' as well, for the "
+                    f"chat notify path."
+                ),
+                "parent_id": parent_id,
+                "agent_type": "REVIEWER",
+                "integrity_level": "trusted",
+                "reviewer_profile": "security-reviewer",
+                "model_policy": "fast-chat",
+                "step_order": 1,
+            },
+            {
+                "name": "Validate review",
+                "goal": (
+                    "Validate that the reviewer's extraction is accurate "
+                    "and complete. When approving, call resource.submit_verdict "
+                    "with the derived_resource_id from arc state and "
+                    "verdict='approved' (or 'rejected' if the content is "
+                    "unsafe/incorrect). Copy the final answer to arc state "
+                    "key '_agent_response'."
+                ),
+                "parent_id": parent_id,
+                "agent_type": "JUDGE",
+                "integrity_level": "trusted",
+                "reviewer_profile": "judge",
+                "step_order": 2,
+            },
+        ],
+    })
+
+    if "error" in batch_result:
+        # Clean up the parent
         try:
             _am.update_status(parent_id, "failed")
         except (ValueError, Exception):
             pass
-        return (
-            "Error creating web fetch arcs: 'fetch_web' template not loaded. "
-            "Check config_seed/templates/fetch_web.yaml is present and that "
-            "coordinator startup logs no template-load failures."
-        )
+        return f"Error creating web fetch arcs: {batch_result['error']}"
 
-    try:
-        child_ids = _tm.instantiate_template(
-            template["id"],
-            parent_id,
-            bindings={"goal": goal},
-        )
-    except ValueError as exc:
-        try:
-            _am.update_status(parent_id, "failed")
-        except (ValueError, Exception):
-            pass
-        return f"Error creating web fetch arcs: {exc}"
-
+    child_ids = batch_result["arc_ids"]
     executor_arc_id = child_ids[0]
+    reviewer_arc_id = child_ids[1]
+    judge_arc_id = child_ids[2]
 
-    # Pre-set the URL in the EXECUTOR arc's state so the script can read it.
+    # --- Resource wiring ---------------------------------------------------
+    #
+    # Raw html Resource: produced_by_arc_id=EXECUTOR, raw ingest (no
+    # template).  Created first so its row id can be used to compute the
+    # on-disk file_path.
+    raw_resource_id = _create_resource(
+        content_type="html",
+        file_path=None,  # placeholder; updated after we know the id
+        produced_by_arc_id=executor_arc_id,
+        source_descriptor=url,
+    )
+    raw_path = _resource_storage_path(raw_resource_id, "blob")
+    raw_path.parent.mkdir(parents=True, exist_ok=True)
+    # Update the row with its final file_path.
+    from ..db import db_transaction as _db_transaction
+    with _db_transaction() as _db:
+        _db.execute(
+            "UPDATE resources SET file_path = ? WHERE id = ?",
+            (str(raw_path), raw_resource_id),
+        )
+
+    # Link EXECUTOR -> raw (output role).
+    _link_arc_resource(
+        arc_id=executor_arc_id,
+        resource_id=raw_resource_id,
+        role="output",
+    )
+
+    # Derived text-summary Resource: pre-created pending so the REVIEWER
+    # can file_path-write and finalize, and the JUDGE can submit verdict.
+    derived_resource_id = _derive_resource(
+        content_type="text-summary",
+        file_path=None,  # placeholder; updated after we know the id
+        produced_by_arc_id=reviewer_arc_id,
+        produced_by_template="html_to_summary",
+        template_verdict="pending",
+        source_descriptor=url,
+    )
+    derived_path = _resource_storage_path(derived_resource_id, "blob")
+    derived_path.parent.mkdir(parents=True, exist_ok=True)
+    with _db_transaction() as _db:
+        _db.execute(
+            "UPDATE resources SET file_path = ? WHERE id = ?",
+            (str(derived_path), derived_resource_id),
+        )
+
+    # REVIEWER links: reads raw (input), writes derived (output).
+    _link_arc_resource(
+        arc_id=reviewer_arc_id,
+        resource_id=raw_resource_id,
+        role="input",
+    )
+    _link_arc_resource(
+        arc_id=reviewer_arc_id,
+        resource_id=derived_resource_id,
+        role="output",
+    )
+
+    # --- Arc state pre-seeding --------------------------------------------
+    # EXECUTOR script inputs.
     set_arc_state(executor_arc_id, "fetch_url", url)
+    set_arc_state(executor_arc_id, "raw_resource_path", str(raw_path))
+    set_arc_state(executor_arc_id, "raw_resource_id", raw_resource_id)
+
+    # REVIEWER reads raw + writes derived.
+    set_arc_state(reviewer_arc_id, "raw_resource_path", str(raw_path))
+    set_arc_state(reviewer_arc_id, "raw_resource_id", raw_resource_id)
+    set_arc_state(reviewer_arc_id, "derived_resource_path", str(derived_path))
+    set_arc_state(reviewer_arc_id, "derived_resource_id", derived_resource_id)
+
+    # JUDGE arc: seed _review_target_resource_id so PR2's verdict wiring
+    # flips the derived Resource's template_verdict on approve/reject.
+    set_arc_state(judge_arc_id, "_review_target_resource_id", derived_resource_id)
+    set_arc_state(judge_arc_id, "derived_resource_id", derived_resource_id)
+
+    # Parent PLANNER knows its primary Resource — PR4's chat notify path
+    # will check trust dynamically at delivery time.
+    set_arc_state(parent_id, "_primary_resource_id", derived_resource_id)
 
     # Link children to conversation too
     if conversation_id:
@@ -1184,7 +1492,7 @@ def _handle_fetch_web_content(
 
 
 def _save_api_call(
-    conv_id: int,
+    conv_id: int | None,
     model: str,
     usage: dict,
     stop_reason: str | None = None,
@@ -1194,7 +1502,8 @@ def _save_api_call(
     """Persist API call metrics (tokens, cache stats) to the api_calls table.
 
     Args:
-        conv_id: Conversation ID.
+        conv_id: Conversation ID, or None for calls made outside a
+            conversation (e.g. arc-only coding-agent iterations).
         model: Model name used for this call.
         usage: The 'usage' dict from the API response.
         stop_reason: The stop_reason from the API response.
@@ -1270,25 +1579,68 @@ def _save_tool_calls(
 
 
 def _build_arcs_summary(conv_arc_ids: list[int]) -> str:
-    """Build a summary of active arcs, highlighting conversation-specific ones."""
-    from ..core.arcs import manager as arc_manager
+    """Build a summary of active arcs, highlighting conversation-specific ones.
+
+    Also surfaces recently finished arcs that belong to this conversation so
+    the chat agent can answer "what have you been up to?" without forgetting
+    earlier steps once the most recent system completion notification has
+    rolled past in the message history.  The recap is bounded so the cached
+    prefix stays small, and structurally lists each arc so the agent has a
+    direct, enumerable handle for follow-up tool calls (list_arcs,
+    get_arc_detail, read_arc_result).
+    """
+    from ..core.arcs import manager as arc_manager  # noqa: F401  (kept for parity)
+    conv_set = set(conv_arc_ids)
+    recap_limit = config.CONFIG.get("chat_arcs_summary_recent_limit", 10)
+
     with db_connection() as db:
-        # Get all active/waiting arcs
-        rows = db.execute(
+        active_rows = db.execute(
             "SELECT id, name, status, goal FROM arcs "
             "WHERE status IN ('active', 'waiting', 'pending') "
             "ORDER BY id DESC LIMIT 20"
         ).fetchall()
 
-    if not rows:
-        return "No active arcs."
+        # Recently finished arcs from THIS conversation (and their children).
+        # Children are pulled in by parent_id so a multi-step workflow created
+        # from a single user request shows up even when only the parent arc
+        # is registered in conversation_arcs.
+        recent_finished_rows: list = []
+        if conv_set:
+            placeholders = ",".join("?" for _ in conv_set)
+            params = list(conv_set) * 2 + [recap_limit]
+            recent_finished_rows = db.execute(
+                f"SELECT id, name, status, goal, parent_id FROM arcs "
+                f"WHERE status IN ('completed', 'failed', 'cancelled') "
+                f"AND (id IN ({placeholders}) "
+                f"OR parent_id IN ({placeholders})) "
+                f"ORDER BY id DESC LIMIT ?",
+                tuple(params),
+            ).fetchall()
 
-    lines = []
-    conv_set = set(conv_arc_ids)
-    for r in rows:
-        goal = (r["goal"] or "")[:80]
-        marker = " [this conversation]" if r["id"] in conv_set else ""
-        lines.append(f"#{r['id']} [{r['status']}] {r['name']}: {goal}{marker}")
+    lines: list[str] = []
+    if active_rows:
+        for r in active_rows:
+            goal = (r["goal"] or "")[:80]
+            marker = " [this conversation]" if r["id"] in conv_set else ""
+            lines.append(
+                f"#{r['id']} [{r['status']}] {r['name']}: {goal}{marker}"
+            )
+    else:
+        lines.append("No active arcs.")
+
+    if recent_finished_rows:
+        lines.append("")
+        lines.append(
+            "Recently finished arcs from this conversation "
+            "(use get_arc_detail/read_arc_result for full content). "
+            "When the user asks what you've been working on, an audit "
+            "trail, or a recap, enumerate EVERY item below — do not "
+            "summarise only the most recent one:"
+        )
+        for r in recent_finished_rows:
+            goal = (r["goal"] or "")[:80]
+            lines.append(f"#{r['id']} [{r['status']}] {r['name']}: {goal}")
+
     return "\n".join(lines)
 
 
@@ -1326,14 +1678,13 @@ def _invoke_with_escalated_model(
         f"[Escalated to {target_model}: {reason}]"
     )
 
-    # Build system prompt (reuse chat template logic)
+    # Build stable system prompt (reuse chat template logic). Per-turn
+    # context lives on the user message, not in the cached system slot.
     conv_arc_ids = conversation.get_conversation_arc_ids(conversation_id)
     arcs_summary = _build_arcs_summary(conv_arc_ids)
     system = templates.render(
         "chat_new",
         system_prompt=_build_chat_system_prompt(),
-        active_arcs_summary=arcs_summary,
-        prior_context_tail="",
     )
 
     # Get messages
@@ -1345,6 +1696,15 @@ def _invoke_with_escalated_model(
     api_messages, _ = _convert_history_to_standard(
         api_messages, _esc_standard, [None] * len(api_messages)
     )
+
+    # Attach per-turn context block to the last user message
+    per_turn_block = _build_per_turn_context_block(
+        messages=api_messages,
+        arcs_summary=arcs_summary,
+        prior_context_tail="",
+    )
+    if per_turn_block:
+        api_messages = _attach_per_turn_context(api_messages, per_turn_block)
 
     # Call AI with escalated model
     tools = _select_chat_tools()
@@ -1400,8 +1760,8 @@ def _get_context_window(model_str: str | None = None) -> int:
     """Resolve the context window size for a model string.
 
     Resolution order:
-    1. Exact model string match in context_windows config (e.g. "local:qwen2.5-1.5b-q4")
-    2. Provider prefix match (e.g. "local")
+    1. Exact model string match in context_windows config (e.g. "ollama:qwen3.5:9b")
+    2. Provider prefix match (e.g. "ollama")
     3. _DEFAULT_CONTEXT_WINDOW (200000)
 
     Args:
@@ -1558,7 +1918,7 @@ def _compact_messages(
                     )
                 elif block.get("type") == "tool_result":
                     text_parts.append(
-                        f"{role}: [tool_result: {str(block.get('content', ''))[:200]}]"
+                        f"{role}: [tool_result: {str(block.get('content', ''))[:constants.LOG_PREVIEW_TRUNCATION]}]"
                     )
                 else:
                     text_parts.append(f"{role}: {json.dumps(block)}")
@@ -1724,6 +2084,79 @@ def _build_message_id_map(
         result.append(None)
 
     return result[:len(api_messages)]
+
+
+def _dispatch_chat_tool_call(
+    tool_name: str,
+    tool_input: dict,
+    tools: list[dict],
+    *,
+    conv_id: int,
+    executor_arc_id: int | None,
+    executor_conv_id: int | None,
+) -> str:
+    """Validate, confirm if required, and execute one chat-tool call.
+
+    Returns the result string to feed back to the model. Centralizes
+    the dispatch logic that was previously inlined six levels deep
+    inside the chat-tool loop in :func:`invoke_for_chat`.
+
+    Args:
+        tool_name: Name of the tool to invoke.
+        tool_input: Argument dict from the model's ``tool_use`` block.
+        tools: Currently advertised tool defs (used for shape validation).
+        conv_id: Conversation id (forwarded to ``_execute_chat_tool``).
+        executor_arc_id: Optional executor arc id forwarded for arc-step
+            tool calls.
+        executor_conv_id: Optional executor conversation id forwarded
+            for arc-step tool calls.
+    """
+    # Validate before executing — gives small models actionable feedback.
+    validation_error = _validate_tool_call(tool_name, tool_input, tools)
+    if validation_error:
+        logger.warning("Tool validation failed: %s", validation_error)
+        return validation_error
+
+    # Check if tool requires user confirmation.
+    from ..chat_tool_loader import get_loaded_tools, get_confirmation_handler
+    loaded_tools = get_loaded_tools()
+    tool_def = loaded_tools.get(tool_name)
+
+    if not (tool_def and tool_def.requires_user_confirm):
+        # No confirmation required, execute normally.
+        return _execute_chat_tool(
+            tool_name, tool_input, conversation_id=conv_id,
+            executor_arc_id=executor_arc_id,
+            executor_conv_id=executor_conv_id,
+        )
+
+    confirmation_handler = get_confirmation_handler()
+    if confirmation_handler is None:
+        logger.warning(
+            "Tool %s requires confirmation but no handler registered",
+            tool_name,
+        )
+        return (
+            f"Error: Tool '{tool_name}' requires user confirmation, "
+            "but no confirmation handler is registered. This tool "
+            "cannot be executed on this platform."
+        )
+
+    try:
+        confirmed = confirmation_handler(tool_name, tool_input)
+    except Exception as e:
+        logger.exception("Confirmation handler error for %s", tool_name)
+        return f"Error during confirmation: {e}"
+
+    if not confirmed:
+        logger.info("Tool %s execution declined by user", tool_name)
+        return "User declined to execute this tool."
+
+    return _execute_chat_tool(
+        tool_name, tool_input, conversation_id=conv_id,
+        executor_arc_id=executor_arc_id,
+        executor_conv_id=executor_conv_id,
+    )
 
 
 def invoke_for_chat(
@@ -1898,23 +2331,38 @@ def invoke_for_chat(
         conv_arc_ids = conversation.get_conversation_arc_ids(conv_id)
         arcs_summary = _build_arcs_summary(conv_arc_ids)
 
-    # Resolve context window for the active model
+    # Resolve context window for the active model.
+    # Priority: explicit _model_override kwarg → per-conversation pin →
+    # global model_roles/ai_provider default.
+    if _model_override is None:
+        try:
+            _conv_pin = conversation.get_conversation_model_override(conv_id)
+        except Exception:  # broad catch: DB query, degrade to default
+            logger.exception(
+                "Failed to read conversation model override for conv %s", conv_id
+            )
+            _conv_pin = None
+        if _conv_pin:
+            _model_override = _conv_pin
+            logger.info(
+                "Using per-conversation model pin for conv %s: %s",
+                conv_id, _conv_pin,
+            )
     _chat_model = _model_override or model_resolver.get_model_for_role("chat")
     context_window = _get_context_window(_chat_model)
 
-    # Build system prompt from template
-    # Auto-search results are included and change per message, but the cost
-    # is small (~50-100 tokens) and the benefit to model navigation is large.
-    # Arc step agents skip auto-search and other interactive-only sections.
+    # Build the **stable** system prompt from template. Per-turn dynamic
+    # context (date, auto-search, recent conversations, active arcs, prior
+    # summary) is intentionally NOT included here — it would invalidate the
+    # Anthropic prompt cache on every turn. Instead we attach those bits to
+    # the live user message via _build_per_turn_context_block below.
     system = templates.render(
         template_name,
         system_prompt=_build_chat_system_prompt(
             context_budget=context_window, model_name=_chat_model,
-            messages=api_messages if not _is_arc else None,
+            messages=None,  # do not feed user messages into cached prefix
             is_arc_step=_is_arc,
         ),
-        active_arcs_summary=arcs_summary,
-        prior_context_tail=prior_text,
     )
 
     client = _get_client(_model_override)
@@ -1926,6 +2374,18 @@ def invoke_for_chat(
     api_messages, db_message_ids = _convert_history_to_standard(
         api_messages, _hist_standard, db_message_ids
     )
+
+    # Build and attach the per-turn context block to the last user message.
+    # Arc step agents don't get this block — their conversations are
+    # ephemeral and the platform supplies arc context separately.
+    if not _is_arc:
+        per_turn_block = _build_per_turn_context_block(
+            messages=api_messages,
+            arcs_summary=arcs_summary,
+            prior_context_tail=prior_text,
+        )
+        if per_turn_block:
+            api_messages = _attach_per_turn_context(api_messages, per_turn_block)
 
     mechanical_max = config.CONFIG.get("mechanical_retry_max", 4)
     max_tool_iterations = config.CONFIG.get("chat_tool_iterations", 10)
@@ -2085,52 +2545,13 @@ def invoke_for_chat(
             logger.info("Chat tool call: %s(%s)", tool_name, list(tool_input.keys()))
             t_start = time.monotonic()
 
-            # Validate before executing — gives small models actionable feedback
-            validation_error = _validate_tool_call(tool_name, tool_input, tools)
-            if validation_error:
-                result_str = validation_error
-                logger.warning("Tool validation failed: %s", validation_error)
-            else:
-                # Check if tool requires user confirmation
-                from ..chat_tool_loader import get_loaded_tools, get_confirmation_handler
-                loaded_tools = get_loaded_tools()
-                tool_def = loaded_tools.get(tool_name)
+            result_str = _dispatch_chat_tool_call(
+                tool_name, tool_input, tools,
+                conv_id=conv_id,
+                executor_arc_id=_executor_arc_id,
+                executor_conv_id=_executor_conv_id,
+            )
 
-                if tool_def and tool_def.requires_user_confirm:
-                    confirmation_handler = get_confirmation_handler()
-                    if confirmation_handler is None:
-                        result_str = (
-                            f"Error: Tool '{tool_name}' requires user confirmation, "
-                            "but no confirmation handler is registered. This tool "
-                            "cannot be executed on this platform."
-                        )
-                        logger.warning(
-                            "Tool %s requires confirmation but no handler registered",
-                            tool_name
-                        )
-                    else:
-                        # Call confirmation handler
-                        try:
-                            confirmed = confirmation_handler(tool_name, tool_input)
-                            if not confirmed:
-                                result_str = "User declined to execute this tool."
-                                logger.info("Tool %s execution declined by user", tool_name)
-                            else:
-                                result_str = _execute_chat_tool(
-                                    tool_name, tool_input, conversation_id=conv_id,
-                                    executor_arc_id=_executor_arc_id,
-                                    executor_conv_id=_executor_conv_id,
-                                )
-                        except Exception as e:
-                            result_str = f"Error during confirmation: {e}"
-                            logger.error("Confirmation handler error for %s: %s", tool_name, e)
-                else:
-                    # No confirmation required, execute normally
-                    result_str = _execute_chat_tool(
-                        tool_name, tool_input, conversation_id=conv_id,
-                        executor_arc_id=_executor_arc_id,
-                        executor_conv_id=_executor_conv_id,
-                    )
             t_end = time.monotonic()
             tool_timing_map[tool_id] = int((t_end - t_start) * 1000)
 
@@ -2293,8 +2714,7 @@ def _get_client(model_override: str | None = None):
 
     Returns:
         Module: providers.anthropic for "anthropic", providers.ollama for "ollama",
-                providers.tinfoil for "tinfoil", providers.local for "local",
-                providers.chain for "chain".
+                providers.tinfoil for "tinfoil", providers.chain for "chain".
     """
     if model_override and ":" in model_override:
         return model_resolver.create_client_for_model(model_override)
@@ -2307,8 +2727,6 @@ def _get_client(model_override: str | None = None):
         return ollama_client
     if provider == "tinfoil":
         return tinfoil_client
-    if provider == "local":
-        return local_client
     return claude_client
 
 
@@ -2320,8 +2738,6 @@ def _get_provider_for_client(client) -> str:
         return "ollama"
     if client is tinfoil_client:
         return "tinfoil"
-    if client is local_client:
-        return "local"
     # Fallback: check module name
     name = getattr(client, "__name__", "")
     if "chain" in name:
@@ -2330,8 +2746,6 @@ def _get_provider_for_client(client) -> str:
         return "ollama"
     if "tinfoil" in name:
         return "tinfoil"
-    if "local" in name:
-        return "local"
     return "anthropic"
 
 
@@ -2395,147 +2809,6 @@ def _convert_history_to_standard(
     return converted, adjusted_ids
 
 
-def _try_local_fallback(
-    system: str,
-    messages: list[dict],
-    *,
-    operation_type: str | None = None,
-    max_tokens: int | None = None,
-    temperature: float | None = None,
-    arc_id: int | None = None,
-) -> dict | None:
-    """Attempt a call to a local model as a last-resort fallback.
-
-    Called after the main retry loop is exhausted. Uses direct httpx to
-    avoid interference from client-level circuit breakers.
-
-    Args:
-        system: System prompt text.
-        messages: Conversation messages in canonical (Anthropic) format.
-        operation_type: The type of operation (e.g. "chat", "summarization").
-        max_tokens: Maximum tokens in the response.
-        temperature: Sampling temperature.
-        arc_id: Optional arc ID for per-arc fallback override check.
-
-    Returns:
-        Normalized response dict on success, None on failure.
-    """
-    import httpx
-
-    fb_config = config.CONFIG.get("local_fallback", {})
-    if not fb_config.get("enabled", False):
-        return None
-
-    # Per-arc fallback override: check arc_state for _fallback_allowed
-    if arc_id is not None:
-        try:
-            db = get_db()
-            row = db.execute(
-                "SELECT value_json FROM arc_state WHERE arc_id = ? AND key = '_fallback_allowed'",
-                (arc_id,),
-            ).fetchone()
-            db.close()
-            if row is not None:
-                import json as _json
-                allowed = _json.loads(row["value_json"])
-                if allowed is False:
-                    logger.debug("Local fallback blocked by arc_state for arc_id=%d", arc_id)
-                    return None
-        except (sqlite3.Error, json.JSONDecodeError, KeyError) as _exc:
-            pass  # If we can't check, fall through to config-level filtering
-
-    fb_url = fb_config.get("url", "")
-    if not fb_url:
-        return None
-
-    # Check operation type against allowed/blocked lists
-    if operation_type:
-        blocked = fb_config.get("blocked_operations", [])
-        if operation_type in blocked:
-            logger.debug("Local fallback blocked for operation_type=%s", operation_type)
-            return None
-        allowed = fb_config.get("allowed_operations", [])
-        if allowed and operation_type not in allowed:
-            logger.debug("Local fallback not allowed for operation_type=%s", operation_type)
-            return None
-
-    fb_model = fb_config.get("model", "qwen3.5:9b")
-    fb_timeout = fb_config.get("timeout", 300)
-    fb_max_tokens = max_tokens or fb_config.get("max_tokens", 4096)
-    fb_context_window = fb_config.get("context_window", 16384)
-    fallback_id = f"fallback:{fb_model}"
-
-    logger.info("Attempting local fallback to %s at %s (operation=%s)",
-                fb_model, fb_url, operation_type)
-
-    try:
-        # Convert messages from Anthropic to OpenAI format
-        dummy_ids = [None] * len(messages)
-        converted, _ = _convert_history_to_standard(messages, "openai", dummy_ids)
-
-        # Build OpenAI-format messages with system prompt
-        api_messages = [{"role": "system", "content": system}]
-        for msg in converted:
-            role = msg["role"]
-            content = msg.get("content")
-            entry = {"role": role}
-            if role == "assistant" and "tool_calls" in msg:
-                entry["content"] = content
-                entry["tool_calls"] = msg["tool_calls"]
-            elif role == "tool":
-                entry["tool_call_id"] = msg.get("tool_call_id", "")
-                entry["content"] = content if isinstance(content, str) else str(content)
-            else:
-                entry["content"] = content
-            api_messages.append(entry)
-
-        # Truncate to fit context window (rough estimate: 4 chars per token)
-        total_chars = sum(len(str(m.get("content", ""))) for m in api_messages)
-        char_limit = fb_context_window * 4
-        while total_chars > char_limit and len(api_messages) > 2:
-            removed = api_messages.pop(1)  # Remove oldest non-system message
-            total_chars -= len(str(removed.get("content", "")))
-
-        body = {
-            "model": fb_model,
-            "messages": api_messages,
-            "max_tokens": fb_max_tokens,
-            "temperature": temperature or 0.7,
-        }
-
-        url = f"{fb_url.rstrip('/')}/v1/chat/completions"
-        body_json = json.dumps(body, ensure_ascii=False)
-        body_bytes = body_json.encode("utf-8", errors="replace")
-        response = httpx.post(
-            url, content=body_bytes,
-            headers={"Content-Type": "application/json"},
-            timeout=fb_timeout,
-        )
-        response.raise_for_status()
-        result = response.json()
-
-        # Record success in model health
-        from ..core.models import health as model_health
-        model_health.record_model_call(fallback_id, success=True)
-
-        # Normalize from OpenAI format
-        normalized = api_standard.normalize_response(result, "openai")
-        logger.info("Local fallback succeeded via %s", fb_model)
-        return normalized
-
-    except Exception as e:  # broad catch: local inference may raise anything
-        logger.warning("Local fallback failed: %s", e)
-        try:
-            from ..core.models import health as model_health
-            model_health.record_model_call(
-                fallback_id, success=False,
-                error_type=type(e).__name__,
-            )
-        except (ImportError, KeyError, ValueError) as _exc:
-            pass
-        return None
-
-
 def _call_with_retries(
     system: str,
     messages: list[dict],
@@ -2565,7 +2838,7 @@ def _call_with_retries(
         max_tokens: Maximum tokens in the response (None = use client default).
         tools: Optional tool definitions in canonical (Anthropic) format.
         temperature: Sampling temperature (None = use client default).
-        operation_type: Type of operation for local fallback routing.
+        operation_type: Type of operation (kept for model health classification).
 
     Returns the normalized API response dict, or a dict with '_error' key containing
     ErrorInfo if all retries exhausted.
@@ -2589,25 +2862,6 @@ def _call_with_retries(
         _, chat_model = chat_model.split(":", 1)
     if provider == "chain":
         chat_model = None
-
-    # Fast path: if all cloud models have open circuit breakers and we
-    # have no tools, skip retries and go straight to local fallback
-    if tools is None:
-        try:
-            from ..core.models.health import all_cloud_models_circuit_open
-            if all_cloud_models_circuit_open():
-                logger.info("All cloud models circuit-open, attempting fast fallback")
-                fallback_result = _try_local_fallback(
-                    system, messages,
-                    operation_type=operation_type,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                )
-                if fallback_result is not None:
-                    return fallback_result
-                # If fallback fails, fall through to normal retry loop
-        except Exception:  # broad catch: fallback may raise anything
-            pass
 
     last_error_info = None
     for attempt in range(max_retries):
@@ -2645,6 +2899,7 @@ def _call_with_retries(
             logger.warning(
                 "AI API call failed (attempt %d/%d) [%s]: %s",
                 attempt + 1, max_retries, error_info.type, e,
+                exc_info=True,
             )
 
             # Store for return on final attempt
@@ -2660,16 +2915,5 @@ def _call_with_retries(
         max_retries,
         last_error_info.type if last_error_info else "Unknown",
     )
-
-    # Try local fallback before giving up (tools not supported in fallback)
-    if tools is None:
-        fallback_result = _try_local_fallback(
-            system, messages,
-            operation_type=operation_type,
-            max_tokens=max_tokens,
-            temperature=temperature,
-        )
-        if fallback_result is not None:
-            return fallback_result
 
     return {"_error": last_error_info} if last_error_info else None

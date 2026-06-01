@@ -13,7 +13,6 @@ templates (e.g. reflection prompts) from subdirectories.
 
 import logging
 import os
-import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -41,52 +40,29 @@ class PromptSection:
     order: int
 
 
-def _install_defaults(defaults_dir: str, target_dir: str, label: str) -> dict:
-    """Copy a defaults directory to target_dir if it doesn't exist.
-
-    Shared implementation for install_prompt_defaults() and
-    install_coding_prompt_defaults().
-
-    Returns:
-        {"status": "installed"|"exists"|"no_defaults", "copied": int}
-    """
-    if os.path.isdir(target_dir):
-        return {"status": "exists", "copied": 0}
-
-    if not os.path.isdir(defaults_dir):
-        logger.warning("%s defaults directory not found: %s", label, defaults_dir)
-        return {"status": "no_defaults", "copied": 0}
-
-    try:
-        shutil.copytree(defaults_dir, target_dir)
-        count = sum(1 for _ in Path(target_dir).glob("*.md"))
-        logger.info("Installed %s defaults: %d files to %s", label, count, target_dir)
-        return {"status": "installed", "copied": count}
-    except OSError as e:
-        logger.error("Failed to install %s defaults: %s", label, e)
-        return {"status": "error", "error": str(e), "copied": 0}
-
-
 def install_prompt_defaults(prompts_dir: str) -> dict:
     """Copy config_seed/prompts/ to prompts_dir if it doesn't exist.
 
-    Same pattern as kb.install_seed(). Only copies on first install.
+    Thin wrapper that delegates to :func:`carpenter.seed.install_single_target`.
+    Kept for backwards compatibility with existing callers and tests.
 
     Returns:
         {"status": "installed"|"exists"|"no_defaults", "copied": int}
     """
-    return _install_defaults(_DEFAULTS_DIR, prompts_dir, "Prompt")
+    from .seed import install_single_target
+    return install_single_target("prompts", prompts_dir)
 
 
 def install_coding_prompt_defaults(coding_prompts_dir: str) -> dict:
     """Copy config_seed/coding-prompts/ to coding_prompts_dir if it doesn't exist.
 
-    Same pattern as install_prompt_defaults(). Only copies on first install.
+    Thin wrapper that delegates to :func:`carpenter.seed.install_single_target`.
 
     Returns:
         {"status": "installed"|"exists"|"no_defaults", "copied": int}
     """
-    return _install_defaults(_CODING_DEFAULTS_DIR, coding_prompts_dir, "Coding prompt")
+    from .seed import install_single_target
+    return install_single_target("coding-prompts", coding_prompts_dir)
 
 
 def _parse_front_matter(content: str) -> tuple[dict, str]:
@@ -311,7 +287,8 @@ def _render_template_string(text: str, context: dict) -> str:
     except ImportError:
         return text
     except Exception:
-        logger.warning("Failed to render prompt template, returning raw text")
+        # Intentional: template rendering failure falls back to raw text rather than crashing.
+        logger.warning("Failed to render prompt template, returning raw text", exc_info=True)
         return text
 def load_coding_prompt(coding_prompts_dir: str) -> str | None:
     """Load the coding agent system prompt from template files.

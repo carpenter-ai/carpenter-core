@@ -59,7 +59,8 @@ class TestInvokeCodingAgent:
             result = coding_dispatch.invoke_coding_agent("/ws", "prompt")
 
         mock_run.assert_called_once_with(
-            "/ws", "prompt", {"type": "builtin", "model": "test"}
+            "/ws", "prompt", {"type": "builtin", "model": "test"},
+            arc_id=None,
         )
         assert result["exit_code"] == 0
 
@@ -92,6 +93,23 @@ class TestInvokeCodingAgent:
 
         with pytest.raises(ValueError, match="Unknown coding agent type"):
             coding_dispatch.invoke_coding_agent("/ws", "prompt")
+
+    def test_forwards_arc_id_to_builtin(self, monkeypatch):
+        """arc_id is forwarded to coding_agent.run as a kwarg so the
+        built-in agent can log API calls against the arc."""
+        monkeypatch.setattr("carpenter.config.CONFIG", {
+            "default_coding_agent": "builtin",
+            "coding_agents": {
+                "builtin": {"type": "builtin", "model": "test"},
+            },
+        })
+
+        with patch("carpenter.agent.coding_agent.run") as mock_run:
+            mock_run.return_value = {"stdout": "done", "exit_code": 0, "iterations": 1}
+            coding_dispatch.invoke_coding_agent("/ws", "prompt", arc_id=42)
+
+        _args, kwargs = mock_run.call_args
+        assert kwargs.get("arc_id") == 42
 
     def test_explicit_agent_name(self, monkeypatch):
         """Explicit agent_name overrides default."""

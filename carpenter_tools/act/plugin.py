@@ -1,26 +1,7 @@
-"""Plugin action tools. Tier 1: callback to platform.
+"""Plugin action tool declarations.
 
-These tools delegate tasks to external tools via the plugin system.
-They can ONLY be called from reviewed Python code — the human reviewer
-sees every prompt before it reaches the external tool.
-
-Two submission patterns are available:
-
-Pattern A (blocking): submit_task() — submits and polls until completion.
-    Use for quick tasks in interactive sessions. Fragile on crash: the
-    blocking poll loop loses state on restart.
-
-Pattern B (resilient): submit_task_async() — submits and returns immediately
-    with a task_id. The caller should create a child arc with an
-    arc_activation waiting for the plugin completion event, then complete.
-    When the plugin finishes, the event fires, the child arc activates,
-    and picks up the result via plugin.check_task(). This pattern survives
-    platform restarts.
+See ``carpenter_tools`` package docstring for the invocation model.
 """
-
-import time
-
-from .._callback import callback
 from ..tool_meta import tool
 
 
@@ -58,51 +39,7 @@ def submit_task(plugin_name: str, prompt: str, files: dict | None = None,
             - exit_code: Process exit code
             - error: Error message if failed
     """
-    # Submit task via callback to platform
-    submission = callback("plugin.submit_task", {
-        "plugin_name": plugin_name,
-        "prompt": prompt,
-        "files": files,
-        "working_directory": working_directory,
-        "context": context,
-        "timeout_seconds": timeout_seconds,
-    })
-
-    if "error" in submission:
-        return {
-            "status": "failed",
-            "error": submission["error"],
-            "output": "",
-            "task_id": None,
-        }
-
-    task_id = submission["task_id"]
-
-    # Poll for completion
-    deadline = time.time() + timeout_seconds
-    while time.time() < deadline:
-        time.sleep(2)
-
-        status = callback("plugin.check_task", {
-            "plugin_name": plugin_name,
-            "task_id": task_id,
-        })
-
-        if status.get("completed"):
-            result = status["result"]
-            result["task_id"] = task_id
-            return result
-
-        # If watcher is unhealthy, keep polling but at a slower rate
-        if not status.get("watcher_healthy", True):
-            time.sleep(3)  # 5 seconds total between checks
-
-    return {
-        "status": "timeout",
-        "task_id": task_id,
-        "error": f"Task timed out after {timeout_seconds}s",
-        "output": "",
-    }
+    ...
 
 
 @tool(local=False, readonly=False, side_effects=True,
@@ -141,23 +78,4 @@ def submit_task_async(plugin_name: str, prompt: str,
             - plugin_name: Name of the plugin the task was submitted to
             - error: Error message if submission failed
     """
-    submission = callback("plugin.submit_task", {
-        "plugin_name": plugin_name,
-        "prompt": prompt,
-        "files": files,
-        "working_directory": working_directory,
-        "context": context,
-        "timeout_seconds": timeout_seconds,
-    })
-
-    if "error" in submission:
-        return {
-            "error": submission["error"],
-            "task_id": None,
-            "plugin_name": plugin_name,
-        }
-
-    return {
-        "task_id": submission["task_id"],
-        "plugin_name": submission.get("plugin_name", plugin_name),
-    }
+    ...

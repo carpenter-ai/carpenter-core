@@ -6,7 +6,6 @@ transitioning the parent back to active, gathering failure context,
 and invoking the chat agent so the parent can create alternative children
 or propagate failure.
 
-Follows the same pattern as reflection_template_handler.py.
 """
 
 import asyncio

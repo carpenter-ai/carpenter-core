@@ -132,7 +132,7 @@ def test_cost_tier_order_constant():
 
 
 def test_create_arc_with_agent_model():
-    """create_arc resolves agent_model to agent_config_id."""
+    """create_arc resolves agent_model to model_policy_id."""
     arc_id = arc_manager.create_arc(
         name="test-agent-model",
         goal="Test model selection",
@@ -142,13 +142,13 @@ def test_create_arc_with_agent_model():
 
     arc = arc_manager.get_arc(arc_id)
     assert arc is not None
-    assert arc["agent_config_id"] is not None
+    assert arc["model_policy_id"] is not None
 
-    # Verify the agent_config has the resolved model
-    agent_config = arc_manager.get_agent_config(arc["agent_config_id"])
-    assert agent_config is not None
-    assert "opus" in agent_config["model"]
-    assert agent_config["model"].startswith("anthropic:")
+    # Verify the policy has the resolved model
+    policy = arc_manager.get_model_policy(arc["model_policy_id"])
+    assert policy is not None
+    assert "opus" in policy["model"]
+    assert policy["model"].startswith("anthropic:")
 
 
 def test_create_arc_agent_model_does_not_override_explicit_model():
@@ -156,12 +156,12 @@ def test_create_arc_agent_model_does_not_override_explicit_model():
     arc_id = arc_manager.create_arc(
         name="test-explicit-model",
         goal="Test precedence",
-        model="anthropic:claude-sonnet-4-20250514",
+        model="anthropic:claude-sonnet-4-6",
         agent_model="opus",  # Should be ignored because model is set
     )
     arc = arc_manager.get_arc(arc_id)
-    agent_config = arc_manager.get_agent_config(arc["agent_config_id"])
-    assert agent_config["model"] == "anthropic:claude-sonnet-4-20250514"
+    policy = arc_manager.get_model_policy(arc["model_policy_id"])
+    assert policy["model"] == "anthropic:claude-sonnet-4-6"
 
 
 def test_add_child_with_agent_model():
@@ -171,9 +171,9 @@ def test_add_child_with_agent_model():
         parent_id, name="child-haiku", goal="Use haiku", agent_model="haiku"
     )
     child = arc_manager.get_arc(child_id)
-    assert child["agent_config_id"] is not None
-    agent_config = arc_manager.get_agent_config(child["agent_config_id"])
-    assert "haiku" in agent_config["model"]
+    assert child["model_policy_id"] is not None
+    policy = arc_manager.get_model_policy(child["model_policy_id"])
+    assert "haiku" in policy["model"]
 
 
 def test_create_arc_unknown_agent_model():
@@ -219,13 +219,13 @@ def test_template_with_agent_model(tmp_path):
 
     # First child should use opus
     child1 = arc_manager.get_arc(arc_ids[0])
-    config1 = arc_manager.get_agent_config(child1["agent_config_id"])
-    assert "opus" in config1["model"]
+    policy1 = arc_manager.get_model_policy(child1["model_policy_id"])
+    assert "opus" in policy1["model"]
 
     # Second child should use haiku
     child2 = arc_manager.get_arc(arc_ids[1])
-    config2 = arc_manager.get_agent_config(child2["agent_config_id"])
-    assert "haiku" in config2["model"]
+    policy2 = arc_manager.get_model_policy(child2["model_policy_id"])
+    assert "haiku" in policy2["model"]
 
 
 def test_template_model_min_tier_enforced(tmp_path):

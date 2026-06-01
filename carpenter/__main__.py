@@ -4,35 +4,14 @@ import os
 import sys
 from pathlib import Path
 
+from .util.dot_env import update_dot_env as _update_dot_env
 
-def _update_dot_env(dot_env_path: Path, key: str, value: str) -> bool:
-    """Write or update KEY=VALUE in a .env file.
-
-    Returns True if the key was updated in place, False if it was newly added.
-    """
-    import re
-
-    existing_lines: list[str] = []
-    if dot_env_path.is_file():
-        existing_lines = dot_env_path.read_text().splitlines()
-
-    new_lines: list[str] = []
-    updated = False
-    for line in existing_lines:
-        if re.match(rf'^{re.escape(key)}\s*=', line.strip()):
-            new_lines.append(f"{key}={value}")
-            updated = True
-        else:
-            new_lines.append(line)
-
-    if not updated:
-        if new_lines and new_lines[-1].strip():
-            new_lines.append("")  # blank separator
-        new_lines.append(f"{key}={value}")
-
-    dot_env_path.parent.mkdir(parents=True, exist_ok=True)
-    dot_env_path.write_text("\n".join(new_lines) + "\n")
-    return updated
+# Re-exported as ``_update_dot_env`` for backward compatibility with
+# call sites and tests that import directly from ``carpenter.__main__``.
+# The implementation lives in ``carpenter.util.dot_env`` and is shared
+# with ``carpenter.api.credentials`` so both paths get the same atomic,
+# locked, chmod'd, fsync'd write semantics.
+__all__ = ["_update_dot_env", "main"]
 
 
 def _enqueue_restart(reason: str = "") -> bool:

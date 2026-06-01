@@ -1,5 +1,7 @@
-"""Read-only messaging tools. Tier 1: callback to platform."""
-from .._callback import callback
+"""Read-only messaging tool declarations.
+
+See ``carpenter_tools`` package docstring for the invocation model.
+"""
 from ..tool_meta import tool
 
 
@@ -7,4 +9,4 @@ from ..tool_meta import tool
       param_types={"question": "UnstructuredText"})
 def ask(question: str) -> dict:
     """Ask the user a question. Returns their response."""
-    return callback("messaging.ask", {"question": question})
+    ...

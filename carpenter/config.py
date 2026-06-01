@@ -44,12 +44,30 @@ DEFAULTS = {
         "max_entry_bytes": 6000,            # soft cap (~1500 tokens)
         "staleness_days": 30,               # entries not accessed in N days flagged stale
         "search_backend": "embedding",        # embedding | vector | onnx | fts5 | hybrid
+        # NOTE: ``kb.embedding_*`` keys are kept as one-release fallbacks
+        # for the new top-level ``embedding`` block below.  New deployments
+        # should configure embedding via ``embedding:`` in config.yaml.
         "embedding_url": "http://192.168.2.243:11434",
         "embedding_model": "nomic-embed-text",
         "embedding_dim": 384,
         "onnx_model_path": "",              # auto-resolved: {base_dir}/models/all-MiniLM-L6-v2.onnx
         "work_history_enabled": True,
         "theme_map": {},                    # overrides for tool-module -> KB-path mapping
+    },
+    # Phase 2 PR-1: process-wide embedding service config.  Defaults
+    # reproduce the historical KB behaviour (local all-MiniLM-L6-v2 via
+    # ONNX with numpy fallback).  See carpenter/embeddings/service.py.
+    "embedding": {
+        "provider": "local",          # local | ollama
+        "batch_size": 10,
+        "local": {
+            "model_path": "",         # default: {base_dir}/models/all-MiniLM-L6-v2.onnx
+        },
+        "ollama": {
+            "url": "http://192.168.2.243:11434",
+            "model": "nomic-embed-text",
+            "dim": 768,
+        },
     },
     "prompts_dir": "",  # default: {base_dir}/prompts
     "prompt_templates_dir": "",  # default: {base_dir}/config/prompt-templates
@@ -67,7 +85,7 @@ DEFAULTS = {
     "agentic_iteration_budget": 10,
     "agentic_iteration_cap": 256,
     "heartbeat_seconds": 5,
-    "max_concurrent_handlers": 2,
+    "max_concurrent_handlers": 5,
     "execution_session_expiry_hours": 1,
     "shutdown_timeout": 25,
     "executor_grace_seconds": 5,
@@ -93,24 +111,9 @@ DEFAULTS = {
         "compaction": "",
         "code_review": "",
         "review_judge": "",
-        "reflection_daily": "",
-        "reflection_weekly": "",
-        "reflection_monthly": "",
     },
     "memory_recent_hints": 2,
     "chat_language": "",  # ISO 639-1 code; empty = respond in user's language
-    "reflection": {
-        "enabled": True,
-        "min_daily_conversations": 1,
-        "daily_cron": "0 23 * * *",
-        "weekly_cron": "0 23 * * 0",
-        "monthly_cron": "0 23 1 * *",
-        "auto_action": False,
-        "review_mode": "auto",
-        "tainted_review_mode": "human",
-        "max_actions_per_reflection": 10,
-        "max_actions_per_day": 50,
-    },
     "review": {
         "adversarial_mode": False,
         "adversarial_min_findings": 1,
@@ -128,10 +131,32 @@ DEFAULTS = {
             "window_max_tokens": 20,
             "excerpt_max_chars": 60,
         },
-    },
-    "skill_kb_review": {
-        "enabled": True,
-        "human_escalation_for_tainted": True,
+        # Quarantined Quality Reviewer (QQR) — defence-in-depth second
+        # reviewer that does NOT see chat history. See
+        # ``carpenter/review/qqr.py``. Composition rules in
+        # ``carpenter/review/pipeline.py::determine_outcome``: under
+        # disabled/errored verification, BOTH reviewers must concur for
+        # APPROVE — never expands today's auto-approve surface.
+        "qqr": {
+            "enabled": True,
+            # Optional model-policy ID; if set and resolves to a model in
+            # ``allowed_models`` it is used. Otherwise the first allowed
+            # model is used.
+            "model_policy_id": "",
+            # Vetted allowlist. The selected model MUST be in this list —
+            # config drift to a non-allowlisted model falls back to the
+            # first entry.
+            "allowed_models": [
+                "anthropic:claude-haiku-4-5",
+                "anthropic:claude-sonnet-4-6",
+            ],
+            # When True (default), QQR errors / timeouts / malformed JSON
+            # produce an ABSTAIN signal. The aggregator then falls back to
+            # today's main-reviewer-only path with an audit-log entry.
+            # The narrowed-approval table can only upgrade outcomes to
+            # MAJOR; it never silently approves more than today.
+            "fail_closed": True,
+        },
     },
     "verification": {
         "enabled": True,
@@ -151,7 +176,7 @@ DEFAULTS = {
     },
     # Agent capability matrix — maps agent types to their allowed capabilities.
     # Keys are agent type strings (PLANNER, EXECUTOR, REVIEWER, JUDGE, CHAT).
-    # Each entry has: can_read_untrusted (bool|null), can_create_untrusted_arcs (bool),
+    # Each entry has: can_create_untrusted_arcs (bool),
     # allowed_tools (list of tool names, or null for unrestricted).
     # See carpenter/core/trust_types.py for hardcoded defaults.
     "agent_capabilities": {},
@@ -174,7 +199,7 @@ DEFAULTS = {
     "models": {
         "opus": {
             "provider": "anthropic",
-            "model_id": "claude-opus-4-6",
+            "model_id": "claude-opus-4-7",
             "description": "Most capable model. Deep reasoning, architecture decisions, security review, complex multi-step planning.",
             "cost_tier": "high",
             "context_window": 200000,
@@ -190,7 +215,7 @@ DEFAULTS = {
         },
         "haiku": {
             "provider": "anthropic",
-            "model_id": "claude-haiku-4-5-20251001",
+            "model_id": "claude-haiku-4-5",
             "description": "Fast and cheap. Summarization, simple code generation, data extraction, formatting.",
             "cost_tier": "low",
             "context_window": 200000,
@@ -202,7 +227,6 @@ DEFAULTS = {
     "api_standards": {
         "anthropic": "anthropic",
         "ollama": "openai",
-        "local": "openai",
         "tinfoil": "openai",
         "chain": "anthropic",
     },
@@ -210,22 +234,9 @@ DEFAULTS = {
     "ollama_model": "llama3.1",
     "tinfoil_model": "llama3-3-70b",
     "tinfoil_max_tokens": 4096,
-    # Local inference (llama.cpp)
-    "local_llama_cpp_path": "",  # Path to llama-server binary (empty = auto-detect via PATH)
-    "local_model_path": "",      # Path to GGUF model file
-    "local_server_port": 8081,   # HTTP port for llama-server
-    "local_server_host": "127.0.0.1",
-    "local_context_size": 16384,  # -c flag passed to llama-server
-    "local_gpu_layers": 0,       # -ngl flag (0 = CPU only)
-    "local_parallel": 1,         # --parallel flag (concurrent request slots)
-    "local_repack": "auto",      # Weight repacking: True, False, or "auto" (check RAM)
-    "local_server_args": [],     # Extra CLI args for llama-server
-    "local_startup_timeout": 120,  # Seconds to wait for server health
-    "local_client_timeout": 1200,  # Client timeout in seconds (cold cache can take ~19 min)
     # Context windows — map provider prefixes or specific model strings to token limits.
     # Used by compaction logic and prompt building.
     "context_windows": {
-        "local": 16384,
         "ollama": 16384,
         "tinfoil": 8192,
         "anthropic": 200000,
@@ -287,17 +298,6 @@ DEFAULTS = {
             "default": False,
         },
     },
-    "local_fallback": {
-        "enabled": False,
-        "provider": "ollama",
-        "url": "",                # e.g. "http://192.168.2.243:11434"
-        "model": "qwen3.5:9b",
-        "context_window": 16384,
-        "timeout": 300,
-        "max_tokens": 4096,
-        "allowed_operations": ["chat", "summarization", "simple_code"],
-        "blocked_operations": ["review", "security_review", "planning"],
-    },
     "executor_memory_limit_mb": 300,  # Legacy (unused with restricted executor)
     "egress_policy": "auto",   # Legacy (unused with restricted executor)
     "egress_enforce": True,    # Legacy (unused with restricted executor)
@@ -311,34 +311,13 @@ DEFAULTS = {
     "scheduling_allowed_event_types": ["cron.message", "arc.dispatch"],
     # Trigger and subscription pipeline configuration.
     # Triggers emit events into the event bus; subscriptions route events to actions.
-    # Reflection triggers default to disabled — activated when reflection.enabled is True.
-    "triggers": [
-        {
-            "type": "timer",
-            "name": "daily-reflection",
-            "schedule": "0 23 * * *",
-            "emits": "reflection.trigger",
-            "payload": {"cadence": "daily"},
-            "enabled": False,
-        },
-        {
-            "type": "timer",
-            "name": "weekly-reflection",
-            "schedule": "0 23 * * 0",
-            "emits": "reflection.trigger",
-            "payload": {"cadence": "weekly"},
-            "enabled": False,
-        },
-        {
-            "type": "timer",
-            "name": "monthly-reflection",
-            "schedule": "0 23 1 * *",
-            "emits": "reflection.trigger",
-            "payload": {"cadence": "monthly"},
-            "enabled": False,
-        },
-    ],
+    # Feature-specific triggers are declared inside each template's ``triggers:``
+    # section and loaded at startup via ``template_manager.load_template_triggers``
+    # — the platform config holds only cross-feature triggers here.
+    "triggers": [],
     "subscriptions": [],
+    # Resource sweep: delete blobs of deprecated Resources older than N days.
+    "resource_sweep_age_days": 7,
     "connectors": {},                   # Connector definitions (replaces plugins.json)
     "connector_retention_days": 7,      # Days to keep completed connector task folders
     "plugin_shared_base": "",           # Base path for plugin shared folders (empty = disabled)
@@ -352,6 +331,12 @@ DEFAULTS = {
     # Tool backend timeouts and limits
     "git_api_timeout": 30.0,               # default git server API HTTP timeout (seconds)
     "git_api_long_timeout": 60.0,         # timeout for large git server responses like diffs (seconds)
+    # Forge provider selection (D5 — see carpenter/forges/).  ``forge`` picks
+    # which provider implementation to dispatch to (currently "forgejo";
+    # "github" is a follow-up).  ``forge_default_base_branch`` is the PR base
+    # branch used when callers don't override it.
+    "forge": "forgejo",
+    "forge_default_base_branch": "main",
     "web_request_default_timeout": 30.0,  # default HTTP timeout for web tool requests (seconds)
     "web_response_max_chars": 10000,      # max chars returned from web GET/POST responses
     "web_fetch_max_bytes": 1000000,       # max bytes for webpage fetch content (1 MB)
@@ -365,8 +350,6 @@ DEFAULTS = {
     "tool_lists": {
         "session_exempt_tools_add": [],
         "session_exempt_tools_remove": [],
-        "untrusted_data_tools_add": [],
-        "untrusted_data_tools_remove": [],
         "external_access_tools_add": [],
         "external_access_tools_remove": [],
         "messaging_tools_add": [],
@@ -383,7 +366,6 @@ DEFAULTS = {
     "conversation_summary_min_remaining": 50,
     "pr_review_summary_max_length": 200,
     "arc_parent_chain_max_depth": 100,
-    "inference_server_health_check_interval": 1,
     "default_coding_agent": "builtin",
     "notifications": {
         "email": {
@@ -407,7 +389,6 @@ DEFAULTS = {
             "fyi": [],
         },
         "routing": {
-            "reflection_actions": "low",
             "review_needed": "normal",
             "security_events": "urgent",
         },
@@ -560,12 +541,69 @@ def _expand_paths(config: dict) -> dict:
         "data_models_dir", "prompt_templates_dir",
         "plugin_shared_base", "plugins_config",
         "tls_cert_path", "tls_key_path", "tls_ca_path",
-        "local_llama_cpp_path", "local_model_path",
     }
     for key in path_keys:
         if key in config and isinstance(config[key], str):
             config[key] = os.path.expanduser(config[key])
     return config
+
+
+# Layout-dependent path keys derived from ``base_dir`` when not explicitly
+# set in YAML.  Values are relative paths under ``base_dir``.
+#
+# This map is the single source of truth for server-side default layout.
+# install.sh (and other deployment tooling) should only emit ``base_dir`` and
+# genuinely deployment-specific values (port, AI provider, keys); the server
+# derives every other path from this map at startup.
+#
+# Keys whose SEED target also appears in ``carpenter.seed.SEED_MANIFEST`` must
+# match it.  The overlap today: ``prompts_dir``, ``coding_prompts_dir``,
+# ``data_models_dir`` (kb dir lives under ``config["kb"]["dir"]`` and is
+# handled separately below).
+_DERIVED_PATH_DEFAULTS = {
+    "database_path": ("data", "platform.db"),
+    "log_dir": ("data", "logs"),
+    "code_dir": ("data", "code"),
+    "workspaces_dir": ("data", "workspaces"),
+    "templates_dir": ("config", "templates"),
+    "tools_dir": ("config", "tools"),
+    "data_models_dir": ("data_models",),
+    "prompts_dir": ("config", "prompts"),
+    "coding_prompts_dir": ("config", "coding-prompts"),
+    "coding_tools_dir": ("config", "coding-tools"),
+    "chat_tools_dir": ("config", "chat_tools"),
+    "prompt_templates_dir": ("config", "prompt-templates"),
+}
+
+
+def _derive_paths_from_base_dir(
+    config: dict, base_dir: str, yaml_overrides: dict,
+) -> None:
+    """Fill layout-dependent path defaults from ``base_dir`` when unset.
+
+    A key is considered "unset" when the YAML file did not provide a value
+    for it (so DEFAULTS' placeholder wins) — in that case we overwrite with
+    a path derived from ``base_dir``.  If the YAML explicitly sets the key,
+    its value is preserved for back-compat.
+    """
+    base = os.path.expanduser(base_dir)
+    for key, parts in _DERIVED_PATH_DEFAULTS.items():
+        if key in yaml_overrides:
+            continue  # explicit YAML value wins
+        config[key] = os.path.join(base, *parts)
+
+    # kb.dir lives inside the nested ``kb`` dict.  Only derive when the user
+    # did not explicitly set it in their YAML ``kb`` block.  Deep-copy before
+    # mutating so we never write into the shared DEFAULTS["kb"] dict.
+    import copy as _copy
+    yaml_kb = yaml_overrides.get("kb") if isinstance(yaml_overrides, dict) else None
+    kb_cfg = config.get("kb")
+    if isinstance(kb_cfg, dict):
+        kb_explicit_dir = isinstance(yaml_kb, dict) and bool(yaml_kb.get("dir"))
+        if not kb_explicit_dir and not kb_cfg.get("dir"):
+            kb_cfg = _copy.deepcopy(kb_cfg)
+            kb_cfg["dir"] = os.path.join(base, "config", "kb")
+            config["kb"] = kb_cfg
 
 
 def load_config(yaml_path: str | None = None) -> dict:
@@ -591,6 +629,17 @@ def load_config(yaml_path: str | None = None) -> dict:
 
     # Resolve base_dir early (needed for .env and registry paths)
     base_dir = os.path.expanduser(config.get("base_dir", DEFAULTS["base_dir"]))
+
+    # Derive layout-dependent path defaults from base_dir for keys the user
+    # did not explicitly set in YAML.  This lets install.sh (and other
+    # deployment tooling) set ``base_dir`` alone and rely on the server to
+    # compute every other path — eliminating the need to duplicate layout
+    # knowledge in install scripts.
+    #
+    # Back-compat: if ``config.yaml`` sets an explicit value for any of these
+    # keys, that value wins.  Existing deployments with fully-populated
+    # ``config.yaml`` keep working unchanged.
+    _derive_paths_from_base_dir(config, base_dir, yaml_overrides)
 
     # Load credential registry; build a call-local map (no global mutation of _CREDENTIAL_MAP)
     registry = _load_credential_registry(base_dir)

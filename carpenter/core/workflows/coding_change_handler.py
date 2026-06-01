@@ -12,7 +12,7 @@ import asyncio
 import logging
 import os
 
-from ... import config
+from ... import config, constants
 from ..arcs import CODING_CHANGE_PREFIX, manager as arc_manager
 from .. import workspace_manager
 from ...agent import coding_dispatch, conversation
@@ -27,8 +27,10 @@ STEP_INVOKE_AGENT = "invoke-agent"
 STEP_GENERATE_REVIEW = "generate-review"
 STEP_APPROVAL = "approval"
 
-# Maximum number of revision/rework attempts before auto-escalating to human review
-MAX_REWORK_ATTEMPTS = 3
+# Maximum number of revision/rework attempts before auto-escalating to human review.
+# Sourced from the shared cross-module constant so review UI ("Attempt N/3") and
+# the handler always agree.
+MAX_REWORK_ATTEMPTS = constants.MAX_REWORK_RETRIES
 
 # Maximum characters to include in stdout preview in arc history entries
 STDOUT_PREVIEW_MAX_CHARS = 500
@@ -260,7 +262,9 @@ async def handle_invoke_agent(work_id: int, payload: dict):
         # Run the coding agent in the work-handler pool (long-running)
         from ... import thread_pools
         result = await thread_pools.run_in_work_pool(
-            coding_dispatch.invoke_coding_agent, workspace_path, prompt, agent_name
+            coding_dispatch.invoke_coding_agent,
+            workspace_path, prompt, agent_name,
+            arc_id=arc_id,
         )
 
         # Re-check arc status after the long-running agent call.

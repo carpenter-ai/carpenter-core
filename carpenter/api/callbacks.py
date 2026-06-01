@@ -18,9 +18,9 @@ from ..tool_backends import arc as arc_backend
 from ..tool_backends import scheduling as sched_backend
 from ..tool_backends import web as web_backend
 from ..tool_backends import git as git_backend
-from ..tool_backends import forgejo_api as forgejo_api_backend
 from ..tool_backends import plugin as plugin_backend
 from ..tool_backends import review as review_backend
+from ..tool_backends import resource as resource_backend
 from ..tool_backends import policy as policy_backend
 from ..tool_backends import lm as lm_backend
 from ..tool_backends import config_tool as config_tool_backend
@@ -29,6 +29,7 @@ from ..tool_backends import kb as kb_backend
 from ..tool_backends import conversation as conversation_backend
 from ..tool_backends import credentials as credentials_backend
 from ..tool_backends import platform as platform_backend
+from ..forges import get_forge_provider
 from ..core.trust.types import AgentType, get_agent_capabilities
 from ..core.trust.capabilities import get_arc_capabilities, resolve_capability_tools, SCOPE_BYPASS_CAPABILITIES
 from ..core.trust.audit import log_trust_event
@@ -72,23 +73,17 @@ _DEFAULT_SESSION_EXEMPT_TOOLS = frozenset({
     "plugin.check_task", "plugin.check_health", "plugin.read_workspace_file",
     "plugin.list_plugins", "plugin.get_task_status",
     "policy.validate",
-    # Trust boundary tools (have their own enforcement via _UNTRUSTED_DATA_TOOLS)
-    "arc.read_output_UNTRUSTED", "arc.read_state_UNTRUSTED",
     # Read-only git operations
     "git.get_pr", "git.get_pr_diff",
     # Read-only webhook operations
     "webhook.list",
 })
 
-_DEFAULT_UNTRUSTED_DATA_TOOLS = frozenset({
-    "arc.read_output_UNTRUSTED",
-    "arc.read_state_UNTRUSTED",
-})
-
 _DEFAULT_EXTERNAL_ACCESS_TOOLS = frozenset({
     "web.get",
     "web.post",
     "web.fetch_webpage",
+    "web.fetch_webpage_to_resource",
 })
 
 _DEFAULT_MESSAGING_TOOLS = frozenset({
@@ -129,14 +124,6 @@ def get_session_exempt_tools() -> frozenset:
     return _apply_overrides(
         _DEFAULT_SESSION_EXEMPT_TOOLS,
         "session_exempt_tools_add", "session_exempt_tools_remove",
-    )
-
-
-def get_untrusted_data_tools() -> frozenset:
-    """Return the effective untrusted-data tool set (defaults + config overrides)."""
-    return _apply_overrides(
-        _DEFAULT_UNTRUSTED_DATA_TOOLS,
-        "untrusted_data_tools_add", "untrusted_data_tools_remove",
     )
 
 
@@ -196,18 +183,25 @@ _DISPATCH = {
     "web.get": web_backend.handle_get,
     "web.post": web_backend.handle_post,
     "web.fetch_webpage": web_backend.handle_fetch_webpage,
+    # Phase B PR B3: fetch-to-Resource helper.  Dispatch-only (no chat
+    # tool).  Fetches a URL and persists the body as a raw,
+    # produced_by_template=NULL Resource owned by the caller arc — a
+    # convenience wrapper so arcs don't have to sequence resource.create +
+    # blob write + resource.finalize by hand.
+    "web.fetch_webpage_to_resource": web_backend.handle_fetch_webpage_to_resource,
     "git.setup_repo": git_backend.handle_setup_repo,
     "git.create_branch": git_backend.handle_create_branch,
     "git.commit_and_push": git_backend.handle_commit_and_push,
-    "git.create_pr": forgejo_api_backend.handle_create_pr,
-    "git.list_prs": forgejo_api_backend.handle_list_prs,
-    "git.merge_pr": forgejo_api_backend.handle_merge_pr,
-    "git.close_pr": forgejo_api_backend.handle_close_pr,
-    "git.get_pr": forgejo_api_backend.handle_get_pr,
-    "git.get_pr_diff": forgejo_api_backend.handle_get_pr_diff,
-    "git.post_pr_review": forgejo_api_backend.handle_post_pr_review,
-    "git.create_repo_webhook": forgejo_api_backend.handle_create_repo_webhook,
-    "git.delete_repo_webhook": forgejo_api_backend.handle_delete_repo_webhook,
+    # Forge-provider dispatch — resolves per-call so tests can swap providers.
+    "git.create_pr": lambda p: get_forge_provider().create_pr(p),
+    "git.list_prs": lambda p: get_forge_provider().list_prs(p),
+    "git.merge_pr": lambda p: get_forge_provider().merge_pr(p),
+    "git.close_pr": lambda p: get_forge_provider().close_pr(p),
+    "git.get_pr": lambda p: get_forge_provider().get_pr(p),
+    "git.get_pr_diff": lambda p: get_forge_provider().get_pr_diff(p),
+    "git.post_pr_review": lambda p: get_forge_provider().post_pr_review(p),
+    "git.create_repo_webhook": lambda p: get_forge_provider().create_repo_webhook(p),
+    "git.delete_repo_webhook": lambda p: get_forge_provider().delete_repo_webhook(p),
     "config.reload": config_tool_backend.handle_reload,
     "config.set_value": config_tool_backend.handle_set_value,
     "config.get_value": config_tool_backend.handle_get_value,
@@ -222,10 +216,19 @@ _DISPATCH = {
     # Trust boundary tools (Phase B)
     "arc.get_plan": arc_backend.handle_get_plan,
     "arc.get_children_plan": arc_backend.handle_get_children_plan,
-    "arc.read_output_UNTRUSTED": arc_backend.handle_read_output_UNTRUSTED,
-    "arc.read_state_UNTRUSTED": arc_backend.handle_read_state_UNTRUSTED,
     # Review tools (Phase C)
     "review.submit_verdict": review_backend.handle_submit_verdict,
+    # Resource verdict (JUDGE-only — PR2)
+    "resource.submit_verdict": resource_backend.handle_submit_verdict,
+    # Resource finalize (producer commits blob + stats — PR3).  Callable
+    # by any agent; the handler enforces that the caller arc is the
+    # Resource's producer.
+    "resource.finalize": resource_backend.handle_finalize,
+    # Resource create (Phase B PR B1): any arc registers a new raw
+    # Resource it will then write + finalize.  Content-type is a free-form
+    # label; produced_by_template=NULL means the row is forever untrusted
+    # until a template-arc pipeline derives a trusted successor from it.
+    "resource.create": resource_backend.handle_create,
     # Language model call tool
     "lm.call": lm_backend.handle_call,
     # Policy validation (read-only, no session required)

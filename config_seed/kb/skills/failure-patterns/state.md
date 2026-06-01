@@ -108,25 +108,25 @@ Failures related to the database, encryption, arc state machine, and platform st
 
 ## Taint Boundary Violation
 
-**Symptoms**: Clean arcs cannot access `arc.read_output_UNTRUSTED` or `arc.read_state_UNTRUSTED` tools. Tainted conversations cannot modify skill KB entries without human review. Trust promotion is rejected because the promoting arc is not a JUDGE.
+**Symptoms**: `read_resource` returns an "untrusted" refusal instead of content when a trusted arc tries to read a raw or pending-verdict Resource. Tainted conversations cannot modify skill KB entries without human review. Trust promotion is rejected because the promoting arc is not a JUDGE.
 
 **Root cause**: The trust boundary system enforces strict separation between clean and tainted contexts:
-- Clean arcs cannot access untrusted data tools.
+- Trusted arcs can only read Resources whose `template_verdict` is `approved`. Raw Resources (`produced_by_template=NULL`) and `pending`/`rejected` Resources are refused.
 - Planner agents are restricted to structural/messaging tools only.
 - Only JUDGE arcs can promote trust (and only for their specific target arc -- no cascading).
 - Tainted arcs must have at least one reviewer and a judge at creation time (`arc.create_batch`).
 - Tainted conversations (those that have received untrusted tool output) require human review for skill KB modifications.
 
 **Escape**:
-1. If a clean arc needs untrusted data: it should not access it directly. Create a review arc to process the untrusted data, then access the reviewed output.
+1. If a trusted arc needs data from an untrusted byte stream: do not read it directly. Route it through a reviewed template pipeline -- an untrusted producer writes the raw Resource, a REVIEWER arc processes it and derives a new Resource, and a JUDGE (or template verdict) marks that derivation `approved`. Trusted downstream readers can then call `read_resource` on the derived resource and receive the content.
 2. If a tainted conversation needs to modify skill knowledge: writing to a `skills/` KB path triggers the `skill-kb-review` workflow, which will escalate to human review. The platform notifies the user automatically.
 3. If trust promotion is failing: verify the promoting arc has `agent_type = 'JUDGE'` and is targeting the correct arc. Trust promotion does not cascade to parent arcs.
 4. For creating tainted arcs: use `arc.create_batch` which enforces the reviewer+judge requirement. Do not try to create tainted arcs individually without review infrastructure.
 5. If the conversation was tainted by a taint-check failure (fail-closed behavior), the conversation is treated as tainted even if no untrusted data was actually processed. This is by design.
 
-**Prevention**: Plan trust boundaries before creating arc structures. Keep clean and tainted workflows separate. Use review arcs as the bridge between untrusted and trusted zones.
+**Prevention**: Plan trust boundaries before creating arc structures. Keep clean and tainted workflows separate. Use review arcs and derived Resources as the bridge between untrusted and trusted zones.
 
-**Escalation**: Trust boundary violations are security features, not bugs. If the workflow genuinely requires crossing trust boundaries, it must go through the review arc mechanism.
+**Escalation**: Trust boundary violations are security features, not bugs. If the workflow genuinely requires crossing trust boundaries, it must go through the review-arc + Resource pipeline.
 
 ---
 

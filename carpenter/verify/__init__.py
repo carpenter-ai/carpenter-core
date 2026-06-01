@@ -214,4 +214,8 @@ def _resolve_untyped_inputs(constrained_inputs: list) -> None:
                     policy_type, inp.key, inp.arc_id,
                 )
         except Exception as _exc:  # broad catch: schema resolution involves DB + imports
-            logger.debug("Could not resolve schema type for %s (arc %s)", inp.key, inp.arc_id)
+            # Intentional: schema resolution is best-effort — verification proceeds without it.
+            logger.info(
+                "Could not resolve schema type for %s (arc %s)",
+                inp.key, inp.arc_id, exc_info=True,
+            )

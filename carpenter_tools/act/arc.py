@@ -1,5 +1,7 @@
-"""Arc mutation tools. Tier 1: callback to platform."""
-from .._callback import callback
+"""Arc mutation tool declarations.
+
+See ``carpenter_tools`` package docstring for the invocation model.
+"""
 from ..tool_meta import tool
 
 
@@ -24,21 +26,13 @@ def create(
         integrity_level: 'trusted' (default), 'constrained', or 'untrusted'.
         output_type: 'python' (default), 'text', 'json', or 'unknown'.
         agent_type: 'EXECUTOR' (default), 'PLANNER', 'REVIEWER', or 'CHAT'.
-        model: Explicit model string (e.g. 'anthropic:claude-sonnet-4-20250514').
+        model: Explicit model string (e.g. 'anthropic:claude-sonnet-4-6').
         model_role: Named role slot to resolve model from (e.g. 'default_step').
         agent_role: Named agent role for system prompt (e.g. 'security-reviewer').
         wait_until: ISO datetime string; heartbeat won't dispatch until this time.
         output_contract: Pydantic model reference 'module:ClassName' for output schema.
     """
-    params = {"name": name, "goal": goal, "parent_id": parent_id}
-    for key, val in [("integrity_level", integrity_level), ("output_type", output_type),
-                     ("agent_type", agent_type), ("model", model),
-                     ("model_role", model_role), ("agent_role", agent_role),
-                     ("wait_until", wait_until), ("output_contract", output_contract)]:
-        if val is not None:
-            params[key] = val
-    result = callback("arc.create", params)
-    return result["arc_id"]
+    ...
 
 
 @tool(local=True, readonly=False, side_effects=True,
@@ -62,37 +56,26 @@ def add_child(
         integrity_level: 'trusted' (default), 'constrained', or 'untrusted'.
         output_type: 'python' (default), 'text', 'json', or 'unknown'.
         agent_type: 'EXECUTOR' (default), 'PLANNER', 'REVIEWER', or 'CHAT'.
-        model: Explicit model string (e.g. 'anthropic:claude-sonnet-4-20250514').
+        model: Explicit model string (e.g. 'anthropic:claude-sonnet-4-6').
         model_role: Named role slot to resolve model from (e.g. 'default_step').
         agent_role: Named agent role for system prompt (e.g. 'security-reviewer').
         wait_until: ISO datetime string; heartbeat won't dispatch until this time.
         output_contract: Pydantic model reference 'module:ClassName' for output schema.
     """
-    params = {"parent_id": parent_id, "name": name, "goal": goal}
-    for key, val in [("integrity_level", integrity_level), ("output_type", output_type),
-                     ("agent_type", agent_type), ("model", model),
-                     ("model_role", model_role), ("agent_role", agent_role),
-                     ("wait_until", wait_until), ("output_contract", output_contract)]:
-        if val is not None:
-            params[key] = val
-    result = callback("arc.add_child", params)
-    if "hint" in result:
-        print(f"[platform hint] {result['hint']}")
-    return result["arc_id"]
+    ...
 
 
 @tool(local=True, readonly=False, side_effects=True)
 def cancel(arc_id: int) -> int:
     """Cancel an arc and descendants. Returns count cancelled."""
-    result = callback("arc.cancel", {"arc_id": arc_id})
-    return result["cancelled_count"]
+    ...
 
 
 @tool(local=True, readonly=False, side_effects=True,
       param_types={"status": "Label"})
 def update_status(arc_id: int, status: str) -> None:
     """Update arc status."""
-    callback("arc.update_status", {"arc_id": arc_id, "status": status})
+    ...
 
 
 @tool(local=True, readonly=False, side_effects=True,
@@ -118,11 +101,7 @@ def invoke_coding_change(
     Returns:
         The new arc ID (int).
     """
-    params: dict = {"source_dir": source_dir, "prompt": prompt}
-    if coding_agent is not None:
-        params["coding_agent"] = coding_agent
-    result = callback("arc.invoke_coding_change", params)
-    return result["arc_id"]
+    ...
 
 
 @tool(local=True, readonly=False, side_effects=True,
@@ -144,11 +123,7 @@ def request_ai_review(
         focus_areas: Optional focus areas (e.g. "security", "performance").
     Returns: The new reviewer arc ID.
     """
-    params = {"target_arc_id": target_arc_id, "model": model}
-    if focus_areas is not None:
-        params["focus_areas"] = focus_areas
-    result = callback("arc.request_ai_review", params)
-    return result["arc_id"]
+    ...
 
 
 @tool(local=True, readonly=False, side_effects=True,
@@ -161,11 +136,7 @@ def grant_read_access(reader_arc_id: int, target_arc_id: int, depth: str = "subt
         target_arc_id: The arc whose state will become readable.
         depth: 'self' for exact arc only, 'subtree' for arc and all descendants.
     """
-    return callback("arc.grant_read_access", {
-        "reader_arc_id": reader_arc_id,
-        "target_arc_id": target_arc_id,
-        "depth": depth,
-    })
+    ...
 
 
 @tool(local=True, readonly=False, side_effects=True)
@@ -185,7 +156,4 @@ def create_batch(arcs: list[dict]) -> dict:
     Returns:
         {"arc_ids": [list of created arc IDs]} or {"error": "message"}
     """
-    result = callback("arc.create_batch", {"arcs": arcs})
-    if "hint" in result:
-        print(f"[platform hint] {result['hint']}")
-    return result
+    ...

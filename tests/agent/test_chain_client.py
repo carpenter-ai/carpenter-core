@@ -25,7 +25,7 @@ _TWO_ENTRY_CHAIN = [
     {
         "name": "test-haiku",
         "provider": "anthropic",
-        "model": "claude-haiku-4-5-20251001",
+        "model": "claude-haiku-4-5",
         "context_window": 200000,
         "timeout": 60,
     },

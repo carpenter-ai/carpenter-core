@@ -43,6 +43,15 @@ class ReviewProfile:
     # False → full security review: injection scan, sanitise, security-focused LLM.
     intent_review_only: bool = True
 
+    # ── Quarantined Quality Reviewer (QQR) ────────────────────────────────────
+    # True → run QQR after the main reviewer. QQR sees only the sanitised code
+    # plus a deterministic, T-only distilled summary of the user's request — no
+    # chat history, no tool outputs, no tools. Its verdict composes with the
+    # main reviewer per the rules in ``determine_outcome``: under disabled or
+    # errored verification, BOTH reviewers must concur for APPROVE; either
+    # MAJOR is MAJOR. ABSTAIN falls back to today's main-reviewer-only path.
+    run_qqr: bool = False
+
 
 # ── Named profiles ─────────────────────────────────────────────────────────────
 
@@ -66,4 +75,5 @@ PROFILE_STEP = ReviewProfile(
     check_syntax=True,
     run_formal_verification=True,
     intent_review_only=False,
+    run_qqr=True,
 )

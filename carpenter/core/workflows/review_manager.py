@@ -128,12 +128,88 @@ def submit_verdict(
         "reason": reason,
     })
 
+    # Parallel Resource verdict path: if the reviewer arc has a
+    # `_review_target_resource_id` in its state AND the reviewer is a
+    # JUDGE, apply the verdict to the Resource's template_verdict.  This
+    # is a sibling effect to arc trust promotion — a derived Resource
+    # only becomes trusted via a JUDGE approval on its producing arc.
+    _apply_resource_verdict_if_any(reviewer_arc_id, decision)
+
     if decision == "approve":
         promoted = _check_and_promote(target_arc_id)
         return {"accepted": True, "promoted": promoted}
     else:
         _handle_rejection(target_arc_id, reviewer_arc_id, reason)
         return {"accepted": True, "promoted": False}
+
+
+def _get_review_target_resource_id(reviewer_arc_id: int) -> int | None:
+    """Return the Resource id this reviewer arc is gating, or None.
+
+    Reads ``arc_state[_review_target_resource_id]`` on the reviewer arc.
+    PR3's ``fetch_web_content`` sets this when building template arc
+    pipelines.  Absent key (or absent row) means this review doesn't
+    gate a Resource and the Resource verdict path is a no-op.
+    """
+    with db_connection() as db:
+        row = db.execute(
+            "SELECT value_json FROM arc_state "
+            "WHERE arc_id = ? AND key = '_review_target_resource_id'",
+            (reviewer_arc_id,),
+        ).fetchone()
+    if row is None:
+        return None
+    try:
+        value = json.loads(row["value_json"])
+    except (TypeError, json.JSONDecodeError):
+        logger.warning(
+            "reviewer arc %s has non-JSON _review_target_resource_id; ignoring",
+            reviewer_arc_id,
+        )
+        return None
+    if not isinstance(value, int):
+        return None
+    return value
+
+
+def _apply_resource_verdict_if_any(reviewer_arc_id: int, decision: str) -> None:
+    """If the reviewer is a JUDGE gating a Resource, flip its verdict.
+
+    Maps review decisions to Resource template_verdict values:
+      'approve' -> 'approved'
+      'reject'  -> 'rejected'
+
+    Silent no-op when:
+      - Reviewer isn't a JUDGE (REVIEWER verdicts are advisory).
+      - Reviewer has no ``_review_target_resource_id`` state key.
+      - The underlying ``mark_template_verdict`` call raises (logged at
+        warning level; verdict flow continues).
+    """
+    # Only JUDGE verdicts flip Resource trust — REVIEWER verdicts are
+    # advisory for both arcs and Resources.
+    with db_connection() as db:
+        row = db.execute(
+            "SELECT agent_type FROM arcs WHERE id = ?",
+            (reviewer_arc_id,),
+        ).fetchone()
+    if not row or row["agent_type"] != "JUDGE":
+        return
+
+    resource_id = _get_review_target_resource_id(reviewer_arc_id)
+    if resource_id is None:
+        return
+
+    verdict = "approved" if decision == "approve" else "rejected"
+    try:
+        # Imported lazily to avoid a cycle if resources package grows to
+        # depend on workflows helpers.
+        from ..resources import mark_template_verdict
+        mark_template_verdict(resource_id, verdict)
+    except ValueError as exc:
+        logger.warning(
+            "mark_template_verdict(%s, %r) from judge arc %s failed: %s",
+            resource_id, verdict, reviewer_arc_id, exc,
+        )
 
 
 def _get_review_arcs_for_target(target_arc_id: int) -> list[int]:

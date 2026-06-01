@@ -126,7 +126,11 @@ def _make_dispatch_fn(
         request_queue: Queue for sending requests to the dispatcher.
         response_queue: Queue for receiving results from the dispatcher.
         allowed_tools: If not None, restrict dispatch to these tool names.
-        dispatch_log: Mutable list where each dispatch call is logged.
+        dispatch_log: Mutable list where each dispatch call is recorded.
+            Entries contain ``tool_name`` and byte-size counts only;
+            ``params`` and ``result`` are intentionally NOT recorded so
+            that the log can never leak plaintext untrusted arc state.
+            See docs/trust-invariants.md I7.
     """
 
     def dispatch(tool_name: str, params: dict | None = None) -> Any:
@@ -160,7 +164,26 @@ def _make_dispatch_fn(
                 f"dispatch params must be JSON-serializable: {exc}"
             ) from exc
 
-        log_entry = {"tool_name": tool_name, "params": params}
+        # Audit-only entry: record that this tool was dispatched, but NEVER
+        # record `params` or `result`. The executor may be running code
+        # produced by an untrusted arc, in which case the params include
+        # plaintext untrusted state (e.g. ``state.set(arc_id=<untrusted>,
+        # value=<plaintext>)``). Storing those values in
+        # ``ExecutionResult.dispatch_log`` would put plaintext on a
+        # return-value field that callers could trivially persist,
+        # undermining the I7 at-rest encryption guarantee for non-trusted
+        # arcs. See docs/trust-invariants.md I7.
+        #
+        # The log keeps ``tool_name`` (already public — it's the name of
+        # the dispatched tool) plus byte-size counts so callers can detect
+        # "user code dispatched a 5 MB state.set" without seeing the
+        # contents. Tool-name-only is sufficient for the current consumer
+        # (a single test); the size fields are cheap defense-in-depth for
+        # any future debugging tool.
+        log_entry = {
+            "tool_name": tool_name,
+            "params_size": len(request_json),
+        }
 
         # Send request and wait for response
         request_queue.put(request_json)
@@ -170,14 +193,17 @@ def _make_dispatch_fn(
         response = json.loads(response_json)
 
         if "error" in response:
-            log_entry["error"] = response["error"]
+            # Error strings can also reflect data the tool tried to act on
+            # (e.g. "no such key: <secret-derived-name>"). Record a
+            # redacted boolean instead of the error text; the full error
+            # is still raised so user code sees the actual failure.
+            log_entry["error"] = True
             dispatch_log.append(log_entry)
             raise RuntimeError(f"dispatch({tool_name}) failed: {response['error']}")
 
-        result = response.get("result")
-        log_entry["result"] = result
+        log_entry["result_size"] = len(response_json)
         dispatch_log.append(log_entry)
-        return result
+        return response.get("result")
 
     return dispatch
 
@@ -411,6 +437,9 @@ class RestrictedExecutor:
             try:
                 output = _print_obj()
             except Exception:
+                # Intentionally suppress: PrintCollector failure shouldn't fail
+                # the whole execution; just lose captured stdout.
+                logger.info("PrintCollector _print() failed", exc_info=True)
                 output = ""
         else:
             output = ""
@@ -478,8 +507,8 @@ class RestrictedExecutor:
                 # Ensure result is JSON-serializable
                 response_json = json.dumps({"result": result})
             except Exception as exc:
-                logger.warning(
-                    "Dispatch error for tool %s: %s", tool_name, exc,
+                logger.exception(
+                    "Dispatch error for tool %s", tool_name,
                 )
                 response_json = json.dumps({"error": str(exc)})
 

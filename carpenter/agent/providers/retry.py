@@ -2,7 +2,7 @@
 
 Encapsulates the retry loop, exponential backoff with jitter, and
 circuit-breaker integration that was previously duplicated across the
-ollama, local, and tinfoil provider modules.
+ollama and tinfoil provider modules.
 
 The anthropic provider has additional rate-limiter integration and
 429-specific handling, so it keeps its own retry loop but could be
@@ -29,7 +29,7 @@ def build_openai_messages(system: str, messages: list[dict]) -> list[dict]:
     """Build an OpenAI-format messages array with a system prompt.
 
     Converts the canonical message list into the format expected by
-    OpenAI-compatible APIs (Ollama, llama.cpp, Tinfoil, etc.),
+    OpenAI-compatible APIs (Ollama, Tinfoil, etc.),
     preserving tool-call threading.
 
     Args:
@@ -67,7 +67,7 @@ def retry_with_breaker(
 ) -> T:
     """Execute *fn* with retry, exponential backoff, and circuit-breaker.
 
-    This is the shared retry loop used by the ollama, local, and tinfoil
+    This is the shared retry loop used by the ollama and tinfoil
     providers. On each attempt it:
 
     1. Checks the circuit breaker -- raises CircuitOpenError if open.

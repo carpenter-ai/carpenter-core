@@ -7,7 +7,7 @@ The rest of the codebase works with one canonical format (Anthropic-like):
 - stop_reason: "end_turn" | "tool_use" | "max_tokens"
 - usage: {input_tokens, output_tokens}
 
-Two standards: "anthropic" (native) and "openai" (Ollama, llama.cpp, Tinfoil).
+Two standards: "anthropic" (native) and "openai" (Ollama, Tinfoil).
 Providers declare their standard via the ``api_standards`` config dict.
 """
 
@@ -23,7 +23,6 @@ logger = logging.getLogger(__name__)
 _DEFAULT_STANDARDS = {
     "anthropic": "anthropic",
     "ollama": "openai",
-    "local": "openai",
     "tinfoil": "openai",
     "chain": "anthropic",
 }

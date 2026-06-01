@@ -21,7 +21,7 @@ from .coding_change_handler import (
     _notify_and_respond,
 )
 from ...tool_backends import git as git_backend
-from ...tool_backends import forgejo_api as forgejo_api_backend
+from ...forges import get_forge_provider
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +80,7 @@ async def handle_fetch_pr(work_id: int, payload: dict):
 
     try:
         # Fetch PR metadata
-        pr_result = forgejo_api_backend.handle_get_pr({
+        pr_result = get_forge_provider().get_pr({
             "repo_owner": repo_owner,
             "repo_name": repo_name,
             "pr_number": pr_number,
@@ -99,7 +99,7 @@ async def handle_fetch_pr(work_id: int, payload: dict):
         _set_arc_state(arc_id, "pr_metadata", pr_result)
 
         # Fetch PR diff
-        diff_result = forgejo_api_backend.handle_get_pr_diff({
+        diff_result = get_forge_provider().get_pr_diff({
             "repo_owner": repo_owner,
             "repo_name": repo_name,
             "pr_number": pr_number,
@@ -204,7 +204,7 @@ async def handle_ai_review(work_id: int, payload: dict):
                         response_text += block.get("text", "")
             elif isinstance(content, str):
                 response_text = content
-            # OpenAI-style response (ollama, local)
+            # OpenAI-style response (ollama, tinfoil)
             if not response_text:
                 choices = response.get("choices", [])
                 if choices:
@@ -320,7 +320,7 @@ async def handle_post_review(work_id: int, payload: dict):
             })
 
     try:
-        post_result = forgejo_api_backend.handle_post_pr_review({
+        post_result = get_forge_provider().post_pr_review({
             "repo_owner": repo_owner,
             "repo_name": repo_name,
             "pr_number": pr_number,

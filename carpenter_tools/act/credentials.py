@@ -1,5 +1,7 @@
-"""Credential management tools. Tier 1: callback to platform."""
-from .._callback import callback
+"""Credential management tool declarations.
+
+See ``carpenter_tools`` package docstring for the invocation model.
+"""
 from ..tool_meta import tool
 
 
@@ -12,15 +14,11 @@ def request(key: str, label: str = "", description: str = "") -> dict:
     Returns a dict with request_id and URL the user should visit.
 
     Args:
-        key: Env var name (e.g. 'FORGEJO_TOKEN', 'ANTHROPIC_API_KEY').
+        key: Env var name (e.g. 'GIT_TOKEN', 'ANTHROPIC_API_KEY').
         label: Human-readable label for the form.
         description: Explanation of what the credential is used for.
     """
-    return callback("credentials.request", {
-        "key": key,
-        "label": label,
-        "description": description,
-    })
+    ...
 
 
 @tool(local=True, readonly=False, side_effects=True,
@@ -28,10 +26,10 @@ def request(key: str, label: str = "", description: str = "") -> dict:
 def verify(key: str) -> dict:
     """Test a stored credential by making a verification call.
 
-    For FORGEJO_TOKEN, calls the forge API to check validity.
+    For GIT_TOKEN/FORGEJO_TOKEN, delegates to the configured forge to check validity.
     For other keys, checks non-empty. Never returns the credential value.
     """
-    return callback("credentials.verify", {"key": key})
+    ...
 
 
 @tool(local=True, readonly=False, side_effects=True,
@@ -43,6 +41,6 @@ def import_file(path: str, key: str) -> dict:
 
     Args:
         path: Absolute path to the file containing the credential.
-        key: Env var name to store under (e.g. 'FORGEJO_TOKEN').
+        key: Env var name to store under (e.g. 'GIT_TOKEN').
     """
-    return callback("credentials.import_file", {"path": path, "key": key})
+    ...

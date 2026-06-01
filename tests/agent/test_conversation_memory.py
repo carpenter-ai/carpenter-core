@@ -211,7 +211,13 @@ class TestPriorContextPrefersSummary:
     """Test that prior context uses summary when available."""
 
     def test_uses_summary_over_raw_messages(self, test_db, monkeypatch):
-        """When previous conversation has a summary, use it instead of raw tail."""
+        """When previous conversation has a summary, use it instead of raw tail.
+
+        Prior summary now lives in the **per-turn context block** attached to
+        the live user message (not the cached system prompt) — see
+        invocation._build_per_turn_context_block. We verify the summary
+        lands somewhere in the API call, allowing either location.
+        """
         # Create previous conversation with summary
         conv1 = conversation.create_conversation()
         conversation.add_message(conv1, "user", "Old raw message")
@@ -221,11 +227,11 @@ class TestPriorContextPrefersSummary:
         conv2 = conversation.create_conversation()
         conversation.add_message(conv2, "user", "New message")
 
-        # Mock the AI call to capture what system prompt was built
-        captured_system = []
+        # Mock the AI call to capture what system prompt + messages were sent
+        captured = []
 
         def mock_call_with_retries(system, messages, **kwargs):
-            captured_system.append(system)
+            captured.append((system, messages))
             return {
                 "content": [{"type": "text", "text": "Response"}],
                 "stop_reason": "end_turn",
@@ -258,21 +264,28 @@ class TestPriorContextPrefersSummary:
 
         result = invocation.invoke_for_chat("New message", _message_already_saved=False)
 
-        assert len(captured_system) == 1
-        assert "Previous conversation summary" in captured_system[0]
+        assert len(captured) == 1
+        system_text, messages = captured[0]
+        # Serialize everything we sent into one searchable blob
+        blob = system_text + "\n" + json.dumps(messages)
+        assert "Previous conversation summary" in blob
 
     def test_falls_back_to_raw_messages(self, test_db, monkeypatch):
-        """When previous conversation has no summary, use raw tail messages."""
+        """When previous conversation has no summary, use raw tail messages.
+
+        Prior tail is now carried in the per-turn context block on the
+        live user message rather than in the cached system prompt.
+        """
         conv1 = conversation.create_conversation()
         conversation.add_message(conv1, "user", "Old raw message content")
 
         conv2 = conversation.create_conversation()
         conversation.add_message(conv2, "user", "New message")
 
-        captured_system = []
+        captured = []
 
         def mock_call_with_retries(system, messages, **kwargs):
-            captured_system.append(system)
+            captured.append((system, messages))
             return {
                 "content": [{"type": "text", "text": "Response"}],
                 "stop_reason": "end_turn",
@@ -299,9 +312,11 @@ class TestPriorContextPrefersSummary:
         from carpenter.agent import invocation
         result = invocation.invoke_for_chat("New message", _message_already_saved=False)
 
-        assert len(captured_system) == 1
-        # Should contain raw message content, not summary
-        assert "Old raw message content" in captured_system[0]
+        assert len(captured) == 1
+        system_text, messages = captured[0]
+        blob = system_text + "\n" + json.dumps(messages)
+        # Should contain raw message content somewhere in the call
+        assert "Old raw message content" in blob
 
 
 class TestSchemaMigration:

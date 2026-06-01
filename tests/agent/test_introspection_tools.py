@@ -448,7 +448,7 @@ class TestSaveApiCall:
             "cache_creation_input_tokens": 500,
             "cache_read_input_tokens": 3000,
         }
-        _save_api_call(c_id, "claude-haiku-4-5-20251001", usage, "end_turn")
+        _save_api_call(c_id, "claude-haiku-4-5", usage, "end_turn")
 
         db = get_db()
         try:
@@ -457,7 +457,7 @@ class TestSaveApiCall:
             db.close()
         assert row is not None
         assert row["conversation_id"] == c_id
-        assert row["model"] == "claude-haiku-4-5-20251001"
+        assert row["model"] == "claude-haiku-4-5"
         assert row["input_tokens"] == 1000
         assert row["output_tokens"] == 200
         assert row["cache_creation_input_tokens"] == 500
@@ -476,6 +476,34 @@ class TestSaveApiCall:
         assert row["input_tokens"] == 0
         assert row["cache_read_input_tokens"] == 0
 
+    def test_arc_only_call_with_null_conversation(self):
+        """Arc-only coding-agent calls log with conversation_id=NULL and
+        arc_id set, so they show up in the api_calls metrics table even
+        though they aren't part of a chat conversation."""
+        _save_api_call(
+            None,
+            "claude-haiku-4-5-20251001",
+            {"input_tokens": 1234, "output_tokens": 56},
+            "end_turn",
+            arc_id=99,
+        )
+
+        db = get_db()
+        try:
+            row = db.execute(
+                "SELECT * FROM api_calls "
+                "WHERE conversation_id IS NULL AND arc_id = 99 "
+                "ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        finally:
+            db.close()
+        assert row is not None
+        assert row["conversation_id"] is None
+        assert row["arc_id"] == 99
+        assert row["input_tokens"] == 1234
+        assert row["output_tokens"] == 56
+        assert row["model"] == "claude-haiku-4-5-20251001"
+
 
 class TestListApiCalls:
     def test_empty(self):
@@ -484,7 +512,7 @@ class TestListApiCalls:
 
     def test_shows_calls(self):
         c_id = conversation.get_or_create_conversation()
-        _save_api_call(c_id, "claude-haiku-4-5-20251001", {
+        _save_api_call(c_id, "claude-haiku-4-5", {
             "input_tokens": 500, "output_tokens": 50,
             "cache_read_input_tokens": 400, "cache_creation_input_tokens": 0,
         }, "end_turn")

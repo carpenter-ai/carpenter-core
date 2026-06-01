@@ -57,6 +57,14 @@ def read_file(tool_input, **kwargs):
     if error:
         return error
     from carpenter.tool_backends import files as files_backend
+    # I2 enforcement on the chat path: chat agents are TRUSTED-only
+    # (docs/design.md §"Agent Types and Capabilities") and cannot
+    # read bytes produced by a non-trusted writer.  handle_read's
+    # cross-trust check requires a _caller_arc_id which the chat tool
+    # cannot supply, so we consult provenance directly here.
+    refusal = files_backend.chat_read_provenance_check(tool_input["path"])
+    if refusal:
+        return refusal
     result = files_backend.handle_read(tool_input)
     return result.get("content", "(empty)")
 

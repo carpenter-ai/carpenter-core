@@ -112,17 +112,12 @@ class TestConstrainedEnforcement:
         assert is_non_trusted(arc["integrity_level"]) is True
 
     def test_constrained_arc_blocked_from_untrusted_data(self):
-        """Constrained arcs (like trusted) cannot access _UNTRUSTED_DATA_TOOLS.
-
-        Note: This tests the callback enforcement. Constrained arcs have
-        integrity_level != 'trusted', but the enforcement path for
-        _UNTRUSTED_DATA_TOOLS blocks trusted arcs. Constrained arcs are
-        actually allowed to access untrusted data (they're non-trusted).
-        """
-        # Constrained arcs can read untrusted data (they ARE non-trusted)
-        # This is consistent with the existing check which only blocks
-        # caller_integrity == "trusted"
-        pass  # Enforcement tested via HTTP in test_taint_enforcement.py
+        """Constrained arcs are non-trusted, so they are not blocked from
+        untrusted data by the dispatch-level trust check (which only gates
+        ``integrity_level == 'trusted'``).  The trust boundary for
+        constrained arcs is handled via Resource-level review pipelines,
+        not the retired ``_UNTRUSTED_DATA_TOOLS`` allowlist."""
+        pass  # Constrained arcs are non-trusted; no dispatch-level block.
 
     def test_individual_constrained_arc_rejected(self):
         """Cannot create individual constrained arc (same as untrusted)."""

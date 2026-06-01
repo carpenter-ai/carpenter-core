@@ -19,7 +19,7 @@ class TestHandleCall:
         current = config.CONFIG.copy()
         current["model_roles"] = {
             **current.get("model_roles", {}),
-            "default_step": "anthropic:claude-sonnet-4-20250514",
+            "default_step": "anthropic:claude-sonnet-4-6",
         }
         monkeypatch.setattr(config, "CONFIG", current)
 
@@ -36,11 +36,11 @@ class TestHandleCall:
         ):
             result = lm_backend.handle_call({
                 "prompt": "Say hello",
-                "model": "anthropic:claude-sonnet-4-20250514",
+                "model": "anthropic:claude-sonnet-4-6",
             })
 
         assert result["content"] == "Hello world"
-        assert result["model"] == "anthropic:claude-sonnet-4-20250514"
+        assert result["model"] == "anthropic:claude-sonnet-4-6"
         assert result["role"] == "assistant"
         assert result["usage"]["input_tokens"] == 10
 
@@ -49,7 +49,7 @@ class TestHandleCall:
         current = config.CONFIG.copy()
         current["model_roles"] = {
             **current.get("model_roles", {}),
-            "default_step": "anthropic:claude-sonnet-4-20250514",
+            "default_step": "anthropic:claude-sonnet-4-6",
         }
         monkeypatch.setattr(config, "CONFIG", current)
 
@@ -70,15 +70,15 @@ class TestHandleCall:
             })
 
         assert result["content"] == "OK"
-        assert result["model"] == "anthropic:claude-sonnet-4-20250514"
+        assert result["model"] == "anthropic:claude-sonnet-4-6"
 
     def test_rejects_unknown_model(self, test_db, monkeypatch):
         """Models not in model_roles are rejected."""
         current = config.CONFIG.copy()
         current["model_roles"] = {
-            "default": "anthropic:claude-sonnet-4-20250514",
-            "default_step": "anthropic:claude-sonnet-4-20250514",
-            "chat": "anthropic:claude-sonnet-4-20250514",
+            "default": "anthropic:claude-sonnet-4-6",
+            "default_step": "anthropic:claude-sonnet-4-6",
+            "chat": "anthropic:claude-sonnet-4-6",
         }
         monkeypatch.setattr(config, "CONFIG", current)
 
@@ -95,7 +95,7 @@ class TestHandleCall:
         current = config.CONFIG.copy()
         current["model_roles"] = {
             **current.get("model_roles", {}),
-            "default_step": "anthropic:claude-sonnet-4-20250514",
+            "default_step": "anthropic:claude-sonnet-4-6",
         }
         current["agent_roles"] = {
             "test-role": {
@@ -129,7 +129,7 @@ class TestHandleCall:
         current = config.CONFIG.copy()
         current["model_roles"] = {
             **current.get("model_roles", {}),
-            "default_step": "anthropic:claude-sonnet-4-20250514",
+            "default_step": "anthropic:claude-sonnet-4-6",
         }
         monkeypatch.setattr(config, "CONFIG", current)
 
@@ -142,7 +142,7 @@ class TestHandleCall:
         ):
             result = lm_backend.handle_call({
                 "prompt": "Test",
-                "model": "anthropic:claude-sonnet-4-20250514",
+                "model": "anthropic:claude-sonnet-4-6",
             })
 
         assert "error" in result

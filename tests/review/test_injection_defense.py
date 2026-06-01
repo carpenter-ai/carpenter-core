@@ -50,7 +50,7 @@ class TestHistogramLLMAnalysis:
     @pytest.fixture(autouse=True)
     def setup_config(self, test_db, monkeypatch):
         current = config.CONFIG.copy()
-        current["review"] = {"reviewer_model": "anthropic:claude-sonnet-4-20250514"}
+        current["review"] = {"reviewer_model": "anthropic:claude-sonnet-4-6"}
         current["claude_api_key"] = "test-key"
         monkeypatch.setattr(config, "CONFIG", current)
 

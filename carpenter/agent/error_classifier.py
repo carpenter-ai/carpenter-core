@@ -20,7 +20,7 @@ class ErrorInfo:
         message: User-facing error message (actionable and clear)
         status_code: HTTP status code if applicable
         retry_after: Seconds to wait before retrying (from retry-after header)
-        model: Model that was being called (e.g., "claude-3-5-sonnet-20241022")
+        model: Model that was being called (e.g., "claude-sonnet-4-6")
         provider: Provider name (e.g., "anthropic", "ollama", "chain")
         raw_error: String representation of the original exception
         timestamp: ISO 8601 timestamp when error was classified

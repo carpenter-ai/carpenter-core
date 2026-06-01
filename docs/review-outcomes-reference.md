@@ -195,8 +195,42 @@ MAJOR (Auto-escalated)
 Human Decision
 ```
 
+## Quarantined Quality Reviewer (QQR) — dual-reviewer composition
+
+When formal verification is **disabled** or **errors out**, the submit-time
+pipeline falls back to LLM judgement. Today, the main reviewer's verdict is
+authoritative on this fallback path. The Quarantined Quality Reviewer adds a
+second LLM that sees ONLY the sanitised code plus a deterministic, T-only
+summary of the user's request — never the chat history. This narrows the
+auto-approve surface without expanding it.
+
+The composition table for the disabled/errored verification fallback row:
+
+| main reviewer | QQR        | aggregate                                |
+|---------------|------------|------------------------------------------|
+| APPROVE       | APPROVE    | APPROVE                                  |
+| APPROVE       | MAJOR      | MAJOR (NEW — was APPROVE today)          |
+| MAJOR         | APPROVE    | MAJOR                                    |
+| MAJOR         | MAJOR      | MAJOR                                    |
+| MINOR         | any        | REWORK (main reviewer authoritative)     |
+| any           | ABSTAIN    | per main reviewer alone (today's path)   |
+| any           | not run    | per main reviewer alone (today's path)   |
+
+QQR ABSTAIN is the fail-closed sentinel returned on timeout / network
+error / malformed JSON / explicit disable. The aggregator records an
+``arc_history`` audit entry (``qqr_abstain``) and falls back to today's
+behaviour. **An outage cannot silently approve more code than today** —
+the new table only ever upgrades outcomes to MAJOR.
+
+The verified and ran-but-not-verified verification paths are unchanged:
+machine-verified ⇒ APPROVE, ran-but-not-verified ⇒ MAJOR (forced human
+review). QQR is advisory on those paths.
+
+See ``carpenter/review/qqr.py`` and ``determine_outcome`` in
+``carpenter/review/pipeline.py``.
+
 ## See Also
 
-- **Implementation**: `carpenter/review/pipeline.py`
-- **Tests**: `tests/review/test_review_outcomes.py`
+- **Implementation**: `carpenter/review/pipeline.py`, `carpenter/review/qqr.py`
+- **Tests**: `tests/review/test_review_outcomes.py`, `tests/review/test_qqr.py`
 - **Coding rules**: `coding-guidelines.md`

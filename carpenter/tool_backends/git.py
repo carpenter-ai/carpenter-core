@@ -4,7 +4,9 @@ This is a Tier 1 (callback) backend: credentials stay on the platform side.
 Executors invoke these handlers via HTTP POST callbacks.
 
 Uses dulwich (pure Python git library) instead of shelling out to git CLI.
-Forgejo-specific API handlers (PRs, webhooks, reviews) live in forgejo_api.py.
+Forge-specific API handlers (PRs, webhooks, reviews) live in
+``carpenter/forges/<provider>.py`` and are dispatched via the forge-provider
+registry (see ``carpenter/forges/__init__.py``).
 """
 import io
 import logging
@@ -145,6 +147,7 @@ def handle_setup_repo(params: dict) -> dict:
         try:
             _run_dulwich(porcelain.clone, repo_url, workspace)
         except Exception as e:
+            logger.exception("Failed to clone %s to %s", repo_url, workspace)
             return {"success": False, "error": str(e)}
 
         # Rename origin -> upstream: copy URL, remove origin, add upstream
@@ -163,7 +166,8 @@ def handle_setup_repo(params: dict) -> dict:
         try:
             porcelain.checkout(workspace, target=branch.encode())
         except Exception:
-            logger.warning("Could not checkout branch %s", branch)
+            # Intentional: failing to checkout an optional branch is non-fatal.
+            logger.warning("Could not checkout branch %s", branch, exc_info=True)
 
     # Collect remote info
     remotes = _get_remotes_info(workspace)
@@ -188,7 +192,8 @@ def handle_create_branch(params: dict) -> dict:
     try:
         _run_dulwich(porcelain.fetch, workspace, "upstream")
     except Exception as e:
-        logger.warning("Failed to fetch upstream: %s", e)
+        # Intentional: fetch failure is non-fatal; we may still have a usable local copy.
+        logger.warning("Failed to fetch upstream: %s", e, exc_info=True)
 
     if _branch_exists(workspace, branch_name):
         # Branch exists, just check it out
@@ -238,13 +243,15 @@ def handle_commit_and_push(params: dict) -> dict:
             committer=_GIT_IDENTITY,
         )
     except Exception as e:
+        logger.exception("git commit failed in %s on branch %s", workspace, branch_name)
         return {"pushed": False, "error": str(e)}
 
     # Fetch and rebase
     try:
         _run_dulwich(porcelain.fetch, workspace, "upstream")
     except Exception as e:
-        logger.warning("Failed to fetch upstream: %s", e)
+        # Intentional: fetch failure is non-fatal; rebase below will skip if no upstream ref.
+        logger.warning("Failed to fetch upstream: %s", e, exc_info=True)
 
     try:
         r = Repo(workspace)
@@ -252,6 +259,7 @@ def handle_commit_and_push(params: dict) -> dict:
         if upstream_main_ref in r.refs:
             porcelain.rebase(workspace, upstream="upstream/main")
     except Exception as e:
+        logger.exception("git rebase onto upstream/main failed in %s", workspace)
         return {"pushed": False, "error": str(e)}
 
     # Push to fork (force to handle rebased history)
@@ -265,6 +273,7 @@ def handle_commit_and_push(params: dict) -> dict:
             force=True,
         )
     except Exception as e:
+        logger.exception("git push to origin failed for branch %s in %s", branch_name, workspace)
         return {"pushed": False, "error": str(e)}
 
     # Get commit SHA

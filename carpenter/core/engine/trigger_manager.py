@@ -34,10 +34,32 @@ def add_cron(
     event_type: str,
     event_payload: dict | None = None,
 ) -> int:
-    """Add a cron entry. Returns the cron entry ID.
+    """Add (or replace) a cron entry. Returns the cron entry ID.
 
     Validates the cron expression and calculates the first fire time.
     Raises ValueError if the cron expression is invalid.
+
+    Idempotent on name conflict
+    ---------------------------
+    The ``name`` column is UNIQUE. To make this operation safe under
+    caller retries (e.g. an agent whose tool call appeared to fail but
+    actually committed, or a workflow that asks twice for the same
+    schedule), if a cron entry with the same ``name`` already exists
+    this function updates that entry with the new ``cron_expr``,
+    ``event_type``, ``event_payload_json``, and recomputed
+    ``next_fire_at`` rather than raising an ``IntegrityError`` on the
+    UNIQUE constraint. The existing ID is returned so the caller's
+    mental model ("a cron named X now exists with these params")
+    matches reality without needing a remove+re-add round trip.
+
+    Conservative properties:
+    - never silently changes a cron's identity (the name is the
+      user-visible handle)
+    - never creates a duplicate
+    - re-enables a disabled entry of the same name (the caller is
+      explicitly asking for it to exist and fire)
+    - resets ``one_shot`` to FALSE (recurring) since this is
+      ``add_cron`` and not ``add_once``
     """
     if not croniter.is_valid(cron_expr):
         raise ValueError(f"Invalid cron expression: {cron_expr}")
@@ -45,8 +67,29 @@ def add_cron(
     now = datetime.now(timezone.utc)
     cron = croniter(cron_expr, now)
     next_fire = cron.get_next(datetime)
+    payload_json = json.dumps(event_payload) if event_payload else None
+    next_fire_iso = next_fire.isoformat()
 
     with db_transaction() as db:
+        existing = db.execute(
+            "SELECT id FROM cron_entries WHERE name = ?", (name,)
+        ).fetchone()
+        if existing is not None:
+            cron_id = existing["id"]
+            db.execute(
+                "UPDATE cron_entries SET "
+                "cron_expr = ?, event_type = ?, event_payload_json = ?, "
+                "next_fire_at = ?, enabled = TRUE, one_shot = FALSE "
+                "WHERE id = ?",
+                (
+                    cron_expr,
+                    event_type,
+                    payload_json,
+                    next_fire_iso,
+                    cron_id,
+                ),
+            )
+            return cron_id
         cursor = db.execute(
             "INSERT INTO cron_entries "
             "(name, cron_expr, event_type, event_payload_json, next_fire_at) "
@@ -55,8 +98,8 @@ def add_cron(
                 name,
                 cron_expr,
                 event_type,
-                json.dumps(event_payload) if event_payload else None,
-                next_fire.isoformat(),
+                payload_json,
+                next_fire_iso,
             ),
         )
         cron_id = cursor.lastrowid
@@ -102,8 +145,30 @@ def add_once(
 
     # Use a sentinel cron_expr that is never evaluated for one-shot entries
     sentinel_expr = "0 0 31 2 *"
+    payload_json = json.dumps(event_payload) if event_payload else None
+    fire_iso = dt_utc.isoformat()
 
     with db_transaction() as db:
+        # Idempotent on name conflict (same rationale as add_cron).
+        existing = db.execute(
+            "SELECT id FROM cron_entries WHERE name = ?", (name,)
+        ).fetchone()
+        if existing is not None:
+            cron_id = existing["id"]
+            db.execute(
+                "UPDATE cron_entries SET "
+                "cron_expr = ?, event_type = ?, event_payload_json = ?, "
+                "next_fire_at = ?, enabled = TRUE, one_shot = TRUE "
+                "WHERE id = ?",
+                (
+                    sentinel_expr,
+                    event_type,
+                    payload_json,
+                    fire_iso,
+                    cron_id,
+                ),
+            )
+            return cron_id
         cursor = db.execute(
             "INSERT INTO cron_entries "
             "(name, cron_expr, event_type, event_payload_json, next_fire_at, one_shot) "
@@ -112,8 +177,8 @@ def add_once(
                 name,
                 sentinel_expr,
                 event_type,
-                json.dumps(event_payload) if event_payload else None,
-                dt_utc.isoformat(),
+                payload_json,
+                fire_iso,
                 True,
             ),
         )

@@ -60,7 +60,9 @@ def _get_trusted_imports() -> frozenset[str]:
         if override:
             return frozenset(override)
     except Exception:
-        pass
+        # Intentional fallback: if config is unavailable (early import,
+        # missing keys, etc.) fall through to the safe built-in default.
+        logger.info("Falling back to built-in trusted_imports", exc_info=True)
     return _TRUSTED_IMPORTS
 
 
@@ -126,7 +128,9 @@ def _get_network_modules() -> frozenset[str]:
         if override:
             return frozenset(override)
     except Exception:
-        pass
+        # Intentional fallback: if config is unavailable, use the safe
+        # built-in default network-module set.
+        logger.info("Falling back to built-in network_modules", exc_info=True)
     return _DEFAULT_NETWORK_MODULES
 
 

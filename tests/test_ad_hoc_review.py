@@ -68,19 +68,20 @@ def test_request_ai_review_creates_reviewer_arc():
     assert reviewer["agent_type"] == "REVIEWER"
     assert reviewer["arc_role"] == "worker"
     assert reviewer["step_order"] == 2  # same as await-approval
-    assert reviewer["agent_config_id"] is not None
+    assert reviewer["model_policy_id"] is not None
 
-    # Verify agent_config points to a Sonnet model
+    # Verify model_policy points to a Sonnet model
     db = get_db()
     try:
         row = db.execute(
-            "SELECT model FROM agent_configs WHERE id = ?",
-            (reviewer["agent_config_id"],),
+            "SELECT model FROM model_policies WHERE id = ?",
+            (reviewer["model_policy_id"],),
         ).fetchone()
     finally:
         db.close()
 
     assert row is not None
+    assert row["model"] is not None
     assert "sonnet" in row["model"].lower()
 
 

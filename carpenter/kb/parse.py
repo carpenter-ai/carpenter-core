@@ -73,13 +73,24 @@ def replace_auto_sections(content: str, sections: dict[str, str]) -> str:
 def extract_title_and_description(content: str) -> tuple[str, str]:
     """Extract H1 as title, first non-heading paragraph as description.
 
+    Skips a leading YAML frontmatter block (delimited by '---' lines).
+
     Returns:
         (title, description) tuple. Empty strings if not found.
     """
     title = ""
     description = ""
 
-    for line in content.splitlines():
+    lines = content.splitlines()
+    i = 0
+    # Skip leading YAML frontmatter.
+    if lines and lines[0].strip() == "---":
+        for j in range(1, len(lines)):
+            if lines[j].strip() == "---":
+                i = j + 1
+                break
+
+    for line in lines[i:]:
         stripped = line.strip()
         if not stripped:
             continue

@@ -18,6 +18,8 @@ The conversation_id ({{ source_conv_id }}) and arc_id ({{ arc_id }}) are auto-in
 - `JSON("...")` — JSON-encoded payloads
 - `UnstructuredText("...")` — free-form prose, chat messages, goals, anything that isn't one of the above
 
+Additional types include `Domain`, `FilePath`, `Command`, `IntRange`, `Enum`, `Pattern`. See `kb/security/typed-declarations.md` for the full list and guidance. Do not fight the allowlists — if a value you need is rejected, ask the platform to expand the allowlist rather than working around it.
+
 Exempt (do NOT wrap): dict **keys** (`{"foo": Label("bar")}` — left side is fine bare), f-string interior fragments (`f"id={x}"` — wrap the whole f-string with `UnstructuredText(f"...")` if it's a value), keyword argument names, and import module names.
 
 ## Correct send-a-message pattern
@@ -40,6 +42,16 @@ arc.create(name=Label("fetch-data"), goal=UnstructuredText("Pull today's metrics
 from carpenter_tools.act import files
 from carpenter_tools.declarations import WorkspacePath, UnstructuredText
 files.write(path=WorkspacePath("notes.txt"), content=UnstructuredText("hello"))
+```
+
+**When the arc is non-trusted (constrained or untrusted):**
+
+Wrap every raw string in a typed declaration so the platform can track its provenance and enforce default-deny allowlists. For example:
+
+```python
+url = URL("https://example.com")
+note = UnstructuredText("the page mentioned X")
+label = Label("status_ok")
 ```
 
 Do NOT explore or read files. Just write and submit the code immediately.

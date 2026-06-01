@@ -7,26 +7,38 @@ from carpenter.agent import templates
 
 
 def test_render_chat_new():
-    """chat_new template renders with system prompt and active work."""
+    """chat_new template renders the system prompt only.
+
+    Per-turn dynamic content (active work, recent conversations,
+    timestamps, auto-search) lives on the live user message, NOT in the
+    cached system slot — see _build_per_turn_context_block.
+    """
     result = templates.render(
         "chat_new",
         system_prompt="You are helpful.",
     )
     assert "You are helpful." in result
-    assert "Active Work" in result
+    # Active Work / Prior Context / clock are now per-turn context, not
+    # part of the cached system prompt
+    assert "Active Work" not in result
     # new_message should NOT be in system prompt (it's in the messages array)
     assert "New Message" not in result
 
 
 def test_render_chat_compacted():
-    """chat_compacted template renders with prior context."""
+    """chat_compacted template renders the system prompt only.
+
+    Prior context summary now lives in the per-turn context block.
+    """
     result = templates.render(
         "chat_compacted",
         system_prompt="System",
         prior_context_tail="Last 10 lines...",
     )
-    assert "Prior Context" in result
-    assert "Last 10 lines..." in result
+    assert "System" in result
+    # Prior context tail moved to per-turn block — not in cached prefix
+    assert "Prior Context" not in result
+    assert "Last 10 lines..." not in result
     # new_message should NOT be in system prompt
     assert "New Message" not in result
 
@@ -56,8 +68,11 @@ def test_render_review():
 
 def test_render_with_defaults():
     """Templates render fine with missing variables (defaults used)."""
+    # chat_new now contains only {{ system_prompt }}; with no system_prompt
+    # arg the default is the empty string and the template renders empty
+    # but does not crash.
     result = templates.render("chat_new")
-    assert "Active Work" in result
+    assert isinstance(result, str)
 
 
 def test_get_template_unknown():
@@ -95,9 +110,7 @@ def test_user_override_takes_precedence(tmp_path, monkeypatch):
     )
 
     result = templates.render("chat_new", system_prompt="test")
-    assert result == "CUSTOM: test"
-    # Should NOT contain the built-in "Active Work" heading
-    assert "Active Work" not in result
+    assert result.strip() == "CUSTOM: test"
 
 
 def test_builtin_used_when_no_user_override(tmp_path, monkeypatch):
@@ -113,4 +126,3 @@ def test_builtin_used_when_no_user_override(tmp_path, monkeypatch):
     # Should still load the built-in chat_new template
     result = templates.render("chat_new", system_prompt="SP")
     assert "SP" in result
-    assert "Active Work" in result

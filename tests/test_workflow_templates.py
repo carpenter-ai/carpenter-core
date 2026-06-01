@@ -16,8 +16,11 @@ def _copy_templates(tmp_path):
     dest = str(tmp_path / "templates")
     os.makedirs(dest, exist_ok=True)
     for f in os.listdir(TEMPLATES_DIR):
-        if f.endswith((".yaml", ".yml")):
-            shutil.copy(os.path.join(TEMPLATES_DIR, f), dest)
+        src = os.path.join(TEMPLATES_DIR, f)
+        if os.path.isfile(src) and f.endswith((".yaml", ".yml")):
+            shutil.copy(src, dest)
+        elif os.path.isdir(src) and not f.startswith((".", "_")):
+            shutil.copytree(src, os.path.join(dest, f))
     return dest
 
 
@@ -34,7 +37,7 @@ def test_load_writing_repo_template(tmp_path):
 def test_load_templates_from_dir(tmp_path):
     templates_dir = _copy_templates(tmp_path)
     count = template_manager.load_templates_from_dir(templates_dir)
-    assert count == 9
+    assert count == 12
     templates = template_manager.list_templates()
     names = [t["name"] for t in templates]
     assert "writing-repo-change" in names
@@ -43,7 +46,13 @@ def test_load_templates_from_dir(tmp_path):
     assert "external-coding-change" in names
     assert "pr-review" in names
     assert "reflection" in names
-    assert "fetch_web" in names
+    assert "reflection-kb-action" in names
+    assert "reflection-code-action" in names
+    # Gated variants spawned for tainted reflections
+    assert "reflection-kb-action-gated" in names
+    assert "reflection-code-action-gated" in names
+    # skill-kb-review now ships as a template package (phase E2)
+    assert "skill-kb-review" in names
 
 
 def test_find_template_for_resource(tmp_path):

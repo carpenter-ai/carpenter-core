@@ -572,7 +572,7 @@ class TestModelFailover:
         fallback_models = [
             SelectionResult(
                 model_key="haiku",
-                model_id="anthropic:claude-haiku-4-5-20251001",
+                model_id="anthropic:claude-haiku-4-5",
                 score=0.6,
                 reason="fallback",
             ),
@@ -604,7 +604,7 @@ class TestModelFailover:
         # Verify the agent was called with the fallback model
         mock_agent.assert_called_once()
         call_kwargs = mock_agent.call_args
-        assert call_kwargs[1]["agent_config"]["model"] == "anthropic:claude-haiku-4-5-20251001"
+        assert call_kwargs[1]["agent_config"]["model"] == "anthropic:claude-haiku-4-5"
 
     @pytest.mark.asyncio
     async def test_fallback_skips_to_next_on_provider_error(self):
@@ -619,13 +619,13 @@ class TestModelFailover:
         fallback_models = [
             SelectionResult(
                 model_key="sonnet",
-                model_id="anthropic:claude-sonnet-4-5-20250929",
+                model_id="anthropic:claude-sonnet-4-6",
                 score=0.7,
                 reason="fallback-1",
             ),
             SelectionResult(
                 model_key="haiku",
-                model_id="anthropic:claude-haiku-4-5-20251001",
+                model_id="anthropic:claude-haiku-4-5",
                 score=0.5,
                 reason="fallback-2",
             ),
@@ -677,13 +677,13 @@ class TestModelFailover:
         fallback_models = [
             SelectionResult(
                 model_key="sonnet",
-                model_id="anthropic:claude-sonnet-4-5-20250929",
+                model_id="anthropic:claude-sonnet-4-6",
                 score=0.7,
                 reason="fallback-1",
             ),
             SelectionResult(
                 model_key="haiku",
-                model_id="anthropic:claude-haiku-4-5-20251001",
+                model_id="anthropic:claude-haiku-4-5",
                 score=0.5,
                 reason="fallback-2",
             ),
@@ -727,7 +727,7 @@ class TestModelFailover:
         fallback_models = [
             SelectionResult(
                 model_key="haiku",
-                model_id="anthropic:claude-haiku-4-5-20251001",
+                model_id="anthropic:claude-haiku-4-5",
                 score=0.5,
                 reason="fallback",
             ),
@@ -873,25 +873,27 @@ class TestCloneArcForCron:
 
     def test_clone_planner_with_untrusted_batch_rebuilds_review_chain(self):
         """Cloning a PLANNER with EXECUTOR-untrusted+REVIEWER+JUDGE children
-        re-establishes Fernet keys and review-target arc_state via
-        create_untrusted_batch."""
-        from carpenter.core.trust.batch import create_untrusted_batch
+        re-establishes Fernet keys and review-target arc_state via the
+        batch path (not orphan per-arc create_arc calls)."""
+        from carpenter.tool_backends import arc as arc_backend
 
         parent_id = arc_manager.create_arc(
             "cron-root", goal="g", agent_type="PLANNER"
         )
 
         # Build the original untrusted batch as children.
-        result = create_untrusted_batch(
-            [
+        result = arc_backend.handle_create_batch({
+            "arcs": [
                 {
                     "name": "exec",
+                    "parent_id": parent_id,
                     "integrity_level": "untrusted",
                     "agent_type": "EXECUTOR",
                     "step_order": 0,
                 },
                 {
                     "name": "reviewer",
+                    "parent_id": parent_id,
                     "integrity_level": "trusted",
                     "agent_type": "REVIEWER",
                     "reviewer_profile": "security-reviewer",
@@ -899,14 +901,14 @@ class TestCloneArcForCron:
                 },
                 {
                     "name": "judge",
+                    "parent_id": parent_id,
                     "integrity_level": "trusted",
                     "agent_type": "JUDGE",
-                    "reviewer_profile": "security-reviewer",
+                    "reviewer_profile": "judge",
                     "step_order": 2,
                 },
             ],
-            parent_id=parent_id,
-        )
+        })
         assert "arc_ids" in result, result
 
         # Mark parent completed so cron-clone path runs.
@@ -939,14 +941,17 @@ class TestCloneArcForCron:
             assert reviewer_ids == {new_reviewer["id"], new_judge["id"]}
 
             # _reviewer_profile wired on REVIEWER + JUDGE.
-            for rid in (new_reviewer["id"], new_judge["id"]):
+            for rid, expected_profile in (
+                (new_reviewer["id"], "security-reviewer"),
+                (new_judge["id"], "judge"),
+            ):
                 row = db.execute(
                     "SELECT value_json FROM arc_state "
                     "WHERE arc_id = ? AND key = '_reviewer_profile'",
                     (rid,),
                 ).fetchone()
                 assert row is not None
-                assert json.loads(row["value_json"]) == "security-reviewer"
+                assert json.loads(row["value_json"]) == expected_profile
 
             # _review_target points at the new EXECUTOR.
             for rid in (new_reviewer["id"], new_judge["id"]):
@@ -961,16 +966,39 @@ class TestCloneArcForCron:
             db.close()
 
     def test_clone_rejects_untrusted_root(self):
-        """An untrusted root cannot be cloned: standalone untrusted arcs
-        cannot have a sibling reviewer chain."""
-        original_info = {
-            "name": "tainted-root",
-            "goal": "g",
-            "integrity_level": "untrusted",
-            "output_type": "text",
-            "agent_type": "EXECUTOR",
-        }
+        """A non-trusted root arc cannot be cloned standalone."""
+        # Construct an untrusted root by going through the batch path (the
+        # only way create_arc lets us produce an untrusted arc legally) —
+        # we use the batch path with a trusted parent then orphan the
+        # child by manually clearing its parent_id.
+        from carpenter.tool_backends import arc as arc_backend
+        parent_id = arc_manager.create_arc("p", agent_type="PLANNER")
+        result = arc_backend.handle_create_batch({
+            "arcs": [
+                {
+                    "name": "exec",
+                    "parent_id": parent_id,
+                    "integrity_level": "untrusted",
+                    "agent_type": "EXECUTOR",
+                    "step_order": 0,
+                },
+                {
+                    "name": "reviewer",
+                    "parent_id": parent_id,
+                    "integrity_level": "trusted",
+                    "agent_type": "REVIEWER",
+                    "reviewer_profile": "security-reviewer",
+                    "step_order": 1,
+                },
+            ],
+        })
+        assert "arc_ids" in result, result
+        untrusted_id = result["arc_ids"][0]
+
+        original_info = arc_manager.get_arc(untrusted_id)
         new_id = arc_dispatch_handler._clone_arc_for_cron(
-            999, original_info, conversation_id=None
+            untrusted_id, original_info, conversation_id=None
         )
+        # The clone path should refuse rather than produce an orphan
+        # untrusted root with no reviewer chain.
         assert new_id is None

@@ -23,6 +23,7 @@ def emit_status_changed(
     arc_role: str | None = None,
     parent_id: int | None = None,
     agent_type: str | None = None,
+    template_name: str | None = None,
 ) -> int | None:
     """Emit an arc.status_changed event.
 
@@ -36,6 +37,9 @@ def emit_status_changed(
         arc_role: Arc role (worker, coordinator, verifier).
         parent_id: Parent arc ID (None for root arcs).
         agent_type: Agent type (EXECUTOR, PLANNER, etc.).
+        template_name: Workflow template name the arc was created from,
+            if any. Lets subscriptions filter by template (e.g., to
+            prevent recursion when a template fires off its own event).
 
     Returns:
         Event ID, or None if duplicate.
@@ -55,6 +59,8 @@ def emit_status_changed(
         payload["parent_id"] = parent_id
     if agent_type is not None:
         payload["agent_type"] = agent_type
+    if template_name is not None:
+        payload["template_name"] = template_name
 
     # Deterministic idempotency key prevents duplicate events if
     # transition code runs twice

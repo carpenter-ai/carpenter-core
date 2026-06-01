@@ -25,6 +25,8 @@ from .injection_defense import (
 from ..verify.string_declarations import extract_unstructured_text_values
 from .code_sanitizer import sanitize_for_review
 from .code_reviewer import review_code, review_code_adversarial, review_code_for_intent, ReviewResult
+from .qqr import run_qqr, QqrSignal, QqrVerdict, is_enabled as qqr_is_enabled
+from ._summarize import summarize_trusted_request
 from .. import config as config_mod
 from ..agent import conversation as conversation_mod
 
@@ -50,6 +52,7 @@ class PipelineResult:
     advisory_flags: list[str]  # Injection defense findings
     outcome: ReviewOutcome | None = None  # Standardized outcome (None for legacy/cached)
     review_result: ReviewResult | None = None  # Full reviewer result (includes findings in adversarial mode)
+    qqr_signal: QqrSignal | None = None  # Quarantined Quality Reviewer signal (None if QQR not run)
 
 
 # Per-conversation approval cache: conv_id -> set of approved code hashes.
@@ -93,7 +96,36 @@ def _post_advisory_warning(conversation_id: int, review_result: ReviewResult) ->
         conversation_mod.add_message(conversation_id, "system", msg)
         logger.info("Posted advisory warning for verified code: %s", review_result.reason)
     except Exception:  # broad catch: review pipeline may raise anything
-        logger.debug("Could not post advisory warning", exc_info=True)
+        # Intentionally swallow: advisory warning is best-effort; the
+        # underlying review result is already returned to the caller.
+        logger.info(
+            "Could not post advisory warning for conversation %d",
+            conversation_id, exc_info=True,
+        )
+
+
+def _audit_qqr_event(
+    arc_id: int | None,
+    event: str,
+    detail: str,
+) -> None:
+    """Append a QQR-related event to ``arc_history`` when ``arc_id`` is known.
+
+    Best-effort: any DB error is swallowed (logged) so it cannot block the
+    review pipeline. Used to record ABSTAIN fallbacks and disagreement.
+    """
+    if arc_id is None:
+        return
+    try:
+        from ..core.arcs import manager as arc_manager
+        arc_manager.add_history(
+            arc_id,
+            event,
+            {"detail": detail[:500]},
+            actor="system",
+        )
+    except Exception:
+        logger.debug("QQR audit-log write failed", exc_info=True)
 
 
 def _post_advisory_summary(conversation_id: int, review_result: ReviewResult) -> None:
@@ -292,13 +324,48 @@ def run_review_pipeline(
                 sanitized_code, messages, advisory_flags, arc_id=arc_id,
             )
 
-    # Step 7: Determine outcome using verification + LLM review
+    # Step 6b: Quarantined Quality Reviewer (QQR).
+    # Runs ONLY for full-pipeline profiles that opt in (PROFILE_STEP). QQR
+    # sees only the sanitised code plus a deterministic, T-only summary of
+    # the user's request — never chat history. Its verdict composes with
+    # the main reviewer per the rules in ``determine_outcome``. ABSTAIN
+    # falls back to today's behaviour.
+    qqr_signal: QqrSignal | None = None
+    if (
+        not profile.intent_review_only
+        and getattr(profile, "run_qqr", False)
+        and qqr_is_enabled()
+    ):
+        try:
+            trusted_summary = summarize_trusted_request(conversation_id, arc_id)
+            qqr_signal = run_qqr(
+                sanitized_code,
+                trusted_summary,
+                [
+                    str(f.get("severity", "")).strip().upper()
+                    for f in injection_flags
+                    if f.get("severity")
+                ],
+            )
+        except Exception:
+            # Defensive: any unhandled QQR error is fail-closed → ABSTAIN.
+            logger.exception("QQR raised — falling back to ABSTAIN")
+            qqr_signal = QqrSignal.abstain("unhandled QQR exception")
+        if qqr_signal.verdict == QqrVerdict.ABSTAIN:
+            _audit_qqr_event(
+                arc_id,
+                "qqr_abstain",
+                qqr_signal.abstain_reason or "unspecified",
+            )
+
+    # Step 7: Determine outcome using verification + LLM review (+ QQR)
     llm_outcome = determine_outcome(
         syntax_valid=True,  # We already checked this above
         import_star_violation=False,  # Already checked
         injection_flags=injection_flags,
         ai_review_result=review_result.status,
         ai_review_reason=review_result.reason,
+        qqr_signal=qqr_signal,
     )
 
     # Verification determines the final outcome; LLM is advisory
@@ -314,6 +381,7 @@ def run_review_pipeline(
             advisory_flags=advisory_flags,
             outcome=ReviewOutcome.APPROVE,
             review_result=review_result,
+            qqr_signal=qqr_signal,
         )
 
     # Not verifiable OR verification disabled: use LLM outcome but force
@@ -329,6 +397,7 @@ def run_review_pipeline(
                 advisory_flags=advisory_flags,
                 outcome=ReviewOutcome.REJECTED,
                 review_result=review_result,
+                qqr_signal=qqr_signal,
             )
         return PipelineResult(
             status="major_alert",
@@ -337,10 +406,27 @@ def run_review_pipeline(
             advisory_flags=advisory_flags,
             outcome=ReviewOutcome.MAJOR,
             review_result=review_result,
+            qqr_signal=qqr_signal,
         )
 
     # verification_result is None (disabled or error) — fall back to LLM outcome
+    # (composed with QQR per ``determine_outcome``).
     outcome = llm_outcome
+
+    # Audit-log a QQR-driven upgrade (main approve / QQR major) so the
+    # disagreement is traceable. Only fired when QQR was actually run and
+    # produced a non-ABSTAIN signal that disagrees with the main reviewer.
+    if (
+        qqr_signal is not None
+        and qqr_signal.verdict != QqrVerdict.ABSTAIN
+        and review_result.status == "approve"
+        and qqr_signal.verdict == QqrVerdict.MAJOR
+    ):
+        _audit_qqr_event(
+            arc_id,
+            "qqr_upgraded_to_major",
+            f"main=approve qqr=major category={qqr_signal.category}",
+        )
 
     # Map outcome to legacy status for backward compatibility
     if outcome == ReviewOutcome.APPROVE:
@@ -352,6 +438,7 @@ def run_review_pipeline(
             advisory_flags=advisory_flags,
             outcome=outcome,
             review_result=review_result,
+            qqr_signal=qqr_signal,
         )
     elif outcome == ReviewOutcome.REWORK:
         return PipelineResult(
@@ -361,15 +448,29 @@ def run_review_pipeline(
             advisory_flags=advisory_flags,
             outcome=outcome,
             review_result=review_result,
+            qqr_signal=qqr_signal,
         )
     elif outcome == ReviewOutcome.MAJOR:
+        # When the upgrade to MAJOR is QQR-driven (main reviewer would
+        # have approved), surface a clearer reason for the human reviewer.
+        major_reason = review_result.reason
+        if (
+            qqr_signal is not None
+            and qqr_signal.verdict == QqrVerdict.MAJOR
+            and review_result.status == "approve"
+        ):
+            major_reason = (
+                "Quarantined Quality Reviewer (QQR) flagged MAJOR while the "
+                "main reviewer approved — human review required."
+            )
         return PipelineResult(
             status="major_alert",
-            reason=review_result.reason,
+            reason=major_reason,
             sanitized_code=sanitized_code,
             advisory_flags=advisory_flags,
             outcome=outcome,
             review_result=review_result,
+            qqr_signal=qqr_signal,
         )
     else:  # REJECTED
         return PipelineResult(
@@ -379,6 +480,7 @@ def run_review_pipeline(
             advisory_flags=advisory_flags,
             outcome=outcome,
             review_result=review_result,
+            qqr_signal=qqr_signal,
         )
 
 
@@ -388,8 +490,35 @@ def determine_outcome(
     injection_flags: list,
     ai_review_result: str,
     ai_review_reason: str = "",
+    qqr_signal: QqrSignal | None = None,
 ) -> ReviewOutcome:
     """Determine standardized review outcome from all analysis results.
+
+    This function applies *only* to the disabled/errored verification
+    fallback path. The fully-verified and ran-but-not-verified paths are
+    handled directly in :func:`run_review_pipeline` and use today's
+    behaviour unchanged.
+
+    Composition with QQR (the load-bearing change):
+
+    Today, when verification is disabled or errored, the main reviewer's
+    verdict is authoritative. Under QQR, BOTH reviewers must concur for
+    APPROVE; either MAJOR is MAJOR. ABSTAIN falls back to today's
+    main-reviewer-only behaviour with an audit-log entry recorded by the
+    pipeline (not here).
+
+    | main         | QQR        | aggregate |
+    |--------------|------------|-----------|
+    | APPROVE      | APPROVE    | APPROVE   |  (narrower than today)
+    | APPROVE      | MAJOR      | MAJOR     |  (NEW — was APPROVE today)
+    | MAJOR        | APPROVE    | MAJOR     |
+    | MAJOR        | MAJOR      | MAJOR     |
+    | MINOR        | any        | REWORK    |
+    | any          | ABSTAIN    | per main reviewer (today's behaviour)
+    | any          | None       | per main reviewer (QQR not run)
+
+    QQR MINOR is treated as advisory — it does not push to REWORK on its
+    own, because the main reviewer is the canonical correctness judge.
 
     Args:
         syntax_valid: Whether code has valid Python syntax
@@ -397,6 +526,8 @@ def determine_outcome(
         injection_flags: List of injection pattern findings (from injection_defense)
         ai_review_result: AI reviewer status ("approve", "minor", "major")
         ai_review_reason: AI reviewer reason string
+        qqr_signal: Optional QQR signal. When None or ABSTAIN, today's
+            main-reviewer-only behaviour is preserved exactly.
 
     Returns:
         ReviewOutcome enum value
@@ -420,9 +551,29 @@ def determine_outcome(
     if ai_review_result == "major":
         return ReviewOutcome.MAJOR
 
-    # AI reviewer found minor issues → REWORK
+    # AI reviewer found minor issues → REWORK, BUT QQR MAJOR still wins
+    # (the load-bearing principle: "either MAJOR is MAJOR"). QQR APPROVE
+    # or MINOR cannot downgrade the main reviewer's MINOR verdict.
     if ai_review_result == "minor":
+        if (
+            qqr_signal is not None
+            and qqr_signal.verdict == QqrVerdict.MAJOR
+        ):
+            return ReviewOutcome.MAJOR
         return ReviewOutcome.REWORK
 
-    # Otherwise approve
+    # Main reviewer approves. Compose with QQR.
+    if qqr_signal is None or qqr_signal.verdict == QqrVerdict.ABSTAIN:
+        # No QQR (or QQR abstained) → today's behaviour: APPROVE.
+        return ReviewOutcome.APPROVE
+
+    if qqr_signal.verdict == QqrVerdict.MAJOR:
+        # Disagreement: QQR sees a safety/scope concern the main reviewer
+        # missed (or was steered away from by tainted history). MAJOR wins
+        # — narrows today's auto-approve surface.
+        return ReviewOutcome.MAJOR
+
+    # QQR APPROVE or QQR MINOR → preserve main reviewer's APPROVE.
+    # QQR MINOR is advisory only; the main reviewer is authoritative on
+    # correctness because it has full request context.
     return ReviewOutcome.APPROVE

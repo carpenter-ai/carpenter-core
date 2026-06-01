@@ -1,13 +1,7 @@
-"""Config management tools. Tier 1: callback to platform.
+"""Config management tool declarations.
 
-These tools let reviewed code modify safe platform configuration values
-without a server restart.  Only keys in the server-side allowlist can be
-changed; security-critical settings (API keys, sandbox config, etc.) are
-excluded.
-
-For reading config values use carpenter_tools.read.config.get_value.
+See ``carpenter_tools`` package docstring for the invocation model.
 """
-from .._callback import callback
 from ..tool_meta import tool
 
 
@@ -25,7 +19,7 @@ def set_value(key: str, value) -> dict:
     Returns {"status": "ok", "key": key, "value": value, "previous": old}.
     Raises on disallowed keys.
     """
-    return callback("config.set_value", {"key": key, "value": value})
+    ...
 
 
 @tool(local=True, readonly=False, side_effects=True)
@@ -35,4 +29,4 @@ def reload() -> dict:
     Updates the in-memory CONFIG without a server restart.
     Returns {"status": "ok", "reloaded": True}.
     """
-    return callback("config.reload", {})
+    ...

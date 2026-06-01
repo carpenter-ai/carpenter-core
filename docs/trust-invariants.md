@@ -25,20 +25,33 @@ untrusted tool modules (currently `carpenter_tools.act.web`).
 
 ---
 
-## I2 — Trusted arcs cannot access untrusted data tools
+## I2 — Trusted arcs cannot read untrusted Resources
 
-**Statement:** Arcs with `integrity_level='trusted'` are denied access to
-`arc.read_output_UNTRUSTED` and `arc.read_state_UNTRUSTED` — unless the arc's
-agent type has the `can_read_untrusted` capability (REVIEWER, JUDGE).
+**Statement:** Arcs with `integrity_level='trusted'` can only read *trusted*
+Resources — those derived via a reviewed template pipeline whose
+`template_verdict` has been set to `approved`. Raw Resources (produced with
+`produced_by_template=NULL`) and Resources whose `template_verdict` is still
+`pending` or `rejected` are refused by the chat `read_resource` tool with an
+`untrusted` message, and their byte contents are never surfaced to the
+caller. Trusted arc state is reached through the structural tools
+(`arc.get`, `arc.get_history`, `arc.get_plan`, etc.), which only expose
+fields that cannot carry raw tool output. Untrusted data flows across the
+boundary only via the review-arc pipeline: an untrusted arc writes a
+Resource, a REVIEWER (and optionally a JUDGE) runs against it, and only an
+approved verdict unlocks the content for trusted downstream readers.
 
 **Enforcement:**
-- `api/callbacks.py` `_UNTRUSTED_DATA_TOOLS` check — returns HTTP 403 when a
-  trusted arc without `can_read_untrusted` capability attempts to call an
-  untrusted-data tool.
-- `core/trust_types.py` `AGENT_CAPABILITIES` — REVIEWER and JUDGE arcs have
-  `can_read_untrusted=True`.
+- `config_seed/chat_tools/resources.py` `read_resource` — refuses raw
+  Resources (`produced_by_template=NULL`) and any Resource whose
+  `template_verdict` is not `approved`; never echoes the body in the
+  refusal message.
+- `core/resources/trust.py` `is_trusted()` — the predicate the chat tool
+  uses to decide whether to surface content.
+- `core/resources/manager.py` `derive_resource()` and `mark_template_verdict()`
+  — only a reviewed template pipeline can produce an `approved` Resource.
 
-**Tests:** `tests/test_taint_invariants.py::TestI2`
+**Tests:** `tests/test_taint_invariants.py::TestI2`,
+`tests/core/resources/test_read_resource_tool.py`
 
 ---
 
@@ -49,11 +62,22 @@ to `'trusted'`) can only be performed by a JUDGE arc's deterministic policy
 checks via `_check_and_promote()`. JUDGE arcs run platform code (not LLM
 agents) — they execute deterministic policy checks against configured allowlists.
 
+The JUDGE-dispatch wrapper reads the REVIEWER's pending extraction Resource
+via `read_resource_content(caller_arc_id=None)` (the platform-introspection
+path). Passing the JUDGE arc's id would be refused by the I2 defence-in-depth
+gate because JUDGE arcs are `integrity_level='trusted'` and a pending Resource
+has derived trust `'untrusted'`. The JUDGE handler is the *only* mechanism
+that promotes the Resource via `mark_template_verdict('approved')` — reading
+the bytes to make the verdict decision is part of that privileged operation,
+not a tainted downstream read.
+
 **Enforcement:**
 - `core/review_manager.py` `_check_and_promote()` — only promotes when the
   approving verdict comes from an arc with `agent_type='JUDGE'`.
-- `security/judge.py` `run_policy_checks()` — deterministic policy validation.
-- `core/arc_dispatch_handler.py` `_run_judge_checks()` — JUDGE arcs are
+- `security/judge.py` `run_policy_checks()` — deterministic policy validation;
+  reads the REVIEWER's pending Resource and flips `template_verdict` to match
+  the result via `mark_template_verdict()`.
+- `core/arcs/dispatch_handler.py` `_run_judge_checks()` — JUDGE arcs are
   intercepted at dispatch time and run platform code instead of LLM agents.
 
 **Tests:** `tests/test_taint_invariants.py::TestI3`, `tests/security/test_judge.py`
@@ -127,6 +151,78 @@ creation fails if encryption is unavailable.
 
 **Tests:** `tests/test_integration_trust.py::test_full_trust_lifecycle`,
 `tests/core/test_constrained_level.py::TestConstrainedEnforcement::test_constrained_state_encrypted`
+
+### I7 threat model and storage details
+
+The "encrypted at rest" claim above is bounded by these concrete
+assumptions. Operators should read this section before relying on I7 for
+confidentiality against host-level attackers.
+
+**1. `review_keys.fernet_key_encrypted` column name is aspirational.**
+The column stores the *raw* Fernet key bytes, not a key-encrypted-by-
+another-key blob. See `core/trust/encryption.py::generate_arc_key()`,
+which inserts the output of `Fernet.generate_key()` directly, and
+`tool_backends/state.py::_get_arc_fernet_key()`, which reads the bytes
+back and passes them straight to `Fernet(...)`. The column name dates
+from an earlier design that anticipated wrapping keys; the wrapping was
+never implemented. The encryption boundary is therefore the SQLite file
+itself.
+
+**2. Trust boundary is the `platform.db` file.**
+The threat model assumes that read access to `platform.db` (and its
+`*-wal` / `*-shm` sidecars) is restricted to operating-system principals
+that are already trusted by the platform. Any process that can read the
+file can read the Fernet keys in `review_keys` and decrypt every
+ciphertext stored in `arc_state.value_json` for non-trusted arcs.
+
+I7 protects against:
+- A misconfigured backup destination that captures `arc_state` but not
+  `review_keys` (the encrypted column is useless without the key table).
+- An in-process bug or sandbox escape that exposes a single arc's
+  ciphertext but does not have direct DB read access.
+
+I7 does NOT protect against an attacker with filesystem read access to
+the data directory.
+
+**3. Default file mode is 0644 (SQLite default).**
+`carpenter/db.py::init_db()` calls `os.makedirs()` and lets SQLite open
+the file with its default permissions, which on Linux respect the
+process umask but typically result in mode 0644 (world-readable). On a
+single-user host this matches the trust model. **On a multi-user host
+the operator must restrict the data directory** (e.g. `chmod 700
+~/carpenter/data && chmod 600 ~/carpenter/data/platform.db*`) or use
+filesystem-level encryption (LUKS, dm-crypt). The platform does not
+enforce this and does not check it at startup.
+
+**4. `db_encryption_key` (SQLCipher) is optional defense-in-depth.**
+When `db_encryption_key` is set in config and `pysqlcipher3` is
+installed, the entire SQLite file is encrypted at rest using SQLCipher,
+which means the Fernet keys in `review_keys` are also at-rest encrypted.
+This raises the bar from "filesystem read access" to "filesystem read
+access plus the SQLCipher passphrase". It is *not* the primary I7
+boundary — I7 is enforced even when SQLCipher is disabled, but only
+against the limited threats listed in (2). SQLCipher integration fails
+closed if `db_encryption_key` is set without `pysqlcipher3` installed,
+so that an operator who intended to enable disk encryption cannot
+silently get plaintext on disk.
+
+**5. In-memory plaintext is out of scope.**
+I7 only covers state at rest in `arc_state.value_json`. Plaintext values
+are present in memory in the platform process when state is written, in
+tool backend params during dispatch, and (as of this writing) in
+`RestrictedExecutor.ExecutionResult.dispatch_log` for the lifetime of an
+`ExecutionResult` object. Anyone with read access to the platform
+process's memory (a debugger attached to the running daemon, a core
+dump, swap on an unencrypted disk) can read plaintext.
+
+**Storage of dispatched tool params.** `executor/restricted.py` builds
+a `dispatch_log` list on each `ExecutionResult`. This log is held in
+process memory and discarded when the `ExecutionResult` is garbage
+collected — no production caller persists it. The log entries currently
+include `params` and `result` in plaintext, including untrusted arc
+`state.set(value=...)` values. If future code persists `dispatch_log`
+to disk, journal, or DB, it must redact `params` and `result` for
+non-trusted arcs or the I7 guarantee is broken.
 
 ---
 

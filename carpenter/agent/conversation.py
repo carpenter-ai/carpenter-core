@@ -349,6 +349,71 @@ def archive_all_conversations(exclude_ids: list[int] | None = None) -> int:
         return cursor.rowcount
 
 
+_KNOWN_PROVIDERS = frozenset({"anthropic", "ollama", "tinfoil", "chain", "local"})
+
+
+def set_conversation_model_override(
+    conversation_id: int, provider: str, model: str
+) -> None:
+    """Pin a conversation to a specific AI provider/model.
+
+    Only affects subsequent turns on this conversation. The global
+    ``ai_provider`` / ``model_roles`` config is unchanged.
+
+    Args:
+        conversation_id: Conversation to pin.
+        provider: Provider name (anthropic, ollama, tinfoil, chain, local).
+        model: Bare model identifier (e.g. "qwen3.5:9b",
+            "claude-haiku-4-5").
+
+    Raises:
+        ValueError: If provider is not a known provider, or model is empty.
+    """
+    if provider not in _KNOWN_PROVIDERS:
+        raise ValueError(
+            f"Unknown provider {provider!r}. "
+            f"Expected one of: {sorted(_KNOWN_PROVIDERS)}"
+        )
+    if not model or not model.strip():
+        raise ValueError("model must be a non-empty string")
+    with db_transaction() as db:
+        db.execute(
+            "UPDATE conversations SET ai_provider = ?, model = ? WHERE id = ?",
+            (provider, model.strip(), conversation_id),
+        )
+
+
+def clear_conversation_model_override(conversation_id: int) -> None:
+    """Clear a conversation's model override, reverting to the global default."""
+    with db_transaction() as db:
+        db.execute(
+            "UPDATE conversations SET ai_provider = NULL, model = NULL "
+            "WHERE id = ?",
+            (conversation_id,),
+        )
+
+
+def get_conversation_model_override(conversation_id: int) -> str | None:
+    """Return ``"provider:model"`` pin for a conversation, or None.
+
+    Returns None if the conversation has no override, or if either column
+    is NULL (both must be set for the override to take effect).
+    """
+    with db_connection() as db:
+        row = db.execute(
+            "SELECT ai_provider, model FROM conversations WHERE id = ?",
+            (conversation_id,),
+        ).fetchone()
+    if not row:
+        return None
+    keys = row.keys()
+    provider = row["ai_provider"] if "ai_provider" in keys else None
+    model = row["model"] if "model" in keys else None
+    if not provider or not model:
+        return None
+    return f"{provider}:{model}"
+
+
 def set_conversation_title(conversation_id: int, title: str):
     """Set or update a conversation's title."""
     with db_transaction() as db:

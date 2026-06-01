@@ -34,7 +34,6 @@ class AgentType(str, Enum):
 # The dispatch handler runs policy checks directly.
 _DEFAULT_AGENT_CAPABILITIES = {
     AgentType.PLANNER: {
-        "can_read_untrusted": False,
         "can_create_untrusted_arcs": True,
         "allowed_tools": frozenset({
             "arc.create", "arc.add_child", "arc.cancel", "arc.update_status",
@@ -42,33 +41,54 @@ _DEFAULT_AGENT_CAPABILITIES = {
             "arc.get_plan", "arc.get_children_plan",
             "state.get", "state.list",
             "messaging.send", "messaging.ask",
+            # Phase B PR B1: PLANNER may register raw Resources it produces.
+            # The Resource is untrusted at creation (produced_by_template=
+            # NULL); a later template-arc pipeline can derive a trusted
+            # successor from it.
+            "resource.create",
+            # Phase B PR B3: PLANNER may fetch a URL into a raw Resource in
+            # one step (dispatch-only; chat agents route through the
+            # reviewed fetch_web_content pipeline instead).
+            "web.fetch_webpage_to_resource",
         }),
     },
     AgentType.EXECUTOR: {
-        "can_read_untrusted": None,  # depends on arc integrity_level
         "can_create_untrusted_arcs": False,
         "allowed_tools": None,  # all tools via normal session checks
     },
     AgentType.REVIEWER: {
-        "can_read_untrusted": True,
         "can_create_untrusted_arcs": False,
         "allowed_tools": frozenset({
             "arc.get", "arc.get_children", "arc.get_history",
             "arc.get_plan", "arc.get_children_plan",
-            "arc.read_output_UNTRUSTED", "arc.read_state_UNTRUSTED",
             "state.get", "state.set", "state.list",
-            "files.read", "files.list",
+            "files.read", "files.write", "files.list",
             "messaging.send", "messaging.ask",
             "review.submit_verdict",
+            # PR3: template reviewers commit derived Resources by writing
+            # the blob and then calling resource.finalize(..., deprecate_inputs=True).
+            "resource.finalize",
+            # Phase B PR B1: REVIEWER may also register raw Resources when
+            # its review produces new untrusted byte streams that need a
+            # follow-up template pipeline (rather than just a derived
+            # Resource of a declared template).
+            "resource.create",
+            # Phase B PR B3: REVIEWER may pull additional pages into raw
+            # Resources mid-review (e.g. fetch a linked page referenced by
+            # a Resource it's currently reviewing).
+            "web.fetch_webpage_to_resource",
         }),
     },
     AgentType.JUDGE: {
-        "can_read_untrusted": True,
         "can_create_untrusted_arcs": False,
-        "allowed_tools": frozenset(),  # JUDGE runs platform code, no tool calls
+        # JUDGE runs platform code and normally makes no tool calls.  The
+        # one exception is ``resource.submit_verdict``: when a JUDGE's
+        # decision also gates a Resource's template_verdict (see PR3's
+        # fetch_web_content pipeline), the dispatch handler is the
+        # authoritative write path for that flip.
+        "allowed_tools": frozenset({"resource.submit_verdict"}),
     },
     AgentType.CHAT: {
-        "can_read_untrusted": None,  # follows conversation taint rules
         "can_create_untrusted_arcs": True,
         "allowed_tools": None,  # all tools via normal chat dispatch
     },
@@ -83,7 +103,6 @@ def get_agent_capabilities() -> dict:
 
         agent_capabilities:
           PLANNER:
-            can_read_untrusted: false
             can_create_untrusted_arcs: true
             allowed_tools:
               - arc.create
@@ -110,12 +129,6 @@ def get_agent_capabilities() -> dict:
             continue
 
         entry: dict = {}
-        # can_read_untrusted: bool or None
-        if "can_read_untrusted" in config_entry:
-            entry["can_read_untrusted"] = config_entry["can_read_untrusted"]
-        else:
-            entry["can_read_untrusted"] = default_entry.get("can_read_untrusted")
-
         # can_create_untrusted_arcs: bool
         if "can_create_untrusted_arcs" in config_entry:
             entry["can_create_untrusted_arcs"] = config_entry["can_create_untrusted_arcs"]

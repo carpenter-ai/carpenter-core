@@ -73,7 +73,7 @@ Add to `~/carpenter/config.yaml`:
 ```yaml
 review:
   # Model for code review. Falls back to chat_model with a warning if not set.
-  reviewer_model: "anthropic:claude-sonnet-4-20250514"
+  reviewer_model: "anthropic:claude-sonnet-4-6"
 ```
 
 ## Read-Only Isolation: Capability, Not Path Confinement

@@ -540,3 +540,99 @@ class TestShouldCreateVerificationArcs:
 
         arc_info = arc_manager.get_arc(impl_id)
         assert not verification_arcs.should_create_verification_arcs(arc_info)
+
+
+# ── step_role population (D2 PR-β) ────────────────────────────────
+
+
+class TestVerificationStepRolePopulation:
+    """create_verification_arcs populates step_role for each verification arc.
+
+    Per the D2 PR-β refactor, dispatch keys on step_role (with name fallback
+    for legacy arcs). This requires create_verification_arcs to populate
+    step_role on every arc it creates.
+    """
+
+    def test_step_role_populated_for_non_platform_code(self, monkeypatch):
+        """Non-platform code: correctness + judge + docs all have step_role."""
+        import carpenter.config
+        cfg = dict(carpenter.config.CONFIG)
+        cfg["verification"] = {"enabled": True}
+        monkeypatch.setattr("carpenter.config.CONFIG", cfg)
+
+        parent = arc_manager.create_arc("project", goal="Test")
+        impl_id = arc_manager.add_child(parent, "coding-change", goal="Implement")
+        arc_manager.update_status(impl_id, "active")
+        arc_manager.update_status(impl_id, "completed")
+
+        v_ids = verification_arcs.create_verification_arcs(impl_id)
+        # Non-platform code: 3 arcs (correctness, judge, docs)
+        assert len(v_ids) == 3
+
+        roles_by_name = {
+            arc_manager.get_arc(v)["name"]: arc_manager.get_arc(v)["step_role"]
+            for v in v_ids
+        }
+        assert roles_by_name["verify-correctness"] == "verifier-correctness"
+        assert roles_by_name["judge-verification"] == "judge"
+        assert roles_by_name["post-verification-docs"] == "docs"
+
+    def test_step_role_populated_for_platform_code(self, monkeypatch, tmp_path):
+        """Platform code: all 4 verification arcs have correct step_role."""
+        import carpenter.config
+        cfg = dict(carpenter.config.CONFIG)
+        cfg["verification"] = {"enabled": True}
+        monkeypatch.setattr("carpenter.config.CONFIG", cfg)
+
+        parent = arc_manager.create_arc("project", goal="Test")
+        impl_id = arc_manager.add_child(
+            parent, "coding-change-platform",
+            goal=f"Modify platform code in {tmp_path / 'platform'}",
+        )
+        arc_manager.update_status(impl_id, "active")
+        arc_manager.update_status(impl_id, "completed")
+
+        v_ids = verification_arcs.create_verification_arcs(impl_id)
+        assert len(v_ids) == 4
+
+        roles_by_name = {
+            arc_manager.get_arc(v)["name"]: arc_manager.get_arc(v)["step_role"]
+            for v in v_ids
+        }
+        # All four kinds populated with the canonical role string used by
+        # the dispatch handler (matches dispatch_handler.py / judge_verification.py).
+        assert roles_by_name["verify-quality"] == "verifier-quality"
+        assert roles_by_name["verify-correctness"] == "verifier-correctness"
+        assert roles_by_name["judge-verification"] == "judge"
+        assert roles_by_name["post-verification-docs"] == "docs"
+
+    def test_step_role_independent_of_configured_arc_names(self, monkeypatch):
+        """Renaming arcs via verification.arc_names config doesn't change roles.
+
+        Roles are the structural identity; names are presentation. Even if a
+        deployment renames the docs arc to "wrap-up-doc", the dispatch role
+        stays "docs" so the dispatch handler still routes correctly.
+        """
+        import carpenter.config
+        cfg = dict(carpenter.config.CONFIG)
+        cfg["verification"] = {
+            "enabled": True,
+            "arc_names": {
+                "correctness_check": "my-correctness",
+                "judge": "my-judge",
+                "documentation": "my-docs",
+            },
+        }
+        monkeypatch.setattr("carpenter.config.CONFIG", cfg)
+
+        parent = arc_manager.create_arc("project", goal="Test")
+        impl_id = arc_manager.add_child(parent, "coding-change", goal="Implement")
+        arc_manager.update_status(impl_id, "active")
+        arc_manager.update_status(impl_id, "completed")
+
+        v_ids = verification_arcs.create_verification_arcs(impl_id)
+        roles = [arc_manager.get_arc(v)["step_role"] for v in v_ids]
+        # Names are custom but roles are still the canonical dispatch keys.
+        assert "verifier-correctness" in roles
+        assert "judge" in roles
+        assert "docs" in roles

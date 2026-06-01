@@ -154,59 +154,6 @@ def test_unhealthy_recovery_clears_dedup(mock_notif, mock_health):
 
 @patch("carpenter.core.models.monitor.get_all_model_health")
 @patch("carpenter.core.models.monitor.notifications")
-def test_fallback_notification(mock_notif, mock_health):
-    """Fallback model triggers throttled notification."""
-    mock_health.return_value = [
-        _make_state("fallback:local-llama", ModelHealth.HEALTHY,
-                    total_attempts=5),
-    ]
-
-    health_monitor.check_health()
-
-    mock_notif.notify.assert_called_once()
-    call_args = mock_notif.notify.call_args
-    assert "fallback active" in call_args[0][0].lower() or "Local fallback active" in call_args[0][0]
-    assert call_args[1]["category"] == "local_fallback"
-
-
-@patch("carpenter.core.models.monitor.get_all_model_health")
-@patch("carpenter.core.models.monitor.notifications")
-def test_fallback_throttle(mock_notif, mock_health):
-    """Fallback notifications are throttled to 5-minute intervals."""
-    mock_health.return_value = [
-        _make_state("fallback:local-llama", ModelHealth.HEALTHY,
-                    total_attempts=5),
-    ]
-
-    health_monitor.check_health()
-    assert mock_notif.notify.call_count == 1
-
-    # Second call within throttle window — should not notify
-    health_monitor.check_health()
-    assert mock_notif.notify.call_count == 1
-
-
-@patch("carpenter.core.models.monitor.get_all_model_health")
-@patch("carpenter.core.models.monitor.notifications")
-def test_fallback_throttle_expired(mock_notif, mock_health):
-    """Fallback notifies again after throttle window expires."""
-    mock_health.return_value = [
-        _make_state("fallback:local-llama", ModelHealth.HEALTHY,
-                    total_attempts=5),
-    ]
-
-    health_monitor.check_health()
-    assert mock_notif.notify.call_count == 1
-
-    # Simulate throttle window expiry
-    health_monitor._state.last_fallback_notify = time.time() - 301
-
-    health_monitor.check_health()
-    assert mock_notif.notify.call_count == 2
-
-
-@patch("carpenter.core.models.monitor.get_all_model_health")
-@patch("carpenter.core.models.monitor.notifications")
 def test_healthy_model_no_notification(mock_notif, mock_health):
     """Healthy models should not trigger any notification."""
     mock_health.return_value = [
@@ -257,77 +204,6 @@ def test_get_all_health_exception_handled(mock_notif, mock_health):
     health_monitor.check_health()
 
     mock_notif.notify.assert_not_called()
-
-
-# ── Cloud recovery notification tests ─────────────────────────────
-
-
-@patch("carpenter.core.models.monitor.get_all_provider_health")
-@patch("carpenter.core.models.monitor.get_all_model_health")
-@patch("carpenter.core.models.monitor.notifications")
-def test_cloud_recovery_notification(mock_notif, mock_health, mock_prov):
-    """Cloud recovery triggers notification after fallback was active."""
-    mock_prov.return_value = []
-
-    # First: activate fallback
-    mock_health.return_value = [
-        _make_state("fallback:local-llama", ModelHealth.HEALTHY, total_attempts=5),
-    ]
-    health_monitor.check_health()
-    assert mock_notif.notify.call_count == 1  # fallback notification
-
-    # Cloud model recovers
-    mock_health.return_value = [
-        _make_state("anthropic:sonnet", ModelHealth.HEALTHY),
-    ]
-    health_monitor.check_health()
-    assert mock_notif.notify.call_count == 2  # + cloud recovery
-    recovery_call = mock_notif.notify.call_args_list[1]
-    assert "recovered" in recovery_call[0][0].lower() or "Cloud model recovered" in recovery_call[0][0]
-    assert recovery_call[1]["category"] == "cloud_recovery"
-
-
-@patch("carpenter.core.models.monitor.get_all_provider_health")
-@patch("carpenter.core.models.monitor.get_all_model_health")
-@patch("carpenter.core.models.monitor.notifications")
-def test_cloud_recovery_throttle(mock_notif, mock_health, mock_prov):
-    """Cloud recovery notifications are throttled to 5-minute intervals."""
-    mock_prov.return_value = []
-
-    # Activate fallback first
-    mock_health.return_value = [
-        _make_state("fallback:local", ModelHealth.HEALTHY, total_attempts=1),
-    ]
-    health_monitor.check_health()
-
-    # Cloud recovers
-    mock_health.return_value = [
-        _make_state("anthropic:sonnet", ModelHealth.HEALTHY),
-    ]
-    health_monitor.check_health()
-    count_after_first = mock_notif.notify.call_count
-
-    # Second check within throttle window — should NOT send another recovery
-    health_monitor.check_health()
-    assert mock_notif.notify.call_count == count_after_first
-
-
-@patch("carpenter.core.models.monitor.get_all_provider_health")
-@patch("carpenter.core.models.monitor.get_all_model_health")
-@patch("carpenter.core.models.monitor.notifications")
-def test_cloud_recovery_only_after_fallback(mock_notif, mock_health, mock_prov):
-    """Cloud recovery does NOT notify if fallback was never active."""
-    mock_prov.return_value = []
-
-    # Healthy cloud model but no prior fallback
-    mock_health.return_value = [
-        _make_state("anthropic:sonnet", ModelHealth.HEALTHY),
-    ]
-    health_monitor.check_health()
-
-    # Should NOT have sent cloud_recovery
-    for call in mock_notif.notify.call_args_list:
-        assert call[1].get("category") != "cloud_recovery"
 
 
 # ── Provider outage notification tests ──────────────────────────

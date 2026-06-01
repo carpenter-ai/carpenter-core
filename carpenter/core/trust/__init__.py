@@ -15,7 +15,7 @@ from .types import OutputType, AgentType, get_agent_capabilities, validate_outpu
 from .audit import log_trust_event, get_trust_events  # noqa: F401
 
 # Encryption
-from .encryption import generate_arc_key, encrypt_output, decrypt_for_reviewer, decrypt_after_promotion  # noqa: F401
+from .encryption import generate_arc_key, encrypt_output, decrypt_for_reviewer  # noqa: F401
 
 # Template capability grants
 from .capabilities import (  # noqa: F401

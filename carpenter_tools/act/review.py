@@ -1,5 +1,7 @@
-"""Review verdict submission tool. Tier 1: callback to platform."""
-from .._callback import callback
+"""Review verdict tool declarations.
+
+See ``carpenter_tools`` package docstring for the invocation model.
+"""
 from ..tool_meta import tool
 
 
@@ -20,11 +22,6 @@ def submit_verdict(
     Returns:
         Dict with 'accepted' and 'promoted' booleans.
     """
-    import os
-    reviewer_arc_id = int(os.environ.get("TC_ARC_ID", "0"))
-    return callback("review.submit_verdict", {
-        "reviewer_arc_id": reviewer_arc_id,
-        "target_arc_id": target_arc_id,
-        "decision": decision,
-        "reason": reason,
-    })
+    # reviewer_arc_id is injected by the platform dispatch bridge from the
+    # calling arc's _caller_arc_id; the client does not set it here.
+    ...
