@@ -26,7 +26,6 @@ _MUTABLE_KEYS = frozenset({
     "chat_language",
     "model_roles.default",
     "model_roles.chat",
-    "review_auto_approve_threshold",
 })
 
 _MUTABLE_KEY_DESCRIPTIONS = {
@@ -46,7 +45,6 @@ _MUTABLE_KEY_DESCRIPTIONS = {
     "chat_language": "ISO 639-1 language code for the chat agent's response language (e.g. 'de', 'fr'); empty string = respond in the user's language",
     "model_roles.default": "Default model for all roles (format: 'provider:model', e.g. 'anthropic:claude-sonnet-4-6'); empty = auto-detect from ai_provider",
     "model_roles.chat": "Model for chat conversations (format: 'provider:model', e.g. 'anthropic:claude-haiku-4-5'); empty = use model_roles.default or auto-detect",
-    "review_auto_approve_threshold": "Line count threshold for auto-approving small coding-change diffs (0 = always require manual review; 50 = auto-approve diffs under 50 lines)",
 }
 
 
