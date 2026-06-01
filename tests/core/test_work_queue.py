@@ -84,3 +84,40 @@ def test_claimed_item_not_reclaimed():
     item2 = work_queue.claim()
     assert item1 is not None
     assert item2 is None
+
+
+# ── priority ─────────────────────────────────────────────────────────
+
+
+def test_enqueue_default_priority_is_100():
+    """Items enqueued without an explicit priority default to 100."""
+    wid = work_queue.enqueue("test.event", {})
+    item = work_queue.get_item(wid)
+    assert item["priority"] == 100
+
+
+def test_claim_dispatches_lower_priority_first():
+    """claim() returns a lower-priority (higher-importance) item before a
+    default one, even when the lower-priority item was enqueued later."""
+    wid_default = work_queue.enqueue("default", {"n": 1})
+    wid_high = work_queue.enqueue("urgent", {"n": 2}, priority=10)
+    wid_idle = work_queue.enqueue("idle", {"n": 3}, priority=1000)
+
+    first = work_queue.claim()
+    second = work_queue.claim()
+    third = work_queue.claim()
+
+    assert first["id"] == wid_high
+    assert second["id"] == wid_default
+    assert third["id"] == wid_idle
+
+
+def test_claim_breaks_ties_by_created_at():
+    """Within the same priority, items dispatch FIFO by created_at."""
+    wid1 = work_queue.enqueue("first", {"n": 1}, priority=50)
+    wid2 = work_queue.enqueue("second", {"n": 2}, priority=50)
+    wid3 = work_queue.enqueue("third", {"n": 3}, priority=50)
+
+    assert work_queue.claim()["id"] == wid1
+    assert work_queue.claim()["id"] == wid2
+    assert work_queue.claim()["id"] == wid3

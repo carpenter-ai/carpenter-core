@@ -569,10 +569,10 @@ def _check_and_reload():
                     continue
                 new_tools[tool.name] = tool
             new_mtimes[str(py_file)] = py_file.stat().st_mtime
-        except Exception as e:
-            logger.error(
-                "Chat tool reload failed for %s: %s — keeping previous set",
-                py_file.name, e,
+        except Exception:
+            logger.exception(
+                "Chat tool reload failed for %s — keeping previous set",
+                py_file.name,
             )
             return  # Keep previous valid set
 

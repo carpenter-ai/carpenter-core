@@ -57,9 +57,11 @@ def check_string_declarations(code: str) -> StringDeclarationResult:
             if len(snippet) > 44:
                 snippet = snippet[:40] + "...'"
             violations.append(
-                f"Line {lineno}: untyped string literal {snippet} "
-                f"— wrap in Label(), URL(), etc. "
-                f"(see KB: security/typed-declarations)"
+                f"Line {lineno}: untyped string literal {snippet} — bare "
+                f"string literals are not allowed in non-trusted code. Wrap "
+                f"it in a typed declaration: Label('...'), URL('...'), "
+                f"UnstructuredText('...'), Email('...'), etc. "
+                f"See kb/security/typed-declarations.md."
             )
 
         elif isinstance(node, ast.JoinedStr):
@@ -70,9 +72,10 @@ def check_string_declarations(code: str) -> StringDeclarationResult:
                 continue
             lineno = getattr(node, "lineno", "?")
             violations.append(
-                f"Line {lineno}: untyped f-string "
-                f"— wrap in Label(), UnstructuredText(), etc. "
-                f"(see KB: security/typed-declarations)"
+                f"Line {lineno}: untyped f-string — bare f-strings are not "
+                f"allowed in non-trusted code. Wrap it in a typed "
+                f"declaration: Label(f'...'), UnstructuredText(f'...'), "
+                f"URL(f'...'), etc. See kb/security/typed-declarations.md."
             )
 
     return StringDeclarationResult(

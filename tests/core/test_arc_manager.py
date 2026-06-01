@@ -470,74 +470,115 @@ def test_check_activation_no_matching_event():
     assert arc_manager.check_activation(arc_id) is False
 
 
-# ── agent_config helpers ──────────────────────────────────────────
+# ── model_policy helpers ──────────────────────────────────────────
 
 
-def test_get_or_create_agent_config_basic():
-    """get_or_create_agent_config creates a row and returns an int ID."""
-    config_id = arc_manager.get_or_create_agent_config(
-        model="anthropic:claude-sonnet-4-20250514",
+def test_get_or_create_model_policy_basic():
+    """get_or_create_model_policy creates a row and returns an int ID."""
+    policy_id = arc_manager.get_or_create_model_policy(
+        model="anthropic:claude-sonnet-4-6",
     )
-    assert isinstance(config_id, int)
-    assert config_id > 0
+    assert isinstance(policy_id, int)
+    assert policy_id > 0
 
 
-def test_get_or_create_agent_config_dedup():
-    """Same parameters return the same config ID (dedup via unique index)."""
-    id1 = arc_manager.get_or_create_agent_config(
-        model="anthropic:claude-sonnet-4-20250514",
+def test_get_or_create_model_policy_dedup():
+    """Same parameters return the same policy ID (hard-pinned dedup)."""
+    id1 = arc_manager.get_or_create_model_policy(
+        model="anthropic:claude-sonnet-4-6",
         agent_role="security-reviewer",
         temperature=0.2,
     )
-    id2 = arc_manager.get_or_create_agent_config(
-        model="anthropic:claude-sonnet-4-20250514",
+    id2 = arc_manager.get_or_create_model_policy(
+        model="anthropic:claude-sonnet-4-6",
         agent_role="security-reviewer",
         temperature=0.2,
     )
     assert id1 == id2
 
 
-def test_get_or_create_agent_config_different_params():
-    """Different parameters produce different config IDs."""
-    id1 = arc_manager.get_or_create_agent_config(
-        model="anthropic:claude-sonnet-4-20250514",
+def test_get_or_create_model_policy_different_params():
+    """Different parameters produce different policy IDs."""
+    id1 = arc_manager.get_or_create_model_policy(
+        model="anthropic:claude-sonnet-4-6",
     )
-    id2 = arc_manager.get_or_create_agent_config(
-        model="anthropic:claude-haiku-4-5-20251001",
+    id2 = arc_manager.get_or_create_model_policy(
+        model="anthropic:claude-haiku-4-5",
     )
     assert id1 != id2
 
 
-def test_get_or_create_agent_config_null_fields():
+def test_get_or_create_model_policy_null_fields():
     """NULL fields are handled correctly in dedup."""
-    id1 = arc_manager.get_or_create_agent_config(
-        model="anthropic:claude-sonnet-4-20250514",
+    id1 = arc_manager.get_or_create_model_policy(
+        model="anthropic:claude-sonnet-4-6",
         agent_role=None,
         temperature=None,
         max_tokens=None,
     )
-    id2 = arc_manager.get_or_create_agent_config(
-        model="anthropic:claude-sonnet-4-20250514",
+    id2 = arc_manager.get_or_create_model_policy(
+        model="anthropic:claude-sonnet-4-6",
     )
     assert id1 == id2
 
 
-def test_get_agent_config_returns_row():
-    """get_agent_config returns a dict with all fields."""
-    config_id = arc_manager.get_or_create_agent_config(
-        model="anthropic:claude-sonnet-4-20250514",
+def test_get_model_policy_returns_row():
+    """get_model_policy returns a dict with all fields."""
+    policy_id = arc_manager.get_or_create_model_policy(
+        model="anthropic:claude-sonnet-4-6",
         agent_role="security-reviewer",
         temperature=0.2,
         max_tokens=4096,
     )
-    cfg = arc_manager.get_agent_config(config_id)
-    assert cfg is not None
-    assert cfg["model"] == "anthropic:claude-sonnet-4-20250514"
-    assert cfg["agent_role"] == "security-reviewer"
-    assert cfg["temperature"] == pytest.approx(0.2)
-    assert cfg["max_tokens"] == 4096
+    policy = arc_manager.get_model_policy(policy_id)
+    assert policy is not None
+    assert policy["model"] == "anthropic:claude-sonnet-4-6"
+    assert policy["agent_role"] == "security-reviewer"
+    assert policy["temperature"] == pytest.approx(0.2)
+    assert policy["max_tokens"] == 4096
 
 
-def test_get_agent_config_returns_none():
-    """get_agent_config returns None for missing ID."""
-    assert arc_manager.get_agent_config(99999) is None
+def test_get_model_policy_returns_none():
+    """get_model_policy returns None for missing ID."""
+    assert arc_manager.get_model_policy(99999) is None
+
+
+# ── priority primitive ──────────────────────────────────────────────
+
+def test_create_arc_default_priority_is_100():
+    """Root arc without explicit priority and no parent defaults to 100."""
+    arc_id = arc_manager.create_arc("root")
+    arc = arc_manager.get_arc(arc_id)
+    assert arc["priority"] == 100
+
+
+def test_create_arc_inherits_parent_priority():
+    """Child arc created without priority inherits parent's priority."""
+    parent_id = arc_manager.create_arc("parent", priority=250)
+    child_id = arc_manager.create_arc("child", parent_id=parent_id)
+    child = arc_manager.get_arc(child_id)
+    assert child["priority"] == 250
+
+
+def test_create_arc_explicit_priority_overrides_parent():
+    """Explicit priority on a child overrides parent inheritance."""
+    parent_id = arc_manager.create_arc("parent", priority=250)
+    child_id = arc_manager.create_arc("child", parent_id=parent_id, priority=50)
+    child = arc_manager.get_arc(child_id)
+    assert child["priority"] == 50
+
+
+def test_add_child_inherits_parent_priority():
+    """add_child without explicit priority inherits the parent's priority."""
+    parent_id = arc_manager.create_arc("parent", priority=500)
+    child_id = arc_manager.add_child(parent_id, "child")
+    child = arc_manager.get_arc(child_id)
+    assert child["priority"] == 500
+
+
+def test_add_child_explicit_priority_wins():
+    """add_child with explicit priority overrides parent inheritance."""
+    parent_id = arc_manager.create_arc("parent", priority=500)
+    child_id = arc_manager.add_child(parent_id, "child", priority=10)
+    child = arc_manager.get_arc(child_id)
+    assert child["priority"] == 10

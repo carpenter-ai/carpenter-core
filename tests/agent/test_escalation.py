@@ -10,9 +10,9 @@ from carpenter import config
 # ---------------------------------------------------------------------------
 # Model name constants — update HERE when models change, not in every test.
 # ---------------------------------------------------------------------------
-MODEL_HAIKU = "anthropic:claude-haiku-4.5-20241022"
-MODEL_SONNET = "anthropic:claude-sonnet-4-20250514"
-MODEL_OPUS = "anthropic:claude-opus-4-6"
+MODEL_HAIKU = "anthropic:claude-haiku-4-5"
+MODEL_SONNET = "anthropic:claude-sonnet-4-6"
+MODEL_OPUS = "anthropic:claude-opus-4-7"
 MODEL_OLLAMA_CODER = "ollama:qwen2.5-coder:32b"
 MODEL_OLLAMA_SMALL = "ollama:qwen2.5:7b"
 

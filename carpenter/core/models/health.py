@@ -40,7 +40,7 @@ class ModelHealthState:
     """Current health state for a model.
 
     Attributes:
-        model_id: Model identifier (e.g., "claude-sonnet-4-5-20250929")
+        model_id: Model identifier (e.g., "claude-sonnet-4-6")
         health: Current health status
         success_rate: Success rate over sliding window (0.0-1.0)
         consecutive_failures: Count of failures since last success

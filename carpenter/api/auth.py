@@ -18,6 +18,11 @@ _OPEN_PREFIXES = (
     "/api/callbacks/",
     "/api/webhooks/",
     "/api/credentials/",
+    # OAuth redirect comes from the provider's domain (Google, Slack,
+    # ...); it cannot carry our UI bearer token.  Security relies on
+    # the per-flow opaque ``state`` token that the callback handler
+    # constant-time-compares against the stored value.
+    "/api/oauth/",
     "/hooks/",
 )
 

@@ -17,6 +17,7 @@ from datetime import datetime
 
 import httpx
 
+from .. import constants
 from .base import HealthStatus
 from .channel import ChannelConnector
 from .formatting import format_for_channel, split_message
@@ -96,7 +97,8 @@ class TelegramChannelConnector(ChannelConnector):
             try:
                 await self._api("deleteWebhook")
             except Exception:
-                logger.debug("Failed to delete webhook on stop")
+                # Best-effort cleanup; do not bubble during shutdown.
+                logger.info("Failed to delete Telegram webhook on stop", exc_info=True)
 
         if self._client:
             await self._client.aclose()
@@ -123,6 +125,7 @@ class TelegramChannelConnector(ChannelConnector):
                 last_seen=self._last_healthy,
             )
         except Exception as e:
+            logger.exception("Telegram health check failed for @%s", self._bot_username)
             return HealthStatus(
                 healthy=False,
                 detail=str(e),
@@ -150,7 +153,14 @@ class TelegramChannelConnector(ChannelConnector):
                                 text=chunk,
                                 parse_mode=self._parse_mode)
             except Exception:
-                # Retry without parse_mode (formatting may be invalid)
+                # Retry without parse_mode (formatting may be invalid).
+                # Intentional suppression: if the retry succeeds, log the
+                # original failure for diagnostics; otherwise the inner
+                # except logs the retry failure with traceback.
+                logger.info(
+                    "Telegram sendMessage with parse_mode=%s failed for chat_id=%s; retrying without parse_mode",
+                    self._parse_mode, chat_id, exc_info=True,
+                )
                 try:
                     await self._api("sendMessage",
                                     chat_id=int(chat_id),
@@ -234,7 +244,8 @@ class TelegramChannelConnector(ChannelConnector):
                         text="Sorry, you are not authorized to use this bot.",
                     )
                 except Exception:
-                    pass
+                    # Best-effort rejection notice; do not bubble.
+                    logger.info("Telegram rejection send failed for chat_id=%s", chat_id, exc_info=True)
             return
 
         await self.deliver_inbound(
@@ -274,7 +285,7 @@ class TelegramChannelConnector(ChannelConnector):
 
         # Build webhook URL from platform config
         host = config.get("tls_domain", "localhost")
-        port = config.get("port", 7842)
+        port = config.get("port", constants.DEFAULT_API_PORT)
         scheme = "https" if config.get("tls_enabled") else "http"
         webhook_url = f"{scheme}://{host}:{port}{self._webhook_path}"
 

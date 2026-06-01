@@ -5,6 +5,10 @@ import pytest
 from unittest.mock import patch, MagicMock
 
 from carpenter.core.workflows import webhook_dispatch_handler as handler
+from carpenter.forges.forgejo import ForgejoProvider
+
+# Provider instance reused across tests — provider is stateless.
+_forgejo_provider = ForgejoProvider()
 
 
 # ---------------------------------------------------------------------------
@@ -32,7 +36,7 @@ def test_parse_forgejo_pr_opened():
         },
     }
 
-    result = handler._parse_forgejo_payload(data, ["pull_request"])
+    result = _forgejo_provider.parse_webhook_legacy(data, ["pull_request"])
 
     assert result is not None
     assert result["event_type"] == "pull_request"
@@ -52,7 +56,7 @@ def test_parse_forgejo_pr_filtered():
         "repository": {"name": "repo", "owner": {"login": "owner"}},
     }
 
-    result = handler._parse_forgejo_payload(data, ["push"])
+    result = _forgejo_provider.parse_webhook_legacy(data, ["push"])
     assert result is None
 
 
@@ -63,7 +67,7 @@ def test_parse_forgejo_push():
         "commits": [{"id": "abc123"}],
     }
 
-    result = handler._parse_forgejo_payload(data, [])
+    result = _forgejo_provider.parse_webhook_legacy(data, [])
     assert result is not None
     assert result["event_type"] == "push"
     assert result["ref"] == "refs/heads/main"
@@ -84,7 +88,7 @@ def test_parse_forgejo_closed_pr():
         "repository": {"name": "repo", "owner": {"login": "owner"}},
     }
 
-    result = handler._parse_forgejo_payload(data, ["pull_request"])
+    result = _forgejo_provider.parse_webhook_legacy(data, ["pull_request"])
     assert result is None
 
 

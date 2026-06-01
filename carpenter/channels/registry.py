@@ -135,6 +135,7 @@ class ConnectorRegistry:
                     status = asyncio.run(connector.health_check())
                 results[name] = {"healthy": status.healthy, "detail": status.detail}
             except Exception as e:
+                logger.exception("Health check failed for connector: %s", name)
                 results[name] = {"healthy": False, "detail": str(e)}
         return results
 

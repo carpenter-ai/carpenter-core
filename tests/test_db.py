@@ -102,25 +102,30 @@ def test_sqlcipher_fallback_without_key():
         conn.close()
 
 
-def test_sqlcipher_fallback_warns_when_unavailable(monkeypatch, caplog):
-    """get_db() with key but no pysqlcipher3 logs a warning and falls back."""
+def test_sqlcipher_missing_fails_closed(monkeypatch):
+    """get_db() with db_encryption_key set but no pysqlcipher3 must refuse to
+    open a plaintext connection.
+
+    Regression guard: previously this path logged a warning and silently
+    fell back to plain sqlite3, which writes review_keys Fernet bytes
+    (and all other sensitive material) to disk in clear text despite the
+    operator having explicitly requested at-rest encryption. The fix is
+    to fail closed with a clear, actionable message. See
+    docs/trust-invariants.md section I7.
+    """
+    import pytest
     import carpenter.db as db_module
     from carpenter import config
 
     monkeypatch.setattr(db_module, "_sqlcipher_module", None)
     monkeypatch.setitem(config.CONFIG, "db_encryption_key", "test-secret-key")
 
-    import logging
-    with caplog.at_level(logging.WARNING, logger="carpenter.db"):
-        conn = db_module.get_db()
-        try:
-            # Should still work via plain sqlite3
-            result = conn.execute("PRAGMA journal_mode").fetchone()
-            assert result[0] == "wal"
-        finally:
-            conn.close()
+    with pytest.raises(RuntimeError) as excinfo:
+        db_module.get_db()
 
-    assert "pysqlcipher3 is not installed" in caplog.text
+    msg = str(excinfo.value)
+    assert "pysqlcipher3" in msg
+    assert "plaintext" in msg.lower()
 
 
 class TestGetDbTransactionGuard:

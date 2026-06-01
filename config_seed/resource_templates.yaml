@@ -1,0 +1,22 @@
+templates:
+  - name: html_to_summary
+    consumes_content_type: html
+    produces_content_type: text-summary
+    reviewer_profile: security-reviewer
+    judge_profile: judge
+    model_policy: fast-chat
+    goal_template: |
+      Read the untrusted html resource at {input_path}. Extract the
+      relevant information the user wanted: {goal}. Produce a clean
+      text summary and write it to {output_path}.
+
+  - name: json_webhook_to_summary
+    consumes_content_type: json-webhook
+    produces_content_type: json-summary
+    reviewer_profile: security-reviewer
+    judge_profile: judge
+    model_policy: fast-chat
+    goal_template: |
+      Read the untrusted webhook payload at {input_path}. Extract the key
+      fields relevant to the handler: {goal}. Produce a clean JSON or text
+      summary and write it to {output_path}.

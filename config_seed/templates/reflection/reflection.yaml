@@ -1,0 +1,44 @@
+name: reflection
+description: Per-arc reflection — analyse a completed root arc and distill lessons to KB
+capabilities:
+  - system.read
+  - kb.write
+triggers:
+  - name: on-root-arc-completed
+    on: arc.status_changed
+    filter:
+      is_root: true
+      new_status: completed
+      # Prevent reflection-of-reflection recursion. arc.status_changed
+      # includes template_name when the arc was created from a template.
+      # ``$ne`` also matches when the key is absent (non-template arcs
+      # have no template_name), so genuine user-goal root arcs still
+      # trigger reflections.
+      template_name:
+        $ne: reflection
+    action:
+      type: create_arc
+      template_name: reflection
+      arc_name: reflection
+      priority: 1000
+      initial_arc_state:
+        reflected_arc_id: "{event.payload.arc_id}"
+steps:
+  - name: gather-activity
+    description: Build the reflect step's goal from the reflected arc's trajectory
+    role: prepare
+    order: 0
+  - name: reflect
+    description: Analyse the completed arc and produce actionable reflection
+    role: analyze
+    order: 1
+    agent_type: EXECUTOR
+    agent_model: haiku
+  - name: save-reflection
+    description: Persist the reflection to KB and run post-processing
+    role: persist
+    order: 2
+  - name: dispatch-actions
+    description: Fan out proposed actions from the reflect step into child action arcs
+    role: dispatch
+    order: 3

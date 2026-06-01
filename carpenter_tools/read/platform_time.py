@@ -1,4 +1,7 @@
-"""Platform time utilities - read-only tool."""
+"""Platform time tool declarations.
+
+See ``carpenter_tools`` package docstring for the invocation model.
+"""
 
 from datetime import datetime, timezone
 from carpenter_tools.tool_meta import tool

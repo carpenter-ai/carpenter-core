@@ -1,8 +1,7 @@
-"""Webhook subscription management tools. Tier 1: callback to platform.
+"""Webhook subscription management tool declarations.
 
-Action tools only — list_subscriptions is in carpenter_tools/read/webhook.py.
+See ``carpenter_tools`` package docstring for the invocation model.
 """
-from .._callback import callback
 from ..tool_meta import tool
 
 
@@ -23,7 +22,7 @@ def subscribe(
     that maps incoming events to arc creation or work items.
 
     Args:
-        source_type: Webhook source type (e.g. 'forgejo').
+        source_type: Webhook source type for the configured forge (e.g. 'forgejo').
         event_filter: Event types to subscribe to (e.g. ['pull_request']).
         action_type: Action on event: 'create_arc' or 'enqueue_work'.
         action_config: Action configuration dict.
@@ -34,15 +33,7 @@ def subscribe(
     Returns:
         Dict with webhook_id, subscription_id, and forge_hook_id.
     """
-    return callback("webhook.subscribe", {
-        "source_type": source_type,
-        "event_filter": event_filter,
-        "action_type": action_type,
-        "action_config": action_config,
-        "repo_owner": repo_owner,
-        "repo_name": repo_name,
-        "conversation_id": conversation_id,
-    })
+    ...
 
 
 @tool(local=True, readonly=False, side_effects=True,
@@ -56,4 +47,4 @@ def delete(webhook_id: str) -> dict:
     Returns:
         Dict with deleted: bool.
     """
-    return callback("webhook.delete", {"webhook_id": webhook_id})
+    ...

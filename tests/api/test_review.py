@@ -241,6 +241,129 @@ def test_create_diff_review_endpoint(client):
     assert "Test diff review" in view_resp.text
 
 
+def test_diff_review_followup_creates_planner_sibling(client):
+    """Approving a diff review with a followup_goal creates a sibling PLANNER arc.
+
+    The new arc shares the current arc's parent_id (sibling), is created at
+    trusted integrity, has agent_type=PLANNER, and the response includes the
+    new arc id.  An arc_history entry of type 'followup_triggered' is recorded
+    on the original arc.
+    """
+    parent_id = arc_manager.create_arc("review-followup-parent")
+    current_id = arc_manager.add_child(parent_id, "current-coding-change")
+
+    create_resp = client.post(
+        "/api/review/create-diff",
+        json={
+            "diff_content": "--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n",
+            "title": "Followup test",
+            "arc_id": current_id,
+            "changed_files": ["x"],
+        },
+    )
+    review_id = create_resp.json()["review_id"]
+
+    decide_resp = client.post(
+        f"/api/review/{review_id}/decide",
+        json={
+            "decision": "approve",
+            "comment": "looks good",
+            "followup_goal": "Add a regression test for the new behavior.",
+        },
+    )
+    assert decide_resp.status_code == 200
+    body = decide_resp.json()
+    assert "followup_arc_id" in body
+    new_arc_id = body["followup_arc_id"]
+
+    # New arc is a sibling: same parent_id as the current arc
+    new_arc = arc_manager.get_arc(new_arc_id)
+    assert new_arc is not None
+    assert new_arc["parent_id"] == parent_id
+    assert new_arc["agent_type"] == "PLANNER"
+    assert new_arc["integrity_level"] == "trusted"
+    assert new_arc["goal"] == "Add a regression test for the new behavior."
+    assert new_arc["name"] == "followup-from-review"
+
+    # arc_history of original arc records the followup
+    history = arc_manager.get_history(current_id)
+    followup_entries = [h for h in history if h["entry_type"] == "followup_triggered"]
+    assert len(followup_entries) == 1
+
+
+def test_diff_review_followup_root_arc(client):
+    """If current arc is a root, follow-up arc is created as a new root."""
+    current_id = arc_manager.create_arc("root-coding-change")
+
+    create_resp = client.post(
+        "/api/review/create-diff",
+        json={
+            "diff_content": "--- a/y\n+++ b/y\n@@ -1 +1 @@\n-a\n+b\n",
+            "arc_id": current_id,
+        },
+    )
+    review_id = create_resp.json()["review_id"]
+
+    decide_resp = client.post(
+        f"/api/review/{review_id}/decide",
+        json={
+            "decision": "approve",
+            "followup_goal": "Document the change in the changelog.",
+        },
+    )
+    assert decide_resp.status_code == 200
+    new_arc_id = decide_resp.json()["followup_arc_id"]
+    new_arc = arc_manager.get_arc(new_arc_id)
+    assert new_arc["parent_id"] is None
+    assert new_arc["agent_type"] == "PLANNER"
+
+
+def test_diff_review_no_followup_when_goal_empty(client):
+    """An approve decision without followup_goal does not create a new arc."""
+    current_id = arc_manager.create_arc("plain-approve")
+
+    create_resp = client.post(
+        "/api/review/create-diff",
+        json={
+            "diff_content": "--- a/z\n+++ b/z\n@@ -1 +1 @@\n-a\n+b\n",
+            "arc_id": current_id,
+        },
+    )
+    review_id = create_resp.json()["review_id"]
+
+    decide_resp = client.post(
+        f"/api/review/{review_id}/decide",
+        json={"decision": "approve", "comment": "ok"},
+    )
+    assert decide_resp.status_code == 200
+    assert "followup_arc_id" not in decide_resp.json()
+
+
+def test_diff_review_followup_skipped_on_reject(client):
+    """A reject decision with followup_goal does NOT create a follow-up arc."""
+    current_id = arc_manager.create_arc("reject-with-goal")
+
+    create_resp = client.post(
+        "/api/review/create-diff",
+        json={
+            "diff_content": "--- a/q\n+++ b/q\n@@ -1 +1 @@\n-a\n+b\n",
+            "arc_id": current_id,
+        },
+    )
+    review_id = create_resp.json()["review_id"]
+
+    decide_resp = client.post(
+        f"/api/review/{review_id}/decide",
+        json={
+            "decision": "reject",
+            "comment": "no",
+            "followup_goal": "should be ignored",
+        },
+    )
+    assert decide_resp.status_code == 200
+    assert "followup_arc_id" not in decide_resp.json()
+
+
 def test_create_review_missing_required_field():
     """Sending JSON without code_file_id raises a structuring error."""
     from cattrs.errors import ClassValidationError

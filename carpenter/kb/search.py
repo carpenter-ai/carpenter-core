@@ -1,26 +1,41 @@
 """Search backends for the Knowledge Base.
 
 Provides semantic search via sentence embeddings.  The primary backend
-(``EmbeddingBackend``) uses the all-MiniLM-L6-v2 model — trying
-onnxruntime first for speed, then falling back to a pure-numpy forward
-pass that works everywhere (including 32-bit ARM / Android).
+(``EmbeddingBackend``) uses the all-MiniLM-L6-v2 model — delegating to
+``carpenter.embeddings.EmbeddingService``, which picks ONNX Runtime when
+available and falls back to a pure-numpy forward pass that works
+everywhere (including 32-bit ARM / Android).
 
 For users who prefer an external embedding service, ``VectorBackend``
 (Ollama) is retained as an alternative.
+
+Phase 2 PR-1: the embedding pipeline itself now lives in
+``carpenter.embeddings``.  This module keeps KB-specific composition
+(``_embed_text``), KB storage (``kb_embeddings``/``kb_text_content``),
+and thin shims (``_local_embed``/``_ollama_embed``) so existing tests
+that patch ``carpenter.kb.search._local_embed`` /
+``carpenter.kb.search._ollama_embed`` continue to work verbatim.
 """
 
 import logging
-import math
-import os
-import sqlite3
-import struct
-import urllib.request
 from typing import Protocol
 
-import httpx
-
 from ..config import CONFIG
-from ..db import get_db, db_connection, db_transaction
+from ..db import db_connection, db_transaction
+from ..embeddings.codec import (
+    _cosine_similarity,
+    _deserialize_embedding,
+    _serialize_embedding,
+)
+from ..embeddings.providers.local import (
+    _EMBEDDING_DIM,
+    _ONNX_MODEL_NAME,
+    _ONNX_MODEL_URL,
+    _download_onnx_model,
+    _resolve_onnx_model_path,
+)
+from ..embeddings.providers.ollama import OllamaEmbeddingProvider
+from ..embeddings.service import get_embedding_service
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +63,7 @@ class SearchBackend(Protocol):
 
 
 # ---------------------------------------------------------------------------
-# Shared helpers
+# KB-specific helpers (stay here; not part of the embedding service)
 # ---------------------------------------------------------------------------
 
 def _embed_text(title: str, description: str, body: str) -> str:
@@ -62,26 +77,6 @@ def _embed_text(title: str, description: str, body: str) -> str:
     if body:
         parts.append(body[:2000])
     return ". ".join(parts)
-
-
-def _serialize_embedding(vec: list[float]) -> bytes:
-    """Pack a float vector into a compact binary blob."""
-    return struct.pack(f"{len(vec)}f", *vec)
-
-
-def _deserialize_embedding(blob: bytes, dim: int) -> tuple[float, ...]:
-    """Unpack a binary blob into a float tuple."""
-    return struct.unpack(f"{dim}f", blob)
-
-
-def _cosine_similarity(a: tuple[float, ...], b: tuple[float, ...]) -> float:
-    """Compute cosine similarity between two vectors (pure Python)."""
-    dot = sum(x * y for x, y in zip(a, b))
-    norm_a = math.sqrt(sum(x * x for x in a))
-    norm_b = math.sqrt(sum(x * x for x in b))
-    if norm_a == 0 or norm_b == 0:
-        return 0.0
-    return dot / (norm_a * norm_b)
 
 
 def _extract_keywords(text: str) -> list[str]:
@@ -111,158 +106,33 @@ def _sanitize_fts_query(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Local embedding (ONNX + numpy fallback)
+# Backward-compat shims for the embedding pipeline.
+#
+# These exist so existing tests that patch
+# ``carpenter.kb.search._local_embed`` / ``carpenter.kb.search._ollama_embed``
+# keep working unchanged.  New code should call
+# ``carpenter.embeddings.service.get_embedding_service`` directly.
 # ---------------------------------------------------------------------------
 
-_ONNX_MODEL_URL = (
-    "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2"
-    "/resolve/main/onnx/model.onnx"
-)
-_ONNX_MODEL_NAME = "all-MiniLM-L6-v2.onnx"
-_EMBEDDING_DIM = 384
-
-# Module-level ONNX session cache (one per process).
-_onnx_session = None  # type: ignore[assignment]
-_onnx_available: bool | None = None  # None = not yet probed
-
-
-def _resolve_onnx_model_path() -> str:
-    """Return the path to the ONNX model file."""
-    kb_cfg = CONFIG.get("kb", {})
-    explicit = kb_cfg.get("onnx_model_path", "")
-    if explicit:
-        return explicit
-    base_dir = CONFIG.get("base_dir", os.path.expanduser("~/carpenter"))
-    return os.path.join(base_dir, "models", _ONNX_MODEL_NAME)
-
-
-def _download_onnx_model(dest: str) -> None:
-    """Download the ONNX model from HuggingFace to *dest*."""
-    os.makedirs(os.path.dirname(dest), exist_ok=True)
-    logger.info("Downloading ONNX embedding model to %s ...", dest)
-    try:
-        urllib.request.urlretrieve(_ONNX_MODEL_URL, dest)
-        logger.info("ONNX model downloaded successfully (%s)", dest)
-    except Exception:
-        if os.path.exists(dest):
-            os.remove(dest)
-        raise
-
-
-def _get_onnx_session():
-    """Return a cached ``onnxruntime.InferenceSession``.
-
-    Raises ``RuntimeError`` if onnxruntime is not installed or the model
-    file is missing and cannot be downloaded.
-    """
-    global _onnx_session
-    if _onnx_session is not None:
-        return _onnx_session
-
-    try:
-        import onnxruntime as ort  # type: ignore[import-untyped]
-    except ImportError:
-        raise RuntimeError(
-            "onnxruntime is not installed. Install it with: "
-            "pip install onnxruntime>=1.17"
-        )
-
-    model_path = _resolve_onnx_model_path()
-    if not os.path.isfile(model_path):
-        try:
-            _download_onnx_model(model_path)
-        except Exception as exc:
-            raise RuntimeError(
-                f"ONNX model not found at {model_path} and download failed: {exc}"
-            ) from exc
-
-    _onnx_session = ort.InferenceSession(
-        model_path, providers=["CPUExecutionProvider"],
-    )
-    return _onnx_session
-
-
-def _onnx_embed(texts: list[str]) -> list[list[float]]:
-    """Embed texts using the local ONNX model.
-
-    Returns a list of 384-dim unit-normalized embedding vectors.
-    """
-    import numpy as np
-
-    from .tokenizer import tokenize
-
-    session = _get_onnx_session()
-    results: list[list[float]] = []
-    for text in texts:
-        ids_list, mask_list, ttids_list = tokenize(text, max_length=128)
-        input_ids = np.array(ids_list, dtype=np.int64)
-        attention_mask = np.array(mask_list, dtype=np.int64)
-        token_type_ids = np.array(ttids_list, dtype=np.int64)
-        outputs = session.run(
-            None,
-            {
-                "input_ids": input_ids,
-                "attention_mask": attention_mask,
-                "token_type_ids": token_type_ids,
-            },
-        )
-        token_embeddings = outputs[0]
-
-        mask = attention_mask.astype(np.float32)
-        mask_expanded = np.expand_dims(mask, axis=-1)
-        summed = np.sum(token_embeddings * mask_expanded, axis=1)
-        counts = np.clip(mask_expanded.sum(axis=1), a_min=1e-9, a_max=None)
-        embedding = (summed / counts)[0]
-
-        norm = np.linalg.norm(embedding)
-        if norm > 0:
-            embedding = embedding / norm
-
-        results.append(embedding.tolist())
-    return results
-
-
-def _numpy_embed(texts: list[str]) -> list[list[float]]:
-    """Embed texts using the pure-numpy forward pass.
-
-    Returns a list of 384-dim unit-normalized embedding vectors.
-    Same model as ONNX, same results, just slower.
-    """
-    from .numpy_inference import embed
-    from .tokenizer import tokenize
-
-    all_ids: list[list[int]] = []
-    all_masks: list[list[int]] = []
-    all_ttids: list[list[int]] = []
-    for text in texts:
-        ids_list, mask_list, ttids_list = tokenize(text, max_length=128)
-        all_ids.append(ids_list[0])
-        all_masks.append(mask_list[0])
-        all_ttids.append(ttids_list[0])
-
-    return embed(all_ids, all_masks, all_ttids)
-
-
 def _local_embed(texts: list[str]) -> list[list[float]]:
-    """Embed texts using local model: ONNX if available, else numpy.
+    # pragma: no cover -- compat shim; use carpenter.embeddings.service in new code.
+    return get_embedding_service().embed(texts)
 
-    This is the primary embedding function for EmbeddingBackend.
-    """
-    global _onnx_available
-    if _onnx_available is None:
-        try:
-            _get_onnx_session()
-            _onnx_available = True
-        except RuntimeError:
-            _onnx_available = False
-            logger.info(
-                "ONNX runtime unavailable; using pure-numpy inference "
-                "(~0.5s/query on ARM, ~50ms on x86)"
-            )
 
-    if _onnx_available:
-        return _onnx_embed(texts)
-    return _numpy_embed(texts)
+# Cached Ollama provider so we don't reconstruct it on every call.
+_ollama_provider: OllamaEmbeddingProvider | None = None
+
+
+def _get_ollama_provider() -> OllamaEmbeddingProvider:
+    global _ollama_provider
+    if _ollama_provider is None:
+        _ollama_provider = OllamaEmbeddingProvider()
+    return _ollama_provider
+
+
+def _ollama_embed(texts: list[str]) -> list[list[float]]:
+    # pragma: no cover -- compat shim; use carpenter.embeddings.service in new code.
+    return _get_ollama_provider().embed(texts)
 
 
 # ---------------------------------------------------------------------------
@@ -272,12 +142,10 @@ def _local_embed(texts: list[str]) -> list[list[float]]:
 class EmbeddingBackend:
     """Semantic search using all-MiniLM-L6-v2 sentence embeddings.
 
-    Tries ONNX Runtime for speed, falls back to pure-numpy inference.
-    Same model, same embeddings — works everywhere including 32-bit ARM
-    and Android.
-
-    Stores body text in ``kb_text_content`` for reindex without filesystem
-    reads, and pre-computed embeddings in ``kb_embeddings``.
+    Delegates the actual embedding to ``carpenter.embeddings.EmbeddingService``
+    via the ``_local_embed`` shim above (kept patchable for existing tests).
+    Storage is unchanged: body text in ``kb_text_content``, pre-computed
+    vectors in ``kb_embeddings``.
     """
 
     _BATCH_SIZE = 10
@@ -336,7 +204,9 @@ class EmbeddingBackend:
         try:
             vectors = _local_embed([text])
         except Exception as _exc:
-            logger.warning("Embedding failed for %s; skipping", path)
+            # Intentionally swallow: embedding is best-effort; entry still
+            # exists in kb_text_content even if vector update fails.
+            logger.warning("Embedding failed for %s; skipping", path, exc_info=True)
             return
         with db_transaction() as db:
             db.execute(
@@ -361,7 +231,11 @@ class EmbeddingBackend:
         try:
             query_vecs = _local_embed([query_text])
         except Exception as _exc:
-            logger.warning("Embedding query failed; returning empty results")
+            # Intentionally swallow: query failures degrade to no semantic
+            # results; caller can still fall back to keyword search.
+            logger.warning(
+                "Embedding query failed; returning empty results", exc_info=True,
+            )
             return []
 
         query_vec = tuple(query_vecs[0])
@@ -391,31 +265,13 @@ class EmbeddingBackend:
 # VectorBackend — Ollama-based embedding (optional, for power users)
 # ---------------------------------------------------------------------------
 
-def _ollama_embed(texts: list[str]) -> list[list[float]]:
-    """Call Ollama /api/embed endpoint to get embeddings.
-
-    Returns a list of embedding vectors (one per input text).
-    Raises on network/API errors.
-    """
-    kb_cfg = CONFIG.get("kb", {})
-    url = kb_cfg.get("embedding_url", "http://192.168.2.243:11434")
-    model = kb_cfg.get("embedding_model", "nomic-embed-text")
-    resp = httpx.post(
-        f"{url}/api/embed",
-        json={"model": model, "input": texts},
-        timeout=30.0,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    return data["embeddings"]
-
-
 class VectorBackend:
     """Embedding-based semantic search using an external Ollama service.
 
     For users who prefer a more powerful embedding model (e.g.
     nomic-embed-text, mxbai-embed-large) running on a separate machine.
-    Configure via ``kb.embedding_url`` and ``kb.embedding_model``.
+    Configure via ``kb.embedding_url`` and ``kb.embedding_model`` (or
+    the new ``embedding.ollama.*`` block).
     """
 
     _BATCH_SIZE = 10
@@ -470,7 +326,12 @@ class VectorBackend:
         try:
             vectors = _ollama_embed([text])
         except Exception as _exc:
-            logger.warning("Embedding failed for %s; skipping vector update", path)
+            # Intentionally swallow: embedding service may be down; entry
+            # body is still cached so a later reindex can fix this.
+            logger.warning(
+                "Embedding failed for %s; skipping vector update",
+                path, exc_info=True,
+            )
             return
         kb_cfg = CONFIG.get("kb", {})
         model = kb_cfg.get("embedding_model", "nomic-embed-text")
@@ -497,7 +358,11 @@ class VectorBackend:
         try:
             query_vecs = _ollama_embed([query_text])
         except Exception as _exc:
-            logger.warning("Embedding query failed; returning empty results")
+            # Intentionally swallow: query failures degrade to no semantic
+            # results; caller can still fall back to keyword search.
+            logger.warning(
+                "Embedding query failed; returning empty results", exc_info=True,
+            )
             return []
 
         kb_cfg = CONFIG.get("kb", {})
@@ -534,7 +399,7 @@ TextSearchBackend = EmbeddingBackend
 FTS5Backend = EmbeddingBackend
 OnnxEmbeddingBackend = EmbeddingBackend
 
-# Keep _embed and _onnx_embed accessible for tests that mock them
+# Keep _embed accessible for tests that mock it
 _embed = _ollama_embed
 
 
@@ -559,3 +424,36 @@ def get_search_backend(backend_name: str = "embedding") -> SearchBackend:
     if backend_name == "vector":
         return VectorBackend()
     raise ValueError(f"Unknown search backend: {backend_name}")
+
+
+# ---------------------------------------------------------------------------
+# Re-exports for legacy callers
+#
+# ``test_onnx_search.py`` and others import ``_serialize_embedding`` /
+# ``_deserialize_embedding`` directly from ``carpenter.kb.search``;
+# keep these available from this module.  The implementations now live
+# in ``carpenter.embeddings.codec``.
+# ---------------------------------------------------------------------------
+
+__all__ = [
+    "SearchBackend",
+    "EmbeddingBackend",
+    "VectorBackend",
+    "TextSearchBackend",
+    "FTS5Backend",
+    "OnnxEmbeddingBackend",
+    "get_search_backend",
+    "_embed_text",
+    "_extract_keywords",
+    "_sanitize_fts_query",
+    "_local_embed",
+    "_ollama_embed",
+    "_serialize_embedding",
+    "_deserialize_embedding",
+    "_cosine_similarity",
+    "_resolve_onnx_model_path",
+    "_download_onnx_model",
+    "_ONNX_MODEL_URL",
+    "_ONNX_MODEL_NAME",
+    "_EMBEDDING_DIM",
+]

@@ -169,7 +169,7 @@ class TestReviewCodeAdversarial:
     def setup_config(self, test_db, monkeypatch):
         current = config.CONFIG.copy()
         current["review"] = {
-            "reviewer_model": "anthropic:claude-sonnet-4-20250514",
+            "reviewer_model": "anthropic:claude-sonnet-4-6",
             "adversarial_mode": True,
             "adversarial_min_findings": 1,
         }
@@ -253,7 +253,7 @@ class TestReviewCodeAdversarial:
     @patch("carpenter.agent.model_resolver.get_next_model")
     def test_model_escalation_on_double_zero(self, mock_next, mock_reviewer_ai):
         """Both passes find nothing — escalates to stronger model."""
-        mock_next.return_value = "anthropic:claude-opus-4-6-20250514"
+        mock_next.return_value = "anthropic:claude-opus-4-7"
         mock_reviewer_ai.side_effect = [
             # Pass 1: no findings
             self._make_tool_response("APPROVE", "Clean", []),
@@ -277,7 +277,7 @@ class TestReviewCodeAdversarial:
     @patch("carpenter.agent.model_resolver.get_next_model")
     def test_escalated_model_also_zero_returns_major(self, mock_next, mock_reviewer_ai):
         """All three passes find nothing — returns MAJOR for human review."""
-        mock_next.return_value = "anthropic:claude-opus-4-6-20250514"
+        mock_next.return_value = "anthropic:claude-opus-4-7"
         mock_reviewer_ai.return_value = self._make_tool_response("APPROVE", "Clean", [])
 
         messages = [{"role": "user", "content": "Write x=1", "content_json": None}]
@@ -363,7 +363,7 @@ class TestAdversarialConfig:
         """Custom min_findings threshold is used."""
         current = config.CONFIG.copy()
         current["review"] = {
-            "reviewer_model": "anthropic:claude-sonnet-4-20250514",
+            "reviewer_model": "anthropic:claude-sonnet-4-6",
             "adversarial_mode": True,
             "adversarial_min_findings": 3,
         }
@@ -405,7 +405,7 @@ class TestStandardModeUnchanged:
     def setup_config(self, test_db, monkeypatch):
         current = config.CONFIG.copy()
         current["review"] = {
-            "reviewer_model": "anthropic:claude-sonnet-4-20250514",
+            "reviewer_model": "anthropic:claude-sonnet-4-6",
             "adversarial_mode": False,
         }
         current["claude_api_key"] = "test-key"
@@ -442,7 +442,7 @@ class TestPipelineAdversarial:
 
         current = config.CONFIG.copy()
         current["review"] = {
-            "reviewer_model": "anthropic:claude-sonnet-4-20250514",
+            "reviewer_model": "anthropic:claude-sonnet-4-6",
             "adversarial_mode": True,
             "adversarial_min_findings": 1,
         }
@@ -478,9 +478,15 @@ class TestPipelineAdversarial:
         result = run_review_pipeline("x = 1\n", conv_id)
 
         assert result.outcome is not None
-        # Verify adversarial tool was used (has findings in schema)
-        call_kwargs = mock_reviewer_ai.call_args[1]
-        tool = call_kwargs["tools"][0]
+        # Verify adversarial tool was used (has findings in schema).
+        # The pipeline now also invokes QQR (text-only, no tools) — find
+        # the main reviewer call by selecting the call that passed tools.
+        tool_calls = [
+            c for c in mock_reviewer_ai.call_args_list
+            if c.kwargs.get("tools")
+        ]
+        assert tool_calls, "Expected at least one tool-using reviewer call"
+        tool = tool_calls[-1].kwargs["tools"][0]
         assert "findings" in tool["input_schema"]["properties"]
         # Verify review_result is populated
         assert result.review_result is not None
@@ -490,7 +496,7 @@ class TestPipelineAdversarial:
         """Pipeline uses standard review when adversarial_mode is False."""
         current = config.CONFIG.copy()
         current["review"] = {
-            "reviewer_model": "anthropic:claude-sonnet-4-20250514",
+            "reviewer_model": "anthropic:claude-sonnet-4-6",
             "adversarial_mode": False,
         }
         current["claude_api_key"] = "test-key"
@@ -515,9 +521,15 @@ class TestPipelineAdversarial:
         result = run_review_pipeline("x = 1\n", conv_id)
 
         assert result.status == "approved"
-        # Standard tool schema (no findings property)
-        call_kwargs = mock_reviewer_ai.call_args[1]
-        tool = call_kwargs["tools"][0]
+        # Standard tool schema (no findings property). The pipeline now
+        # also invokes QQR (text-only, no tools) — find the main
+        # reviewer call by selecting the call that passed tools.
+        tool_calls = [
+            c for c in mock_reviewer_ai.call_args_list
+            if c.kwargs.get("tools")
+        ]
+        assert tool_calls, "Expected at least one tool-using reviewer call"
+        tool = tool_calls[-1].kwargs["tools"][0]
         assert "findings" not in tool["input_schema"]["properties"]
 
 

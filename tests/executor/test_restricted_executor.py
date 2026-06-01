@@ -277,14 +277,47 @@ class TestDispatch:
         assert len(calls) == 3
 
     def test_dispatch_log_recorded(self):
+        """dispatch_log records audit metadata only.
+
+        The log contains the tool name and byte sizes but never the
+        plaintext params or result, so it can never leak non-trusted
+        arc state. See docs/trust-invariants.md I7.
+        """
         handler, _ = _stateful_handler()
         executor = RestrictedExecutor(tool_handler=handler)
         result = executor.execute(
             "dispatch('state.get', {'key': 'test'})"
         )
         assert len(result.dispatch_log) == 1
-        assert result.dispatch_log[0]["tool_name"] == "state.get"
-        assert "result" in result.dispatch_log[0]
+        entry = result.dispatch_log[0]
+        assert entry["tool_name"] == "state.get"
+        # Audit metadata is present.
+        assert isinstance(entry["params_size"], int) and entry["params_size"] > 0
+        assert isinstance(entry["result_size"], int) and entry["result_size"] > 0
+        # Plaintext params and result are NOT present.
+        assert "params" not in entry
+        assert "result" not in entry
+
+    def test_dispatch_log_does_not_leak_state_set_value(self):
+        """state.set(value=<plaintext>) for an untrusted arc must not be
+        recorded in dispatch_log.
+
+        Regression guard for the I7 dispatch-log redaction. If a future
+        change re-adds ``params`` or ``result`` to log entries, this test
+        catches the leak before it ships.
+        """
+        handler, _ = _stateful_handler()
+        executor = RestrictedExecutor(tool_handler=handler)
+        secret = "untrusted-plaintext-secret-9c2f8ad1"
+        result = executor.execute(
+            f"dispatch('state.set', {{'key': 'k', 'value': {secret!r}}})\n"
+            f"dispatch('state.get', {{'key': 'k'}})"
+        )
+        assert result.exit_code == 0
+        # The plaintext must not appear anywhere in dispatch_log,
+        # including as a stringified entry value.
+        log_repr = repr(result.dispatch_log)
+        assert secret not in log_repr
 
     def test_dispatch_handler_error_propagates(self):
         handler, _ = _stateful_handler()

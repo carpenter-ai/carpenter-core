@@ -86,18 +86,18 @@ class TestExtractConversationText:
 class TestGetReviewerModel:
     def test_configured_model(self, test_db, monkeypatch):
         current = config.CONFIG.copy()
-        current["model_roles"] = {**current.get("model_roles", {}), "code_review": "anthropic:claude-opus-4-6"}
+        current["model_roles"] = {**current.get("model_roles", {}), "code_review": "anthropic:claude-opus-4-7"}
         monkeypatch.setattr(config, "CONFIG", current)
 
-        assert get_reviewer_model() == "anthropic:claude-opus-4-6"
+        assert get_reviewer_model() == "anthropic:claude-opus-4-7"
 
     def test_falls_back_to_default_role(self, test_db, monkeypatch):
         current = config.CONFIG.copy()
-        current["model_roles"] = {**current.get("model_roles", {}), "code_review": "", "default": "anthropic:claude-sonnet-4-20250514"}
+        current["model_roles"] = {**current.get("model_roles", {}), "code_review": "", "default": "anthropic:claude-sonnet-4-6"}
         monkeypatch.setattr(config, "CONFIG", current)
 
         result = get_reviewer_model()
-        assert result == "anthropic:claude-sonnet-4-20250514"
+        assert result == "anthropic:claude-sonnet-4-6"
 
     def test_falls_back_to_auto_detect(self, test_db, monkeypatch):
         current = config.CONFIG.copy()
@@ -156,7 +156,7 @@ class TestReviewCode:
     @pytest.fixture(autouse=True)
     def setup_config(self, test_db, monkeypatch):
         current = config.CONFIG.copy()
-        current["review"] = {"reviewer_model": "anthropic:claude-sonnet-4-20250514"}
+        current["review"] = {"reviewer_model": "anthropic:claude-sonnet-4-6"}
         current["claude_api_key"] = "test-key"
         monkeypatch.setattr(config, "CONFIG", current)
 
@@ -329,7 +329,7 @@ class TestReviewCodeToolUse:
     @pytest.fixture(autouse=True)
     def setup_config(self, test_db, monkeypatch):
         current = config.CONFIG.copy()
-        current["review"] = {"reviewer_model": "anthropic:claude-sonnet-4-20250514"}
+        current["review"] = {"reviewer_model": "anthropic:claude-sonnet-4-6"}
         current["claude_api_key"] = "test-key"
         monkeypatch.setattr(config, "CONFIG", current)
 
@@ -387,3 +387,36 @@ class TestReviewCodeToolUse:
         result = review_code("web.post(S1, data=S2)", messages, [])
         assert result.status == "major"
         assert "Sends data externally" in result.reason
+
+
+# --- Reviewer prompts contain scheduling guidance (s031 regression guard) ---
+
+
+class TestReviewerPromptsHaveSchedulingGuidance:
+    """Ensure both reviewer prompts tell the LLM that user-requested cron jobs
+    are legitimate and should be APPROVED. Regression guard for s031, where
+    the intent reviewer was rejecting explicitly-requested recurring API
+    monitoring with `major_alert` because creating a cron was treated as
+    "scheduling future work the user did not request"."""
+
+    def test_intent_reviewer_prompt_mentions_user_requested_recurring(self):
+        from carpenter.review.code_reviewer import INTENT_REVIEWER_SYSTEM_PROMPT
+        # Must explicitly authorise user-requested recurring/cron work.
+        lowered = INTENT_REVIEWER_SYSTEM_PROMPT.lower()
+        assert "scheduling" in lowered or "recurring" in lowered
+        assert "cron" in lowered
+        # The "approve when user asked for it" carve-out must be present so
+        # the reviewer doesn't reject legitimate scheduling requests.
+        assert "approve" in lowered
+        assert (
+            "explicitly" in lowered
+            or "user explicitly" in lowered
+            or "user did not request" in lowered
+        )
+
+    def test_security_reviewer_prompt_mentions_user_requested_recurring(self):
+        from carpenter.review.code_reviewer import REVIEWER_SYSTEM_PROMPT
+        lowered = REVIEWER_SYSTEM_PROMPT.lower()
+        assert "scheduling" in lowered or "recurring" in lowered
+        assert "cron" in lowered
+        assert "approve" in lowered

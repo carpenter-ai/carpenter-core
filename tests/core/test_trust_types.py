@@ -21,11 +21,6 @@ def test_all_agent_types_have_capabilities():
         assert at in _DEFAULT_AGENT_CAPABILITIES, f"{at} missing from _DEFAULT_AGENT_CAPABILITIES"
 
 
-def test_planner_cannot_read_untrusted():
-    caps = _DEFAULT_AGENT_CAPABILITIES[AgentType.PLANNER]
-    assert caps["can_read_untrusted"] is False
-
-
 def test_planner_has_allowed_tools():
     caps = _DEFAULT_AGENT_CAPABILITIES[AgentType.PLANNER]
     assert "arc.create" in caps["allowed_tools"]
@@ -33,15 +28,9 @@ def test_planner_has_allowed_tools():
     assert "web.get" not in caps["allowed_tools"]
 
 
-def test_reviewer_can_read_untrusted():
-    caps = _DEFAULT_AGENT_CAPABILITIES[AgentType.REVIEWER]
-    assert caps["can_read_untrusted"] is True
-
-
 def test_reviewer_allowed_tools_include_verdict():
     caps = _DEFAULT_AGENT_CAPABILITIES[AgentType.REVIEWER]
     assert "review.submit_verdict" in caps["allowed_tools"]
-    assert "arc.read_output_UNTRUSTED" in caps["allowed_tools"]
 
 
 def test_executor_allowed_tools_is_none():
@@ -58,7 +47,6 @@ def test_get_agent_capabilities_returns_defaults_with_empty_config(monkeypatch):
     result = get_agent_capabilities()
     for at in AgentType:
         assert at in result, f"{at} missing from get_agent_capabilities()"
-    assert result[AgentType.PLANNER]["can_read_untrusted"] is False
     assert result[AgentType.EXECUTOR]["allowed_tools"] is None
 
 
@@ -75,7 +63,6 @@ def test_get_agent_capabilities_config_override_tools(monkeypatch):
     assert isinstance(planner_tools, frozenset)
     assert planner_tools == frozenset({"arc.create", "arc.get"})
     # Boolean flags should still come from defaults
-    assert result[AgentType.PLANNER]["can_read_untrusted"] is False
     assert result[AgentType.PLANNER]["can_create_untrusted_arcs"] is True
 
 
@@ -84,11 +71,11 @@ def test_get_agent_capabilities_config_override_booleans(monkeypatch):
     import carpenter.config as cfg
     monkeypatch.setitem(cfg.CONFIG, "agent_capabilities", {
         "REVIEWER": {
-            "can_read_untrusted": False,
+            "can_create_untrusted_arcs": True,
         },
     })
     result = get_agent_capabilities()
-    assert result[AgentType.REVIEWER]["can_read_untrusted"] is False
+    assert result[AgentType.REVIEWER]["can_create_untrusted_arcs"] is True
     # allowed_tools should come from defaults
     assert "review.submit_verdict" in result[AgentType.REVIEWER]["allowed_tools"]
 
@@ -109,14 +96,16 @@ def test_get_agent_capabilities_unmentioned_types_use_defaults(monkeypatch):
     """Agent types not mentioned in config keep their default capabilities."""
     import carpenter.config as cfg
     monkeypatch.setitem(cfg.CONFIG, "agent_capabilities", {
-        "PLANNER": {"can_read_untrusted": True},
+        "PLANNER": {"can_create_untrusted_arcs": False},
     })
     result = get_agent_capabilities()
     # REVIEWER should be unchanged from defaults
-    assert result[AgentType.REVIEWER]["can_read_untrusted"] is True
+    assert result[AgentType.REVIEWER]["can_create_untrusted_arcs"] is False
     assert "review.submit_verdict" in result[AgentType.REVIEWER]["allowed_tools"]
-    # JUDGE should be unchanged
-    assert result[AgentType.JUDGE]["allowed_tools"] == frozenset()
+    # JUDGE should be unchanged — defaults include only resource.submit_verdict
+    assert result[AgentType.JUDGE]["allowed_tools"] == frozenset(
+        {"resource.submit_verdict"}
+    )
 
 
 # ── Validation functions ─────────────────────────────────────────────

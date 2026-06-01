@@ -397,7 +397,7 @@ def test_last_error_storage(sample_arc):
         message="Rate limited",
         status_code=429,
         retry_after=30.0,
-        model="claude-sonnet-3-5-20241022",
+        model="claude-sonnet-4-6",
         provider="anthropic",
         raw_error="HTTPError: 429",
     )
@@ -410,7 +410,7 @@ def test_last_error_storage(sample_arc):
     assert last_error["error_info"]["type"] == "RateLimitError"
     assert last_error["error_info"]["status_code"] == 429
     assert last_error["error_info"]["retry_after"] == 30.0
-    assert last_error["error_info"]["model"] == "claude-sonnet-3-5-20241022"
+    assert last_error["error_info"]["model"] == "claude-sonnet-4-6"
     assert last_error["error_info"]["provider"] == "anthropic"
 
 

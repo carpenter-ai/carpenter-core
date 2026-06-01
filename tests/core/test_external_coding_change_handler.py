@@ -19,6 +19,18 @@ from carpenter.core.workflows._arc_state import (
     set_arc_state as _set_arc_state,
 )
 from carpenter.db import get_db
+from carpenter import forges as _forges
+
+
+def _patch_forge_provider(create_pr_mock):
+    """Return an unstarted ``patch.dict`` that swaps the forgejo provider.
+
+    The substitute provider exposes only the ``create_pr`` method — which
+    is all this test file uses.
+    """
+    fake = MagicMock()
+    fake.create_pr = create_pr_mock
+    return patch.dict(_forges._REGISTRY, {"forgejo": fake})
 
 
 # ---------------------------------------------------------------------------
@@ -335,7 +347,7 @@ class TestHandlePushAndPr:
 
         with patch("carpenter.core.workspace_manager.get_changed_files", return_value=["README.md"]), \
              patch.object(handler.git_backend, "handle_commit_and_push", mock_push), \
-             patch.object(handler.forgejo_api_backend, "handle_create_pr", mock_pr), \
+             _patch_forge_provider(mock_pr), \
              patch.object(handler, "_notify_and_respond", new_callable=AsyncMock):
             await handler.handle_push_and_pr(1, {"arc_id": arc_id})
 
@@ -440,7 +452,7 @@ class TestHandlePushAndPr:
 
         with patch("carpenter.core.workspace_manager.get_changed_files", return_value=["file.py"]), \
              patch.object(handler.git_backend, "handle_commit_and_push", mock_push), \
-             patch.object(handler.forgejo_api_backend, "handle_create_pr", mock_pr), \
+             _patch_forge_provider(mock_pr), \
              patch.object(handler, "_notify_and_respond", new_callable=AsyncMock):
             await handler.handle_push_and_pr(1, {"arc_id": arc_id})
 

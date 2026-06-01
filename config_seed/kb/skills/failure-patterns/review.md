@@ -76,7 +76,7 @@ Failures that occur during the security review pipeline (`review/pipeline.py`). 
 **Escape**:
 1. If the error is transient (503, rate limit), retry after a short delay. The invocation loop has built-in mechanical retries (`mechanical_retry_max`, default 4).
 2. If the API key is invalid: inform the user to check their API key configuration.
-3. If the model name is wrong: check `config.CONFIG.get("review", {}).get("reviewer_model")`. Common format is `"provider:model-name"` (e.g., `"anthropic:claude-sonnet-4-20250514"`).
+3. If the model name is wrong: check `config.CONFIG.get("review", {}).get("reviewer_model")`. Common format is `"provider:model-name"` (e.g., `"anthropic:claude-sonnet-4-6"`).
 4. If there is no reviewer model AND no chat model configured: this is a configuration error. The user must set at least one.
 5. For Ollama-backed reviewers: check that the Ollama server at `config.CONFIG["ollama_url"]` is running and the model is pulled.
 

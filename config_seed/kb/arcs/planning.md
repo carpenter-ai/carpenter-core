@@ -5,7 +5,7 @@ When users ask for a 'workflow' or 'multi-step process', they mean a structure o
 ## Basic pattern
 ```python
 from carpenter_tools.act import arc
-parent_id = arc.create(name="My Workflow", agent_type="PLANNER")
+parent_id = arc.create(name="My Workflow", agent_type="PLANNER")["arc_id"]
 arc.add_child(parent_id, name="Step 1", goal="Do X using messaging.send()")
 arc.add_child(parent_id, name="Step 2", goal="Do Y using messaging.send()")
 ```
@@ -15,13 +15,18 @@ arc.add_child(parent_id, name="Step 2", goal="Do Y using messaging.send()")
 - Each child arc gets its own execution context when the platform invokes it
 - Create ALL arcs (parent + all children) in a SINGLE submit_code call
 - For parallel execution, use `arc.create_batch()` with explicit step_order values
-- `arc.create()` and `arc.add_child()` return **integers**, NOT dicts
-- `arc.create_batch()` returns `{"arc_ids": [list]}` — this IS a dict
+- `arc.create()` and `arc.add_child()` return `{"arc_id": <int>}` — always
+  unwrap with `["arc_id"]` before passing the id to other tools
+  (e.g. `scheduling.add_cron(event_payload={"arc_id": ...})` silently
+  produces a broken trigger if you pass the raw dict).
+- `arc.create_batch()` returns `{"arc_ids": [list of ints]}`
 - `arc.add_child()` does NOT accept `step_order` — it's auto-calculated
 - Arc executor code goes through CaMeL verification — ALL string literals must be wrapped in SecurityType constructors (Label, UnstructuredText, etc.)
 
 **WRONG patterns:**
-- `parent = arc.create(...); parent_id = parent["arc_id"]` — TypeError, returns int
+- `arc_id = arc.create(...); scheduling.add_cron(..., event_payload={"arc_id": arc_id})`
+  — nests the dict; cron fires but dispatch crashes every minute. Use
+  `["arc_id"]` to unwrap.
 - `arc.add_child(..., step_order=0)` — TypeError, no step_order param
 
 ## Agent types
@@ -38,7 +43,7 @@ review_arc_id = arc.add_child(
     name="Review code changes",
     goal="Review the pending diff and report findings",
     agent_type="REVIEWER",
-    model="claude-sonnet-4-5-20250929",
+    model="claude-sonnet-4-6",
 )
 ```
 The `model` parameter sets the specific AI model for that arc.

@@ -10,8 +10,7 @@ Pure-Python AI agent platform using the CaMeL pattern.
   - `db.py` — SQLite WAL connection, schema init
   - `schema.sql` — 25+ tables
   - `core/` — Work queue, event bus, main loop, arc manager, template manager, code manager, workspace manager
-  - `agent/` — AI clients (Anthropic, Ollama, Tinfoil, Local), prompts, invocation loop, coding agent, reflection
-  - `inference/` — Local inference server management (llama.cpp lifecycle)
+  - `agent/` — AI clients (Anthropic, Ollama, Tinfoil, Chain), prompts, invocation loop, coding agent, reflection
   - `executor/` — Executor protocol, subprocess/Docker executors, network egress enforcement
   - `platform/` — OS abstraction (Platform protocol). Concrete implementations live in platform packages (e.g., `carpenter-linux`).
   - `api/` — FastAPI HTTP server, chat, callbacks, webhooks, web UI
@@ -64,8 +63,8 @@ See `docs/design.md` for the authoritative system design document.
 ## Key Patterns
 
 - **Config**: 4-layer precedence in `config.py`: defaults < `config.yaml` < `{base_dir}/.env` (credential keys only) < standard env vars (`ANTHROPIC_API_KEY` etc.). `get_config(key)` is the preferred accessor. Module-level `CONFIG` dict; monkeypatched in tests via `monkeypatch.setattr("carpenter.config.CONFIG", {...})`. `_CREDENTIAL_MAP` is never mutated by `load_config()` to prevent test state leakage. Config values should be native YAML types (unquoted) — no auto-casting of quoted strings.
-- **AI Providers**: `ai_provider` selects backend ("anthropic", "ollama", "tinfoil", "local"). `invocation.py` dispatches via `_get_client()`. All clients retry transient failures with exponential backoff + jitter. Per-provider circuit breaker fast-fails after consecutive failures. HTTP 429 handled by rate limiter, not circuit breaker.
-- **API Standard Normalization**: `agent/api_standard.py` translates between Anthropic and OpenAI API formats. Two standards: `"anthropic"` (native) and `"openai"` (Ollama, llama.cpp, Tinfoil). `_call_with_retries()` normalizes all responses to canonical Anthropic-like format (`content` blocks, `stop_reason`, `usage.input_tokens/output_tokens`), converts tool definitions to provider format before calls, and formats tool results for message threading. The `api_standards` config dict maps providers to standards (defaults in `config.py`). To add a new provider: declare its standard in `api_standards`, implement `call()` with `tools` parameter, and register in `_get_client()`/`_get_provider_for_client()`.
+- **AI Providers**: `ai_provider` selects backend ("anthropic", "ollama", "tinfoil", "chain"). `invocation.py` dispatches via `_get_client()`. All clients retry transient failures with exponential backoff + jitter. Per-provider circuit breaker fast-fails after consecutive failures. HTTP 429 handled by rate limiter, not circuit breaker.
+- **API Standard Normalization**: `agent/api_standard.py` translates between Anthropic and OpenAI API formats. Two standards: `"anthropic"` (native) and `"openai"` (Ollama, Tinfoil). `_call_with_retries()` normalizes all responses to canonical Anthropic-like format (`content` blocks, `stop_reason`, `usage.input_tokens/output_tokens`), converts tool definitions to provider format before calls, and formats tool results for message threading. The `api_standards` config dict maps providers to standards (defaults in `config.py`). To add a new provider: declare its standard in `api_standards`, implement `call()` with `tools` parameter, and register in `_get_client()`/`_get_provider_for_client()`.
 - **Database**: SQLite WAL mode with Row factory. `get_db()` / `init_db()` in `db.py`. All tables use IF NOT EXISTS.
 - **Tests**: Autouse fixture creates isolated temp DB per test. No network, no Docker. Tests mock subprocess/httpx where needed.
 - **Security model**: Read-only agency + pythonic action. Agent uses read-only tools freely; all actions go through `submit_code` → review pipeline → execution. See `docs/security-model.md`.
@@ -104,8 +103,7 @@ Key config areas:
 - `tls_*` — Direct TLS termination settings
 - `encryption.enforce` — Fernet encryption for non-trusted arc output (default: true, fails-closed)
 - `egress_policy` / `egress_enforce` — Executor network egress enforcement
-- `api_standards` — Maps providers to API standard (`"anthropic"` or `"openai"`). Defaults: `{anthropic: anthropic, ollama: openai, local: openai, tinfoil: openai}`. To add a new provider: set its standard here, implement `call()` with `tools` param, register in `_get_client()`/`_get_provider_for_client()`
-- `local_*` — Local inference server: `local_model_path`, `local_llama_cpp_path`, `local_server_port` (8081), `local_context_size` (8192), `local_parallel` (1), `local_repack` ("auto" — checks MemAvailable + commit headroom; or `true`/`false`), `local_gpu_layers` (0), `local_startup_timeout` (120), `local_server_args` (extra CLI flags)
+- `api_standards` — Maps providers to API standard (`"anthropic"` or `"openai"`). Defaults: `{anthropic: anthropic, ollama: openai, tinfoil: openai, chain: anthropic}`. To add a new provider: set its standard here, implement `call()` with `tools` param, register in `_get_client()`/`_get_provider_for_client()`
 - `reflection.*` — Reflective meta-cognition (opt-in, costs API credits)
 - `review.adversarial_mode` — Adversarial zero-findings review mode
 

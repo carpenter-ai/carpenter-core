@@ -13,6 +13,7 @@ from .webhooks import routes as webhooks_routes
 from .chat import routes as chat_routes
 from .review import routes as review_routes
 from .credentials import routes as credentials_routes
+from .oauth import routes as oauth_routes
 from .analytics import routes as analytics_routes
 from .auth import TokenAuthMiddleware
 from .ui import routes as ui_routes
@@ -39,6 +40,7 @@ def create_app() -> Starlette:
         + chat_routes
         + review_routes
         + credentials_routes
+        + oauth_routes
         + analytics_routes
         + ui_routes
     )

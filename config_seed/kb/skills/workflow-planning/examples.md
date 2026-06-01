@@ -1,10 +1,13 @@
 # Arc Operations: Complete Examples
 
-**CRITICAL**: `arc.create()` and `arc.add_child()` return **integers directly** (the arc ID), NOT dicts!
+**CRITICAL**: `arc.create()` and `arc.add_child()` return `{"arc_id": <int>}`
+dicts.  Always unwrap with `result["arc_id"]` before passing the id to
+other tools — especially `scheduling.add_cron(event_payload={"arc_id": ...})`,
+which silently produces a broken trigger if you pass the raw dict.
 
 **IMPORTANT**: `arc.add_child()` does NOT accept a `step_order` parameter. Step order is auto-calculated (max sibling order + 1) when you add children. Children added in sequence will execute sequentially. For parallel execution or custom ordering, use `arc.create_batch()` with explicit `step_order` values.
 
-**NOTE**: Only `arc.create_batch()` returns a dict: `{"arc_ids": [list of arc IDs]}`
+**NOTE**: `arc.create_batch()` returns `{"arc_ids": [list of ints]}`.
 
 ## Example 1: Simple Task Arc
 
@@ -14,13 +17,13 @@
 ```python
 from carpenter_tools.act import arc, state
 
-# Create arc (returns int directly)
+# Create arc (returns dict; unwrap to int)
 arc_id = arc.create(
     name="Process data.csv",
     goal="Convert CSV to JSON",
     parent_id=None,
     output_type="json"
-)
+)["arc_id"]
 
 # Store the arc_id for later reference
 state.set(key="current_task_arc", value=arc_id, arc_id=0)  # arc_id=0 = conversation-level state
@@ -37,40 +40,40 @@ print(f"Next step: The platform will invoke this arc and it will process the fil
 ```python
 from carpenter_tools.act import arc
 
-# Create parent planner arc (returns int)
+# Create parent planner arc (returns dict; unwrap to int)
 parent_id = arc.create(
     name="Generate Monthly Report",
     goal="Compile and publish monthly metrics report",
     parent_id=None,
     agent_type="PLANNER"
-)
+)["arc_id"]
 
-# Step 1: Gather data (returns int, step_order auto-calculated as 0)
+# Step 1: Gather data (step_order auto-calculated as 0)
 step1_id = arc.add_child(
     parent_id=parent_id,
     name="Gather metrics",
     goal="Query database for last month's metrics",
     agent_type="EXECUTOR",
     output_type="json"
-)
+)["arc_id"]
 
-# Step 2: Generate charts (returns int, step_order auto-calculated as 1)
+# Step 2: Generate charts (step_order auto-calculated as 1)
 step2_id = arc.add_child(
     parent_id=parent_id,
     name="Generate visualizations",
     goal="Create charts and graphs from metrics",
     agent_type="EXECUTOR",
     output_type="python"
-)
+)["arc_id"]
 
-# Step 3: Publish report (returns int, step_order auto-calculated as 2)
+# Step 3: Publish report (step_order auto-calculated as 2)
 step3_id = arc.add_child(
     parent_id=parent_id,
     name="Publish report",
     goal="Send report to stakeholders",
     agent_type="EXECUTOR",
     output_type="text"
-)
+)["arc_id"]
 
 print(f"✓ Created workflow with 3 steps")
 print(f"  Parent arc: #{parent_id}")
@@ -89,13 +92,13 @@ print(f"  Step 3: #{step3_id} (publish)")
 ```python
 from carpenter_tools.act import arc
 
-# Create parent (returns int)
+# Create parent (returns dict; unwrap to int)
 parent_id = arc.create(
     name="Run Test Suite",
     goal="Execute all tests and verify results",
     parent_id=None,
     agent_type="PLANNER"
-)
+)["arc_id"]
 
 # Create parallel test arcs using create_batch (all with step_order=0)
 batch_result = arc.create_batch(
@@ -148,14 +151,13 @@ print(f"  Gate: #{gate['arc_id']}")
 ```python
 from carpenter_tools.act import arc
 
-# Create parent planner
-parent = arc.create(
+# Create parent planner (returns dict; unwrap to int)
+parent_id = arc.create(
     name="External Data Pipeline",
     goal="Safely fetch and process untrusted API data",
     parent_id=None,
     agent_type="PLANNER"
-)
-parent_id = parent  # parent is already an int
+)["arc_id"]
 
 # Create tainted + review arcs together (MUST use create_batch)
 batch = arc.create_batch(
@@ -218,14 +220,14 @@ print(f"  Process (clean): #{processing['arc_id']}")
 ```python
 from carpenter_tools.act import arc, state
 
-# Create a workflow
-parent = arc.create(
+# Create a workflow (returns dict; unwrap to int)
+parent_id = arc.create(
     name="Data Pipeline with State",
     goal="Process data across multiple steps",
     parent_id=None,
     agent_type="PLANNER"
-)
-parent_id = parent  # parent is already an int
+)["arc_id"]
+pid = parent_id  # alias used below
 
 step1 = arc.add_child(
     parent_id=pid,
@@ -341,15 +343,13 @@ You (agent): "I'll create a root arc and request template instantiation"
 ```python
 from carpenter_tools.act import arc, messaging
 
-# Create root arc for the workflow
-root = arc.create(
+# Create root arc for the workflow (returns dict; unwrap to int)
+root_id = arc.create(
     name="Dark Factory: Build Authentication System",
     goal="Autonomous development of JWT authentication with tests",
     parent_id=None,
     agent_type="PLANNER"
-)
-
-root_id = root  # root is already an int
+)["arc_id"]
 
 # Request template instantiation via messaging
 # The platform will see this notification and instantiate the template

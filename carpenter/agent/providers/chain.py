@@ -20,7 +20,7 @@ Example config::
         timeout: 300
       - name: claude-haiku
         provider: anthropic
-        model: "claude-haiku-4-5-20251001"
+        model: "claude-haiku-4-5"
         context_window: 200000
         timeout: 120
 """

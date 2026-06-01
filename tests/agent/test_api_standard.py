@@ -16,9 +16,6 @@ class TestGetApiStandard:
     def test_ollama_default(self):
         assert api_standard.get_api_standard("ollama") == "openai"
 
-    def test_local_default(self):
-        assert api_standard.get_api_standard("local") == "openai"
-
     def test_tinfoil_default(self):
         assert api_standard.get_api_standard("tinfoil") == "openai"
 
@@ -39,8 +36,8 @@ class TestGetApiStandard:
             api_standard.config.CONFIG, "api_standards",
             {"ollama": "anthropic"},
         )
-        # local not in config override, should fall back to built-in default
-        assert api_standard.get_api_standard("local") == "openai"
+        # tinfoil not in config override, should fall back to built-in default
+        assert api_standard.get_api_standard("tinfoil") == "openai"
 
 
 # -- convert_tools_for_provider --

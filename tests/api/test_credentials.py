@@ -1,8 +1,12 @@
 """Tests for carpenter.api.credentials."""
 
 import json
+import os
+import stat
 from pathlib import Path
 from unittest.mock import patch, MagicMock
+
+import pytest
 
 from carpenter.api.credentials import (
     create_credential_request,
@@ -79,6 +83,102 @@ def test_update_dot_env_update_existing(tmp_path, monkeypatch):
     assert "old_value" not in dot_env
 
 
+def test_update_dot_env_sets_mode_600(tmp_path, monkeypatch):
+    """The .env file is chmod 600 after a write — owner-only.
+
+    The file holds OAuth refresh tokens; world- or group-readable
+    permissions would leak them to any user on the host.
+    """
+    monkeypatch.setattr("carpenter.api.credentials.config.CONFIG",
+                        {"base_dir": str(tmp_path)})
+
+    _update_dot_env("REFRESH_TOKEN", "secret-value")
+
+    dot_env = tmp_path / ".env"
+    assert dot_env.is_file()
+    mode = stat.S_IMODE(dot_env.stat().st_mode)
+    assert mode == 0o600, f"expected 0o600, got {oct(mode)}"
+
+
+def test_update_dot_env_sets_mode_600_on_existing_file(tmp_path, monkeypatch):
+    """Even when .env existed with looser perms, update tightens to 600."""
+    dot_env = tmp_path / ".env"
+    dot_env.write_text("OLD=value\n")
+    os.chmod(dot_env, 0o644)
+    monkeypatch.setattr("carpenter.api.credentials.config.CONFIG",
+                        {"base_dir": str(tmp_path)})
+
+    _update_dot_env("NEW", "value")
+
+    mode = stat.S_IMODE(dot_env.stat().st_mode)
+    assert mode == 0o600
+
+
+def test_update_dot_env_atomic_write_preserves_original_on_failure(
+    tmp_path, monkeypatch,
+):
+    """If the write fails mid-way, the original .env is left intact.
+
+    Atomicity comes from write-to-temp + os.rename.  We simulate a
+    crash between temp-file write and rename by patching os.rename to
+    raise — the original file must be unchanged.
+    """
+    dot_env = tmp_path / ".env"
+    original_contents = "EXISTING=preserved\nKEEP=alive\n"
+    dot_env.write_text(original_contents)
+    os.chmod(dot_env, 0o600)
+
+    monkeypatch.setattr("carpenter.api.credentials.config.CONFIG",
+                        {"base_dir": str(tmp_path)})
+
+    def boom(*args, **kwargs):
+        raise OSError("simulated crash mid-rename")
+
+    monkeypatch.setattr("carpenter.util.dot_env.os.rename", boom)
+
+    with pytest.raises(OSError, match="simulated crash"):
+        _update_dot_env("NEW_KEY", "new-value")
+
+    # Original file is intact.
+    assert dot_env.read_text() == original_contents
+
+    # No leftover .tmp.<pid> files.
+    leftovers = list(tmp_path.glob(".env.tmp.*"))
+    assert leftovers == [], f"temp files leaked: {leftovers}"
+
+
+def test_update_dot_env_no_partial_write_visible(tmp_path, monkeypatch):
+    """A failed write must not leave a half-written .env on disk."""
+    dot_env = tmp_path / ".env"
+    dot_env.write_text("KEY=v1\n")
+
+    monkeypatch.setattr("carpenter.api.credentials.config.CONFIG",
+                        {"base_dir": str(tmp_path)})
+
+    # Force the low-level write to fail before rename.
+    real_os_write = os.write
+
+    def bad_write(fd, data):
+        # ``os.fstat`` lets us see which file the fd points at; any
+        # write to a path containing ``.env.tmp.`` is the temp-file
+        # write we want to break.
+        try:
+            link = os.readlink(f"/proc/self/fd/{fd}")
+        except OSError:
+            link = ""
+        if ".env.tmp." in link:
+            raise OSError("disk full")
+        return real_os_write(fd, data)
+
+    monkeypatch.setattr("carpenter.util.dot_env.os.write", bad_write)
+
+    with pytest.raises(OSError, match="disk full"):
+        _update_dot_env("KEY", "v2")
+
+    # Original survives.
+    assert dot_env.read_text() == "KEY=v1\n"
+
+
 # ---------------------------------------------------------------------------
 # verify_credential
 # ---------------------------------------------------------------------------
@@ -104,7 +204,7 @@ def test_verify_credential_git_token_success(monkeypatch):
     mock_response.status_code = 200
     mock_response.json.return_value = {"login": "bot-user"}
 
-    with patch("carpenter.api.credentials.httpx") as mock_httpx:
+    with patch("carpenter.forges.forgejo.httpx") as mock_httpx:
         mock_httpx.get.return_value = mock_response
         result = verify_credential("GIT_TOKEN")
 
@@ -126,7 +226,7 @@ def test_verify_credential_forgejo_token_backward_compat(monkeypatch):
     mock_response.status_code = 200
     mock_response.json.return_value = {"login": "bot-user"}
 
-    with patch("carpenter.api.credentials.httpx") as mock_httpx:
+    with patch("carpenter.forges.forgejo.httpx") as mock_httpx:
         mock_httpx.get.return_value = mock_response
         result = verify_credential("FORGEJO_TOKEN")
 
@@ -144,7 +244,7 @@ def test_verify_credential_git_token_failure(monkeypatch):
     mock_response = MagicMock()
     mock_response.status_code = 401
 
-    with patch("carpenter.api.credentials.httpx") as mock_httpx:
+    with patch("carpenter.forges.forgejo.httpx") as mock_httpx:
         mock_httpx.get.return_value = mock_response
         result = verify_credential("GIT_TOKEN")
 

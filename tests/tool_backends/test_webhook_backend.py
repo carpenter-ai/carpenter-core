@@ -21,7 +21,7 @@ def test_subscribe_creates_subscription_and_forgejo_hook(monkeypatch):
         "active": True,
     }
 
-    with patch("carpenter.tool_backends.forgejo_api.httpx") as mock_httpx:
+    with patch("carpenter.forges.forgejo.httpx") as mock_httpx:
         mock_httpx.post.return_value = mock_hook_response
         result = webhook.handle_subscribe({
             "source_type": "forgejo",
@@ -69,7 +69,7 @@ def test_subscribe_forgejo_error():
     mock_response.status_code = 403
     mock_response.json.return_value = {"message": "forbidden"}
 
-    with patch("carpenter.tool_backends.forgejo_api.httpx") as mock_httpx:
+    with patch("carpenter.forges.forgejo.httpx") as mock_httpx:
         mock_httpx.post.return_value = mock_response
         result = webhook.handle_subscribe({
             "source_type": "forgejo",
@@ -110,7 +110,7 @@ def test_subscribe_builds_target_url(monkeypatch):
     monkeypatch.setitem(tc_config.CONFIG, "git_server_url", "https://forge.example.com")
     monkeypatch.setitem(tc_config.CONFIG, "git_token", "test-token")
 
-    with patch("carpenter.tool_backends.forgejo_api.httpx") as mock_httpx:
+    with patch("carpenter.forges.forgejo.httpx") as mock_httpx:
         mock_httpx.post.return_value = mock_response
         result = webhook.handle_subscribe({
             "source_type": "forgejo",
@@ -144,7 +144,7 @@ def test_subscribe_builds_target_url_no_tls(monkeypatch):
     monkeypatch.setitem(tc_config.CONFIG, "git_server_url", "https://forge.example.com")
     monkeypatch.setitem(tc_config.CONFIG, "git_token", "test-token")
 
-    with patch("carpenter.tool_backends.forgejo_api.httpx") as mock_httpx:
+    with patch("carpenter.forges.forgejo.httpx") as mock_httpx:
         mock_httpx.post.return_value = mock_response
         webhook.handle_subscribe({
             "source_type": "forgejo",
@@ -266,7 +266,7 @@ def test_delete_with_forgejo_cleanup():
     mock_response.status_code = 204
     mock_response.text = ""
 
-    with patch("carpenter.tool_backends.forgejo_api.httpx") as mock_httpx:
+    with patch("carpenter.forges.forgejo.httpx") as mock_httpx:
         mock_httpx.delete.return_value = mock_response
         result = webhook.handle_delete({"webhook_id": "hook-with-forge"})
 
@@ -292,7 +292,7 @@ def test_delete_forgejo_failure_still_deletes_locally():
     mock_response.text = "Not Found"
     mock_response.json.return_value = {"message": "hook not found"}
 
-    with patch("carpenter.tool_backends.forgejo_api.httpx") as mock_httpx:
+    with patch("carpenter.forges.forgejo.httpx") as mock_httpx:
         mock_httpx.delete.return_value = mock_response
         result = webhook.handle_delete({"webhook_id": "hook-forge-fail"})
 

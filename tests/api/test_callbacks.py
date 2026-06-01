@@ -156,39 +156,6 @@ class TestCallerArcIdInjection:
         # arc_id is the target being acted upon, not the caller.
         assert ctx is None
 
-    def test_cross_arc_untrusted_read_uses_caller_taint(self):
-        """Untrusted caller reading trusted target via arc.read_output_UNTRUSTED succeeds."""
-        from carpenter.core.arcs import manager as arc_manager
-
-        # Untrusted caller (allowed to use UNTRUSTED tools)
-        parent = arc_manager.create_arc("parent")
-        caller_id = arc_manager.add_child(parent, "caller", integrity_level="untrusted")
-        # Trusted target arc
-        target_id = arc_manager.create_arc("target", integrity_level="trusted")
-
-        # This is a session-exempt tool, so no session needed
-        result = validate_and_dispatch(
-            "arc.read_output_UNTRUSTED",
-            {"_caller_arc_id": caller_id, "arc_id": target_id},
-        )
-        # Untrusted caller is allowed to access UNTRUSTED data tools
-        assert isinstance(result, dict)
-
-    def test_clean_caller_blocked_from_untrusted_tools(self):
-        """Trusted caller cannot use UNTRUSTED tools even with untrusted target."""
-        from carpenter.core.arcs import manager as arc_manager
-
-        caller_id = arc_manager.create_arc("caller", integrity_level="trusted")
-        parent = arc_manager.create_arc("parent")
-        target_id = arc_manager.add_child(parent, "target", integrity_level="untrusted")
-
-        with pytest.raises(DispatchError, match="untrusted"):
-            validate_and_dispatch(
-                "arc.read_output_UNTRUSTED",
-                {"_caller_arc_id": caller_id, "arc_id": target_id},
-            )
-
-
 # --- Tainted conversation forces integrity on arc creation ---
 
 

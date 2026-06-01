@@ -37,6 +37,7 @@ def invoke_coding_agent(
     workspace: str,
     prompt: str,
     agent_name: str | None = None,
+    arc_id: int | None = None,
 ) -> dict:
     """Invoke the named (or default) coding agent.
 
@@ -44,6 +45,9 @@ def invoke_coding_agent(
         workspace: Absolute path to the workspace directory.
         prompt: The user's coding instruction.
         agent_name: Name of the coding agent profile. None = use default.
+        arc_id: Arc that this coding-agent run is executing for. Forwarded
+            to the built-in agent so per-iteration API calls can be logged
+            against the arc in the ``api_calls`` table.
 
     Returns:
         Result dict from the agent (stdout, exit_code, etc.)
@@ -57,7 +61,7 @@ def invoke_coding_agent(
     logger.info("Invoking coding agent: name=%s, type=%s", name, agent_type)
 
     if agent_type == "builtin":
-        return coding_agent.run(workspace, prompt, profile)
+        return coding_agent.run(workspace, prompt, profile, arc_id=arc_id)
     elif agent_type == "external":
         return external_coding_agent.run(workspace, prompt, profile)
     else:

@@ -19,6 +19,102 @@ logger = logging.getLogger(__name__)
 RESULT_PREVIEW_MAX = 4000
 
 
+def _build_resource_preview(arc_id: int, arc_name: str) -> str | None:
+    """Build a completion message from the arc's ``_primary_resource_id``.
+
+    Returns the fully-formatted message string, or ``None`` if the arc
+    has no ``_primary_resource_id`` (caller should fall back to the
+    ``_agent_response`` path).  When the Resource exists but is not
+    trusted (pending/rejected/missing), returns a hybrid message that
+    still includes the ``_agent_response`` body plus a note about the
+    pending Resource.
+    """
+    primary_id = get_arc_state(arc_id, "_primary_resource_id", None)
+    if primary_id is None:
+        return None
+
+    # Import here to avoid widening module-import surface on cold start.
+    from ..resources import (
+        get_resource,
+        is_trusted,
+        read_resource_content,
+    )
+
+    row = get_resource(primary_id)
+    if row is None:
+        # Resource was cleaned up or the id is stale — fall back.
+        logger.warning(
+            "arc.chat_notify: arc %d has _primary_resource_id=%s but "
+            "Resource not found; falling back to _agent_response",
+            arc_id, primary_id,
+        )
+        return None
+
+    content_type = row.get("content_type") or "unknown"
+    total_bytes = row.get("byte_size")
+
+    if is_trusted(primary_id) and row.get("deleted_at") is None:
+        try:
+            preview = read_resource_content(
+                primary_id, 0, RESULT_PREVIEW_MAX, caller_arc_id=None,
+            )
+        except (FileNotFoundError, ValueError) as e:
+            logger.warning(
+                "arc.chat_notify: arc %d primary Resource %d read failed: %s; "
+                "falling back to _agent_response",
+                arc_id, primary_id, e,
+            )
+            return None
+        total_bytes_str = (
+            str(total_bytes) if total_bytes is not None else "unknown"
+        )
+        msg = (
+            f'[Arc "{arc_name}" completed: {preview}]\n'
+            f"[Primary resource: #{primary_id} ({content_type}, trusted, "
+            f"{total_bytes_str} bytes total). Use read_resource("
+            f"{primary_id}) for full content.]\n[Be concise.]"
+        )
+        return msg
+
+    # Untrusted / pending / rejected / deleted — surface the fact and
+    # still show the _agent_response body so the user can see *something*.
+    verdict = row.get("template_verdict")
+    if row.get("deleted_at") is not None:
+        verdict_descr = "deleted"
+    else:
+        verdict_descr = verdict if verdict else "none (raw ingest)"
+    note = (
+        f"[Note: this arc produced a Resource but it was not approved "
+        f"(verdict={verdict_descr}). Raw summary from _agent_response "
+        "shown below.]"
+    )
+    body_response = get_arc_state(arc_id, "_agent_response", "") or ""
+    if not body_response:
+        children = arc_manager.get_children(arc_id) or []
+        for child in reversed(children):
+            child_resp = get_arc_state(
+                child["id"], "_agent_response", ""
+            ) or ""
+            if child_resp:
+                body_response = child_resp
+                break
+    full_length = len(body_response)
+    was_truncated = full_length > RESULT_PREVIEW_MAX
+    if was_truncated:
+        body_response = body_response[:RESULT_PREVIEW_MAX] + "..."
+    if body_response:
+        msg = f'{note}\n[Arc "{arc_name}" completed: {body_response}]'
+        if was_truncated:
+            msg += (
+                f"\n[Truncated — full result is {full_length} chars. "
+                f"Use read_arc_result(arc_id={arc_id}) for complete output.]"
+            )
+        msg += "\n[Be concise.]"
+    else:
+        msg = f'{note}\n[Arc "{arc_name}" completed.]'
+    return msg
+
+
 async def handle_arc_chat_notify(work_id: int, payload: dict) -> None:
     """Handle an ``arc.chat_notify`` work item.
 
@@ -57,32 +153,41 @@ async def handle_arc_chat_notify(work_id: int, payload: dict) -> None:
     status = arc["status"]
 
     if status == "completed":
-        result = get_arc_state(arc_id, "_agent_response", "") or ""
-        # If root arc has no response, check children (agent response is
-        # stored on the child arc that actually ran the agent)
-        if not result:
-            children = arc_manager.get_children(arc_id) or []
-            # Iterate in reverse step_order so the JUDGE/REVIEWER response
-            # (the most refined summary) is preferred over the EXECUTOR's.
-            for child in reversed(children):
-                child_resp = get_arc_state(child["id"], "_agent_response", "") or ""
-                if child_resp:
-                    result = child_resp
-                    break
-        full_length = len(result)
-        was_truncated = full_length > RESULT_PREVIEW_MAX
-        if was_truncated:
-            result = result[:RESULT_PREVIEW_MAX] + "..."
-        if result:
-            msg = f'[Arc "{name}" completed: {result}]'
-            if was_truncated:
-                msg += (
-                    f"\n[Truncated — full result is {full_length} chars. "
-                    f"Use read_arc_result(arc_id={arc_id}) for complete output.]"
-                )
-            msg += "\n[Be concise.]"
+        # Prefer a trusted primary Resource preview when the arc set one.
+        resource_msg = _build_resource_preview(arc_id, name)
+        if resource_msg is not None:
+            msg = resource_msg
         else:
-            msg = f'[Arc "{name}" completed.]'
+            result = get_arc_state(arc_id, "_agent_response", "") or ""
+            # If root arc has no response, check children (agent response is
+            # stored on the child arc that actually ran the agent)
+            if not result:
+                children = arc_manager.get_children(arc_id) or []
+                # Iterate in reverse step_order so the JUDGE/REVIEWER
+                # response (the most refined summary) is preferred over
+                # the EXECUTOR's.
+                for child in reversed(children):
+                    child_resp = get_arc_state(
+                        child["id"], "_agent_response", ""
+                    ) or ""
+                    if child_resp:
+                        result = child_resp
+                        break
+            full_length = len(result)
+            was_truncated = full_length > RESULT_PREVIEW_MAX
+            if was_truncated:
+                result = result[:RESULT_PREVIEW_MAX] + "..."
+            if result:
+                msg = f'[Arc "{name}" completed: {result}]'
+                if was_truncated:
+                    msg += (
+                        f"\n[Truncated — full result is {full_length} "
+                        f"chars. Use read_arc_result(arc_id={arc_id}) "
+                        "for complete output.]"
+                    )
+                msg += "\n[Be concise.]"
+            else:
+                msg = f'[Arc "{name}" completed.]'
     else:
         msg = f'[Arc "{name}" failed.]'
 

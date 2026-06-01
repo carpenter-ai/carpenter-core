@@ -1,5 +1,7 @@
-"""Platform management tools. Tier 1: callback to platform."""
-from .._callback import callback
+"""Platform management tool declarations.
+
+See ``carpenter_tools`` package docstring for the invocation model.
+"""
 from ..tool_meta import tool
 
 
@@ -13,7 +15,4 @@ def request_restart(mode: str = "opportunistic", reason: str = "") -> dict:
               'urgent' drains in-flight work then restarts immediately.
         reason: Optional human-readable reason for the restart.
     """
-    return callback("platform.request_restart", {
-        "mode": mode,
-        "reason": reason,
-    })
+    ...

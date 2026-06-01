@@ -224,9 +224,28 @@ class KBStore:
         # Update linked_byte_counts for targets
         self._update_linked_byte_counts(path)
 
-        # Trigger skill-KB review for agent-initiated writes to skills/ path
-        if path.startswith("skills/") and auto_source is None:
-            self._trigger_skill_kb_review(path, content_hash, conversation_id)
+        # Emit a generic KB write event. Templates subscribe to this event
+        # (with path-prefix + auto_source filters) to trigger reviews or
+        # other follow-on workflows — see ``config_seed/templates/
+        # skill-kb-review/skill-kb-review.yaml``. Emitting unconditionally
+        # keeps the platform decoupled from individual templates.
+        try:
+            from ..core.engine import event_bus
+            event_bus.record_event(
+                "kb.entry_written",
+                {
+                    "path": path,
+                    "content_hash": content_hash,
+                    "conversation_id": conversation_id,
+                    "auto_source": auto_source,
+                    "entry_type": entry_type,
+                    "trust_level": trust_level,
+                },
+                source="kb.store",
+            )
+        except Exception:
+            # Never let event emission break a KB write.
+            logger.exception("Failed to emit kb.entry_written for %s", path)
 
         return f"Wrote KB entry: {path}"
 
@@ -412,28 +431,6 @@ class KBStore:
                 "INSERT OR IGNORE INTO kb_change_queue (file_path, change_type) "
                 "VALUES (?, ?)",
                 (file_path, change_type),
-            )
-
-    def _trigger_skill_kb_review(
-        self, path: str, content_hash: str, conversation_id: int | None = None,
-    ) -> None:
-        """Trigger a skill-KB review arc for a modified skill entry.
-
-        Only fires if ``skill_kb_review.enabled`` is True in config.
-        Failures are logged but never propagated to the caller.
-        """
-        try:
-            from ..core.workflows.skill_kb_review_handler import trigger_review
-            result = trigger_review(
-                path=path, content_hash=content_hash,
-                conversation_id=conversation_id,
-            )
-            logger.info(
-                "Skill-KB review trigger for %s: arc_id=%s", path, result,
-            )
-        except (OSError, ValueError, KeyError) as _exc:
-            logger.exception(
-                "Failed to trigger skill-KB review for %s", path,
             )
 
     # ── Internal helpers ──────────────────────────────────────────────

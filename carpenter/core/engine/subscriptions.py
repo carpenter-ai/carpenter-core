@@ -38,6 +38,12 @@ class Subscription:
     action_type: str = "enqueue_work"  # predefined action type
     action_config: dict = field(default_factory=dict)  # parameters for the action
     enabled: bool = True
+    # B-full (D24): when a capability package contributes a subscription
+    # the installer tags it with ``source_package`` so
+    # :func:`unregister_for_package` can drop matching entries on
+    # uninstall.  Subscriptions registered from platform config or
+    # built-ins leave this ``None``.
+    source_package: str | None = None
 
 
 # In-memory subscription list, loaded from config at startup
@@ -59,7 +65,19 @@ def load_subscriptions(sub_configs: list[dict]) -> int:
     loaded = 0
     for cfg in sub_configs:
         name = cfg.get("name")
-        event_type = cfg.get("on")
+        # Accept "on", "event", or the literal ``True`` key (YAML 1.1 parses
+        # bare ``on:`` as a boolean, which templates declared from YAML are
+        # prone to; quoting the key is another option but this avoids the
+        # footgun).
+        # Fallback keys: Python ``True`` (dict-form configs loaded direct
+        # from YAML), and the string ``"true"`` (same keys after a
+        # JSON round-trip, since JSON has no bool keys).
+        event_type = (
+            cfg.get("on")
+            or cfg.get("event")
+            or cfg.get(True)
+            or cfg.get("true")
+        )
         enabled = cfg.get("enabled", True)
 
         if not name or not event_type:
@@ -103,6 +121,46 @@ def _filter_matches(event_filter: dict | None, payload: dict) -> bool:
     return filter_matches(event_filter, payload)
 
 
+def _source_package_matches(
+    sub: "Subscription", payload: dict,
+) -> bool:
+    """I9 cross-package isolation gate (Phase 3a PR-B).
+
+    Enforces: if an event was emitted by a packaged trigger (carries
+    ``_source_package`` in its payload), then a packaged subscription
+    can only match it when ``sub.source_package == _source_package``.
+
+    The check is **only active when both sides are tagged** so that:
+
+    * Platform-builtin and config-defined subscriptions
+      (``sub.source_package=None``) continue to match every event,
+      including those emitted by packaged triggers — needed so the
+      built-in ``timer_forward`` / ``webhook-dispatch`` subscriptions
+      still work for packaged trigger output if anyone wires it.
+    * Packaged subscriptions can still match events from non-package
+      sources (raw ``event_bus.record_event`` calls, HTTP webhooks,
+      external systems) which leave ``_source_package`` absent.  This
+      is the "package responds to external event" pattern that
+      ``trigger_subscriptions`` was designed around in B-full.
+
+    The case the check is designed to block is the cross-package one:
+    package X's trigger emits an event ⇒ package Y's subscription
+    must NOT receive it.  That's the new I9 surface (least privilege
+    between packages) the plan calls out.
+    """
+    sub_pkg = sub.source_package
+    if sub_pkg is None:
+        # Untagged subscription: legacy semantics, match everything.
+        return True
+    event_pkg = payload.get("_source_package")
+    if event_pkg is None:
+        # Untagged event (platform / external source): permissive — let
+        # the packaged subscription see it.  Closes a back-compat gap
+        # without weakening cross-package isolation.
+        return True
+    return event_pkg == sub_pkg
+
+
 def _execute_action(db, sub: Subscription, event: dict, payload: dict) -> bool:
     """Execute a subscription's action within the current transaction.
 
@@ -123,6 +181,8 @@ def _execute_action(db, sub: Subscription, event: dict, payload: dict) -> bool:
         return _action_create_arc(db, sub, event, payload)
     elif sub.action_type == "send_notification":
         return _action_send_notification(db, sub, event, payload)
+    elif sub.action_type == "package_dispatch":
+        return _action_package_dispatch(db, sub, event, payload)
     else:
         logger.warning("Unknown action type %r in subscription %s", sub.action_type, sub.name)
         return False
@@ -197,13 +257,34 @@ def _action_create_arc(db, sub: Subscription, event: dict, payload: dict) -> boo
     """Enqueue an arc creation work item.
 
     Rather than creating the arc directly (which requires complex
-    transactional logic), we enqueue a work item that the arc dispatch
-    handler will process.
+    transactional logic), we enqueue a work item that the
+    ``subscription.create_arc`` handler will process.
+
+    Optional ``template_name`` or ``template_id`` in the action config
+    names a workflow template. When provided, the template is resolved
+    here and its ``template_id`` is stored in the enqueued payload so
+    the downstream handler can call ``instantiate_template`` without
+    repeating the lookup. Resolution failures skip the action (and log)
+    rather than creating an arc with a missing/invalid template.
     """
     arc_config = dict(sub.action_config)
     arc_config["_subscription"] = sub.name
     arc_config["_event_id"] = event["id"]
     arc_config["_event_payload"] = payload
+
+    template_name = arc_config.get("template_name")
+    template_id = arc_config.get("template_id")
+    if template_name or template_id is not None:
+        resolved = _resolve_template(template_name, template_id)
+        if resolved is None:
+            logger.warning(
+                "Subscription %s: create_arc skipped, template not found "
+                "(template_name=%r, template_id=%r)",
+                sub.name, template_name, template_id,
+            )
+            return False
+        arc_config["template_id"] = resolved["id"]
+        arc_config["template_name"] = resolved["name"]
 
     idempotency_key = f"sub-arc-{sub.name}-event-{event['id']}"
 
@@ -214,6 +295,113 @@ def _action_create_arc(db, sub: Subscription, event: dict, payload: dict) -> boo
         ("subscription.create_arc", json.dumps(arc_config), idempotency_key, 3),
     )
     return cursor.rowcount > 0
+
+
+def _resolve_template(name: str | None, template_id: int | None) -> dict | None:
+    """Resolve a template by name or id. Returns the template row dict or None.
+
+    If both are given, both must agree. Imported lazily to avoid a circular
+    import at module load time.
+    """
+    from . import template_manager
+
+    if template_id is not None:
+        tmpl = template_manager.get_template(template_id)
+        if tmpl is None:
+            return None
+        if name and tmpl.get("name") != name:
+            logger.warning(
+                "Template id %d resolves to name %r but action config says %r",
+                template_id, tmpl.get("name"), name,
+            )
+            return None
+        return tmpl
+    if name:
+        return template_manager.get_template_by_name(name)
+    return None
+
+
+def _substitute_event_refs(value, event_payload: dict):
+    """Expand ``{event.payload.KEY}`` placeholders in subscription config.
+
+    Supports string values and recurses into list/dict containers. An
+    unmatched placeholder is left in place (no exception). Only the
+    exact-match single-placeholder case preserves the original value's
+    type; mixed strings return strings.
+    """
+    if isinstance(value, str):
+        import re
+        pattern = re.compile(r"\{event\.payload\.([A-Za-z0-9_]+)\}")
+        # Exact single-placeholder match: preserve value type.
+        m = pattern.fullmatch(value)
+        if m and m.group(1) in event_payload:
+            return event_payload[m.group(1)]
+        return pattern.sub(
+            lambda mm: str(event_payload.get(mm.group(1), mm.group(0))),
+            value,
+        )
+    if isinstance(value, list):
+        return [_substitute_event_refs(v, event_payload) for v in value]
+    if isinstance(value, dict):
+        return {k: _substitute_event_refs(v, event_payload) for k, v in value.items()}
+    return value
+
+
+def handle_subscription_create_arc(payload: dict) -> int | None:
+    """Handle a ``subscription.create_arc`` work item.
+
+    Creates a parent arc (named/goaled from the action config) and, if a
+    template was resolved at enqueue time, instantiates the template's
+    steps as children on that parent. The event payload is stored on the
+    parent arc under the ``event_payload`` key for downstream handlers.
+
+    Optional action config fields:
+
+    - ``priority``: integer passed through to ``arc_manager.create_arc``
+      (lower = more urgent, Unix-nice style).
+    - ``initial_arc_state``: dict of ``key -> value`` pairs written to
+      ``arc_state`` on the parent arc after creation. Values may contain
+      ``{event.payload.KEY}`` placeholders, substituted from the
+      triggering event's payload.
+
+    Returns the created parent arc ID, or ``None`` if creation was
+    skipped (which should not normally happen — resolution failures are
+    caught upstream in ``_action_create_arc``).
+    """
+    from ..arcs import manager as arc_manager
+    from ..workflows._arc_state import set_arc_state
+    from . import template_manager
+
+    template_id = payload.get("template_id")
+    template_name = payload.get("template_name")
+    arc_name = payload.get("arc_name") or template_name or "subscription-arc"
+    arc_goal = payload.get("arc_goal")
+    priority = payload.get("priority")
+    event_payload = payload.get("_event_payload", {}) or {}
+
+    create_kwargs = {}
+    if priority is not None:
+        create_kwargs["priority"] = priority
+
+    parent_id = arc_manager.create_arc(
+        name=arc_name,
+        goal=arc_goal,
+        template_id=template_id,
+        **create_kwargs,
+    )
+
+    set_arc_state(parent_id, "event_payload", event_payload)
+    set_arc_state(parent_id, "subscription_name", payload.get("_subscription"))
+
+    initial_arc_state = payload.get("initial_arc_state") or {}
+    for key, value in initial_arc_state.items():
+        resolved = _substitute_event_refs(value, event_payload)
+        set_arc_state(parent_id, key, resolved)
+
+    if template_id is not None:
+        template_manager.instantiate_template(template_id, parent_id)
+
+    return parent_id
 
 
 def _action_send_notification(db, sub: Subscription, event: dict, payload: dict) -> bool:
@@ -240,6 +428,124 @@ def _action_send_notification(db, sub: Subscription, event: dict, payload: dict)
         ("subscription.notification", json.dumps(notif_config), idempotency_key, 1),
     )
     return cursor.rowcount > 0
+
+
+def _action_package_dispatch(
+    db, sub: Subscription, event: dict, payload: dict,
+) -> bool:
+    """Dispatch an event to a package-shipped Python handler.
+
+    Capability packages that declare ``trigger_subscriptions`` in their
+    manifest get one of these subscriptions registered per entry at
+    install time.  Rather than running the handler synchronously inside
+    the subscription loop (which would block all subscription
+    processing on a slow package), we enqueue a work item with the
+    handler ref and let the work-queue dispatcher pick it up.
+
+    The work item's ``event_type`` is always ``package.dispatch`` so a
+    single handler in the platform can route to the package-specific
+    Python handler the manifest declared.  See
+    :func:`carpenter.packages.subscription_handler.dispatch_package_handler`
+    for the work-side handler.
+    """
+    cfg = sub.action_config or {}
+    package_name = cfg.get("package")
+    handler_ref = cfg.get("handler")
+    if not package_name or not handler_ref:
+        logger.warning(
+            "package_dispatch subscription %r missing 'package' or "
+            "'handler' in action_config: %s",
+            sub.name, cfg,
+        )
+        return False
+
+    work_payload = {
+        "_subscription": sub.name,
+        "_event_id": event["id"],
+        "package": package_name,
+        "handler": handler_ref,
+        "event_type": event["event_type"],
+        "event_payload": payload,
+    }
+    idempotency_key = f"sub-pkg-{sub.name}-event-{event['id']}"
+    cursor = db.execute(
+        "INSERT OR IGNORE INTO work_queue "
+        "(event_type, payload_json, idempotency_key, max_retries) "
+        "VALUES (?, ?, ?, ?)",
+        ("package.dispatch", json.dumps(work_payload), idempotency_key, 1),
+    )
+    return cursor.rowcount > 0
+
+
+def unregister_for_package(package_name: str) -> int:
+    """Drop in-memory subscriptions whose ``source_package`` matches.
+
+    Called from :func:`carpenter.packages.installer.uninstall_package`
+    on a clean uninstall (and from re-install before the new
+    subscriptions are loaded, so we don't double-register).  Returns
+    the number of subscriptions removed.  Idempotent.
+    """
+    if not package_name:
+        return 0
+    before = len(_subscriptions)
+    _subscriptions[:] = [
+        s for s in _subscriptions if s.source_package != package_name
+    ]
+    removed = before - len(_subscriptions)
+    if removed:
+        logger.info(
+            "Removed %d subscription(s) for package %r",
+            removed, package_name,
+        )
+    return removed
+
+
+def load_package_subscriptions(records: list[tuple[str, list[dict]]]) -> int:
+    """Re-register package subscriptions from on-disk JSON records.
+
+    Called at server startup to rebuild the in-memory subscription list
+    from each installed package's ``_subscriptions.json``.  ``records``
+    is a list of ``(package_name, [{event, handler}, ...])`` tuples
+    (the caller is responsible for walking the install dir; this
+    function only handles the in-memory side).
+
+    Returns the total number of subscriptions registered across all
+    packages.
+    """
+    total = 0
+    for package_name, entries in records:
+        # Drop any prior registrations for this package so this is
+        # idempotent across reload calls.
+        unregister_for_package(package_name)
+        for i, entry in enumerate(entries):
+            event = entry.get("event")
+            handler = entry.get("handler")
+            if not event or not handler:
+                logger.warning(
+                    "package %r: subscription entry %d missing event/handler",
+                    package_name, i,
+                )
+                continue
+            sub = Subscription(
+                name=f"_pkg.{package_name}.{i}",
+                event_type=event,
+                event_filter=None,
+                action_type="package_dispatch",
+                action_config={
+                    "package": package_name,
+                    "handler": handler,
+                },
+                enabled=True,
+                source_package=package_name,
+            )
+            _subscriptions.append(sub)
+            total += 1
+    if total:
+        logger.info(
+            "Loaded %d package subscription(s) from %d package(s)",
+            total, len(records),
+        )
+    return total
 
 
 def process_subscriptions() -> int:
@@ -288,6 +594,11 @@ def process_subscriptions() -> int:
                 if sub.event_type != event["event_type"]:
                     continue
                 if not filter_matches(sub.event_filter, payload):
+                    continue
+                # I9 cross-package isolation: a packaged subscription
+                # can only fire on events tagged with the same package.
+                # No-op for untagged (platform / config) subscriptions.
+                if not _source_package_matches(sub, payload):
                     continue
 
                 try:

@@ -1,8 +1,10 @@
 """Tests for the setup-credential CLI command and _update_dot_env helper."""
 
+import os
 import sqlite3
 import sys
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -19,6 +21,93 @@ def test_update_dot_env_creates_new_file(tmp_path):
 
     assert dot_env.is_file()
     assert "FORGEJO_TOKEN=ghp_abc123" in dot_env.read_text()
+
+
+def test_main_and_api_share_implementation():
+    """The CLI's _update_dot_env is the shared helper from carpenter.util.dot_env.
+
+    This is the parity guarantee: an operator running ``setup-credential``
+    cannot drift from the OAuth callback path's atomic/chmod/locked/fsync
+    semantics, because both call sites resolve to the same function
+    object.  If anyone duplicates the implementation in the future this
+    test will fail loudly.
+    """
+    from carpenter.__main__ import _update_dot_env as cli_helper
+    from carpenter.util.dot_env import update_dot_env as shared_helper
+
+    assert cli_helper is shared_helper, (
+        "carpenter.__main__._update_dot_env must be the shared helper "
+        "from carpenter.util.dot_env to keep CLI and OAuth callback "
+        "paths in sync."
+    )
+
+
+def test_update_dot_env_fsyncs_data_and_directory(tmp_path):
+    """After a write, os.fsync was called on both the temp file fd and the parent dir fd.
+
+    Without these fsyncs, a power loss after _update_dot_env returns
+    can silently drop the freshly-written credential.  The data fsync
+    flushes the file contents; the directory fsync flushes the
+    directory entry created by os.rename.
+
+    We capture which path each fsync'd fd points at via
+    ``/proc/self/fd/<n>`` (Linux) so we can prove BOTH the temp file
+    AND the parent directory were synced — not just one of them
+    twice.
+    """
+    from carpenter.__main__ import _update_dot_env
+    from carpenter.util import dot_env as dot_env_mod
+
+    real_fsync = os.fsync
+    fsync_targets: list[str] = []
+
+    def tracking_fsync(fd):
+        try:
+            target = os.readlink(f"/proc/self/fd/{fd}")
+        except OSError:
+            target = f"<fd {fd}>"
+        fsync_targets.append(target)
+        return real_fsync(fd)
+
+    with patch.object(dot_env_mod.os, "fsync", side_effect=tracking_fsync):
+        _update_dot_env(tmp_path / ".env", "API_KEY", "the-value")
+
+    # One fsync hit the temp data file (its name contains ``.env.tmp.``).
+    assert any(".env.tmp." in t for t in fsync_targets), (
+        f"expected fsync on the temp .env file; got {fsync_targets}"
+    )
+    # Another fsync hit the parent directory itself.  On Linux,
+    # ``readlink('/proc/self/fd/<dir_fd>')`` returns the directory
+    # path.  We check by comparing real paths to handle ``/dev/shm``
+    # symlinks etc.
+    parent = str(tmp_path.resolve())
+    assert any(os.path.realpath(t) == parent for t in fsync_targets), (
+        f"expected fsync on parent dir {parent}; got {fsync_targets}"
+    )
+
+
+def test_update_dot_env_fsyncs_called_twice(tmp_path):
+    """Strict count check: at least two fsync calls per write.
+
+    Complements the path-aware test above by guarding against a
+    refactor that drops one of the two fsyncs.  Uses a plain mock so
+    it works on non-Linux platforms (where /proc/self/fd doesn't
+    exist).
+    """
+    from carpenter.__main__ import _update_dot_env
+    from carpenter.util import dot_env as dot_env_mod
+
+    real_fsync = os.fsync
+
+    with patch.object(
+        dot_env_mod.os, "fsync", side_effect=real_fsync,
+    ) as mock_fsync:
+        _update_dot_env(tmp_path / ".env", "API_KEY", "the-value")
+
+    assert mock_fsync.call_count >= 2, (
+        f"expected >=2 fsync calls (data + directory), "
+        f"got {mock_fsync.call_count}"
+    )
 
 
 def test_update_dot_env_updates_existing_key(tmp_path):

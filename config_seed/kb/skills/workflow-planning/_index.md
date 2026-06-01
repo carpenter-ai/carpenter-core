@@ -9,15 +9,15 @@ How to plan and execute multi-step work using arcs (work units). Learn to break 
 ```python
 from carpenter_tools.act import arc
 
-# 1. Create parent (returns int directly)
+# 1. Create parent (returns {"arc_id": <int>}; unwrap with ["arc_id"])
 parent_id = arc.create(
     name="My Workflow",
     goal="Complete all steps",
     parent_id=None,
     agent_type="PLANNER"
-)
+)["arc_id"]
 
-# 2. Add children (each returns int directly)
+# 2. Add children (each also returns {"arc_id": <int>})
 for i in range(3):
     arc.add_child(
         parent_id=parent_id,
@@ -29,12 +29,14 @@ print(f"✓ Created workflow #{parent_id}")
 ```
 
 **Key facts**:
-- **`arc.create()` returns an INTEGER directly** (the arc ID)
-- **`arc.add_child()` returns an INTEGER directly** (the child arc ID)
-- Do NOT try to access `["arc_id"]` - the functions return the int, not a dict!
+- **`arc.create()` returns `{"arc_id": <int>}`** — always unwrap with
+  `result["arc_id"]` before passing the id to other tools (especially
+  `scheduling.add_cron(event_payload={"arc_id": ...})`, which silently
+  produces a broken trigger if you pass the raw dict).
+- **`arc.add_child()` returns `{"arc_id": <int>}`** — same unwrap.
 - **`arc.add_child()` does NOT accept `step_order`** - it's auto-calculated (max sibling + 1)
 - For parallel execution, use `arc.create_batch()` with explicit `step_order` values
-- `arc.create_batch()` returns `{"arc_ids": [list]}` - this IS a dict!
+- `arc.create_batch()` returns `{"arc_ids": [list of ints]}`
 - Children inherit parent's taint_level unless specified
 
 ## Overview
@@ -85,11 +87,16 @@ arc_id = result["arc_id"]
 
 ## Common Mistakes
 
-### Mistake #1: Treating return value as dict
+### Mistake #1: Forgetting to unwrap the result
 ```python
-parent = arc.create(name="Workflow", ...)
-parent_id = parent["arc_id"]  # ❌ WRONG - arc.create() returns int, not dict!
-parent_id = arc.create(name="Workflow", ...)  # ✓ CORRECT - returns int directly
+# ❌ WRONG — arc.create() returns {"arc_id": <int>}, not the int itself.
+# Passing this dict to scheduling.add_cron() silently breaks the cron.
+arc_id = arc.create(name="Workflow", ...)
+scheduling.add_cron(..., event_payload={"arc_id": arc_id})  # nested dict!
+
+# ✓ CORRECT — unwrap with ["arc_id"]
+arc_id = arc.create(name="Workflow", ...)["arc_id"]
+scheduling.add_cron(..., event_payload={"arc_id": arc_id})
 ```
 
 ### Mistake #2: Loop instead of workflow structure
@@ -108,13 +115,13 @@ for i in range(10):
 ```python
 from carpenter_tools.act import arc
 
-# Create parent workflow (returns int)
+# Create parent workflow (returns dict; unwrap to int)
 parent_id = arc.create(
     name="10-step workflow",
     goal="Complete all 10 steps",
     parent_id=None,
     agent_type="PLANNER"
-)
+)["arc_id"]
 
 # Create 10 child arcs (the actual workflow structure)
 # step_order auto-calculated: 0, 1, 2, ..., 9
@@ -132,7 +139,11 @@ print(f"✓ Created workflow with 10 arc steps")
 
 ## Basic Arc Creation
 
-**IMPORTANT**: `arc.create()` and `arc.add_child()` return **integers** (the arc ID), NOT dicts! Only `arc.create_batch()` returns a dict.
+**IMPORTANT**: `arc.create()`, `arc.add_child()`, and `arc.create_batch()`
+all return dicts.  Use `result["arc_id"]` (single) or `result["arc_ids"]`
+(batch) to get the integer IDs.  Passing the raw dict to other tools —
+especially `scheduling.add_cron(event_payload={"arc_id": ...})` — silently
+breaks the dependent operation.
 
 ### Simple Clean Arc
 
@@ -146,7 +157,7 @@ arc_id = arc.create(
     agent_type="EXECUTOR",  # Default
     taint_level="clean",  # Default
     output_type="json"
-)
+)["arc_id"]
 
 print(f"Created arc #{arc_id}")
 ```
@@ -156,20 +167,20 @@ print(f"Created arc #{arc_id}")
 ```python
 from carpenter_tools.act import arc
 
-# Create parent first (returns int)
+# Create parent first (returns dict; unwrap to int)
 parent_id = arc.create(
     name="Multi-step workflow",
     goal="Complete complex task",
     parent_id=None,
     agent_type="PLANNER"
-)
+)["arc_id"]
 
-# Add child step (step_order auto-calculated as 0, returns int)
+# Add child step (step_order auto-calculated as 0; also returns dict)
 child_id = arc.add_child(
     parent_id=parent_id,
     name="Step 1: Fetch data",
     goal="Download data from API"
-)
+)["arc_id"]
 ```
 
 ## Creating Tainted Arcs (Untrusted Data)
@@ -292,13 +303,13 @@ Templates provide pre-built workflow structures:
 ```python
 from carpenter_tools.act import arc
 
-# 1. Create root arc (returns int)
+# 1. Create root arc (returns dict; unwrap to int)
 root_id = arc.create(
     name="Dark Factory: Build feature X",
     goal="Autonomous development of feature X",
     parent_id=None,
     agent_type="PLANNER"
-)
+)["arc_id"]
 
 # 2. Get template (read-only, use chat tool)
 # In your response: "Let me check available templates"
@@ -321,7 +332,7 @@ messaging.send(
 ```python
 from carpenter_tools.act import arc
 
-parent_id = arc.create(name="Build Report", goal="...", parent_id=None, agent_type="PLANNER")
+parent_id = arc.create(name="Build Report", goal="...", parent_id=None, agent_type="PLANNER")["arc_id"]
 
 # Children execute sequentially (step_order auto-calculated: 0, 1, 2)
 step1 = arc.add_child(parent_id, name="Gather data", goal="...")
@@ -336,7 +347,7 @@ step3 = arc.add_child(parent_id, name="Generate report", goal="...")
 ```python
 from carpenter_tools.act import arc
 
-parent_id = arc.create(name="Parallel tests", goal="...", parent_id=None, agent_type="PLANNER")
+parent_id = arc.create(name="Parallel tests", goal="...", parent_id=None, agent_type="PLANNER")["arc_id"]
 
 # Parallel steps using create_batch (all step_order=0 = run in parallel)
 batch = arc.create_batch(arcs=[

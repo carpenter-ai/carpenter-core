@@ -182,7 +182,7 @@ def _load_system_prompt() -> str:
             if prompt:
                 return prompt
         except Exception:
-            logger.debug("Failed to load coding prompt templates, using fallback",
+            logger.warning("Failed to load coding prompt templates, using fallback",
                         exc_info=True)
     return _FALLBACK_SYSTEM_PROMPT
 
@@ -200,7 +200,7 @@ def _load_tool_definitions() -> list[dict]:
             if tools:
                 return tools
         except Exception:
-            logger.debug("Failed to load coding tool definitions, using fallback",
+            logger.warning("Failed to load coding tool definitions, using fallback",
                         exc_info=True)
     return _FALLBACK_TOOL_DEFINITIONS
 
@@ -419,16 +419,26 @@ def _execute_tool(workspace: str, tool_name: str, tool_input: dict) -> str:
     except ValueError as e:
         return f"Error: {e}"
     except Exception as e:  # broad catch: tool handler may raise anything
+        logger.exception("Tool handler failed: tool=%s", tool_name)
         return f"Error executing {tool_name}: {e}"
 
 
-def run(workspace: str, prompt: str, profile: dict) -> dict:
+def run(
+    workspace: str,
+    prompt: str,
+    profile: dict,
+    arc_id: int | None = None,
+) -> dict:
     """Run the built-in coding agent in a workspace.
 
     Args:
         workspace: Absolute path to the workspace directory.
         prompt: The user's coding instruction.
         profile: Agent profile dict from config (type, model, max_tokens, etc.)
+        arc_id: Arc this run is executing for. When provided, each API call
+            iteration is logged to the ``api_calls`` table with this arc_id
+            and ``conversation_id=NULL`` so arc-only work is observable in
+            the same metrics table as chat traffic.
 
     Returns:
         dict with keys: stdout (str), exit_code (int), iterations (int)
@@ -500,6 +510,7 @@ def run(workspace: str, prompt: str, profile: dict) -> dict:
         system_prompt = profile.get("system_prompt") or _load_system_prompt()
         # Resolve tool definitions: template files > fallback
         tool_defs = _load_tool_definitions()
+        _call_started_at = _time.monotonic()
         result = invocation._call_with_retries(
             system_prompt, messages,
             client=client,
@@ -509,6 +520,7 @@ def run(workspace: str, prompt: str, profile: dict) -> dict:
             tools=tool_defs,
             temperature=0.3,
         )
+        _call_latency_ms = int((_time.monotonic() - _call_started_at) * 1000)
 
         if result is None:
             return {
@@ -525,6 +537,25 @@ def run(workspace: str, prompt: str, profile: dict) -> dict:
             input_tokens, usage.get("output_tokens", 0),
         )
         rate_limiter.record(input_tokens, model=model)
+
+        # Persist API call metrics so arc-only coding work shows up in
+        # the same ``api_calls`` metrics table as chat traffic. The
+        # response normalises ``usage`` to input_tokens/output_tokens
+        # regardless of provider. Best-effort: never let a logging
+        # failure interrupt the coding loop.
+        try:
+            import sqlite3 as _sqlite3
+            call_model = result.get("model") or model or ""
+            invocation._save_api_call(
+                None,
+                call_model,
+                usage,
+                result.get("stop_reason"),
+                latency_ms=_call_latency_ms,
+                arc_id=arc_id,
+            )
+        except (_sqlite3.Error, ValueError, TypeError) as e:
+            logger.warning("Failed to save coding-agent API call metrics: %s", e)
 
         # Process response content blocks
         content = result.get("content", [])

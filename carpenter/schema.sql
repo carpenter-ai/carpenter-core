@@ -12,6 +12,7 @@ CREATE TABLE IF NOT EXISTS arcs (
     depth INTEGER DEFAULT 0,
     code_file_id INTEGER REFERENCES code_files(id),
     template_id INTEGER REFERENCES workflow_templates(id),
+    step_role TEXT,
     from_template BOOLEAN DEFAULT FALSE,
     template_mutable BOOLEAN DEFAULT FALSE,
     timeout_minutes INTEGER,
@@ -22,18 +23,19 @@ CREATE TABLE IF NOT EXISTS arcs (
     descendant_tokens INTEGER DEFAULT 0,
     descendant_executions INTEGER DEFAULT 0,
     descendant_arc_count INTEGER DEFAULT 0,
-    agent_config_id INTEGER REFERENCES agent_configs(id),
     model_policy_id INTEGER,
     wait_until TEXT,
     output_contract TEXT,
     arc_role TEXT DEFAULT 'worker',
     verification_target_id INTEGER REFERENCES arcs(id),
+    priority INTEGER NOT NULL DEFAULT 100,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_arcs_parent ON arcs(parent_id);
 CREATE INDEX IF NOT EXISTS idx_arcs_status ON arcs(status);
 CREATE INDEX IF NOT EXISTS idx_arcs_integrity_level ON arcs(integrity_level);
+CREATE INDEX IF NOT EXISTS idx_arcs_step_role ON arcs(template_id, step_role);
 
 -- Arc activation conditions
 CREATE TABLE IF NOT EXISTS arc_activations (
@@ -137,9 +139,10 @@ CREATE TABLE IF NOT EXISTS work_queue (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     claimed_at TIMESTAMP,
     completed_at TIMESTAMP,
-    scheduled_at TEXT
+    scheduled_at TEXT,
+    priority INTEGER NOT NULL DEFAULT 100
 );
-CREATE INDEX IF NOT EXISTS idx_work_queue_status ON work_queue(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_work_queue_status ON work_queue(status, priority, created_at);
 CREATE INDEX IF NOT EXISTS idx_work_queue_scheduled ON work_queue(status, scheduled_at) WHERE status = 'pending';
 
 -- Model health tracking: per-model success/failure history for adaptive backoff
@@ -154,7 +157,10 @@ CREATE TABLE IF NOT EXISTS model_calls (
 CREATE INDEX IF NOT EXISTS idx_model_calls_model ON model_calls(model_id, called_at DESC);
 CREATE INDEX IF NOT EXISTS idx_model_calls_provider ON model_calls(provider, called_at DESC);
 
--- Cron entries: Python-native cron via croniter
+-- Cron entries: Python-native cron via croniter.
+-- ``name`` is UNIQUE; ``trigger_manager.add_cron()`` / ``add_once()`` perform
+-- an idempotent upsert on name conflict (re-adding the same name updates the
+-- entry in place rather than raising IntegrityError).
 CREATE TABLE IF NOT EXISTS cron_entries (
     id INTEGER PRIMARY KEY,
     name TEXT NOT NULL UNIQUE,
@@ -189,7 +195,9 @@ CREATE TABLE IF NOT EXISTS conversations (
     channel_type TEXT,
     started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     last_message_at TIMESTAMP,
-    context_tokens INTEGER DEFAULT 0
+    context_tokens INTEGER DEFAULT 0,
+    ai_provider TEXT,
+    model TEXT
 );
 
 -- FTS5 full-text search index for conversation memory
@@ -322,21 +330,6 @@ CREATE TABLE IF NOT EXISTS conversation_arcs (
 );
 CREATE INDEX IF NOT EXISTS idx_conversation_arcs_conv ON conversation_arcs(conversation_id);
 
--- Reflections: cadenced self-reflection entries (daily/weekly/monthly)
-CREATE TABLE IF NOT EXISTS reflections (
-    id INTEGER PRIMARY KEY,
-    cadence TEXT NOT NULL,
-    period_start TEXT NOT NULL,
-    period_end TEXT NOT NULL,
-    content TEXT NOT NULL,
-    proposed_actions TEXT,
-    model TEXT,
-    input_tokens INTEGER DEFAULT 0,
-    output_tokens INTEGER DEFAULT 0,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-CREATE INDEX IF NOT EXISTS idx_reflections_cadence ON reflections(cadence, period_end);
-
 -- Conversation trust taint tracking
 CREATE TABLE IF NOT EXISTS conversation_taint (
     id INTEGER PRIMARY KEY,
@@ -372,41 +365,13 @@ CREATE TABLE IF NOT EXISTS notifications (
 CREATE INDEX IF NOT EXISTS idx_notifications_status ON notifications(status);
 CREATE INDEX IF NOT EXISTS idx_notifications_batch ON notifications(batch_id);
 
--- Reflection actions: proposed actions from reflections that are auto-submitted
-CREATE TABLE IF NOT EXISTS reflection_actions (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    reflection_id INTEGER NOT NULL,
-    action_type TEXT NOT NULL,
-    action_description TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'pending',
-    review_mode TEXT,
-    arc_id INTEGER,
-    outcome TEXT,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    completed_at TIMESTAMP,
-    FOREIGN KEY (reflection_id) REFERENCES reflections(id)
-);
-CREATE INDEX IF NOT EXISTS idx_reflection_actions_reflection ON reflection_actions(reflection_id);
-CREATE INDEX IF NOT EXISTS idx_reflection_actions_status ON reflection_actions(status);
-
--- Agent configs: reusable model/role/parameter bundles for arcs
-CREATE TABLE IF NOT EXISTS agent_configs (
-    id INTEGER PRIMARY KEY,
-    model TEXT NOT NULL,
-    agent_role TEXT,
-    temperature REAL,
-    max_tokens INTEGER,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_configs_dedup
-    ON agent_configs(model, COALESCE(agent_role, ''), COALESCE(temperature, -1), COALESCE(max_tokens, -1));
-
 -- Model policies: constraint+preference bundles for model selection
+-- (Replaces the legacy agent_configs table; model = hard pin, policy_json = selector.)
 CREATE TABLE IF NOT EXISTS model_policies (
     id INTEGER PRIMARY KEY,
     name TEXT,
     model TEXT,                    -- Hard pin (NULL = use selector)
-    agent_role TEXT,               -- Preserved from agent_configs
+    agent_role TEXT,
     temperature REAL,
     max_tokens INTEGER,
     policy_json TEXT,              -- {"constraints": {...}, "preference": [...]}
@@ -454,7 +419,18 @@ CREATE TABLE IF NOT EXISTS verified_code_hashes (
     verified_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
--- Webhook subscriptions: maps incoming webhooks to arc/work actions
+-- Webhook subscriptions: maps incoming webhooks to arc/work actions.
+--
+-- Phase B (PR B2) of the Resource refactor added two optional columns:
+--   resource_content_type: when non-NULL, the incoming webhook payload
+--     is wrapped as a raw-ingest Resource (content_type=<that value>)
+--     and a REVIEWER+JUDGE template pipeline is spawned to process it.
+--     When NULL, legacy behaviour applies (payload stored in arc_state /
+--     work_queue).
+--   auto_approve_verdict: user-configurable override. When set to 1,
+--     no JUDGE arc is spawned; the REVIEWER's completion auto-marks the
+--     derived Resource verdict as 'approved'. Default 0 honours the
+--     "nothing starts trusted" invariant.
 CREATE TABLE IF NOT EXISTS webhook_subscriptions (
     id INTEGER PRIMARY KEY,
     webhook_id TEXT NOT NULL UNIQUE,
@@ -466,6 +442,8 @@ CREATE TABLE IF NOT EXISTS webhook_subscriptions (
     enabled INTEGER NOT NULL DEFAULT 1,
     conversation_id INTEGER,
     forge_hook_id INTEGER,
+    resource_content_type TEXT,
+    auto_approve_verdict INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_webhook_subscriptions_webhook ON webhook_subscriptions(webhook_id);
@@ -548,3 +526,144 @@ CREATE TABLE IF NOT EXISTS trigger_state (
     metadata_json TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+-- Resources: first-class rows for externally-sourced content (web fetches, etc.)
+-- Trust is DERIVED from provenance, not stored.  resource_trust(r) = 'trusted'
+-- iff produced_by_template IS NOT NULL AND template_verdict = 'approved'.
+-- Otherwise untrusted.  Raw ingest (produced_by_template NULL) is forever
+-- untrusted; the only way to become trusted is to be produced by a template
+-- arc whose output was approved by a JUDGE.
+CREATE TABLE IF NOT EXISTS resources (
+    id                   INTEGER PRIMARY KEY,
+    content_type         TEXT NOT NULL,
+    file_path            TEXT,
+    byte_size            INTEGER,
+    content_hash         TEXT,
+    produced_by_arc_id   INTEGER REFERENCES arcs(id),
+    produced_by_template TEXT,
+    template_verdict     TEXT,                      -- NULL, 'pending', 'approved', 'rejected'
+    source_descriptor    TEXT,                      -- free-form JSON string
+    kind                 TEXT,                      -- D24 SD12: dataclass-name dispatch tag for kind-typed handoffs
+    pinned               INTEGER NOT NULL DEFAULT 0,
+    retain_until         TIMESTAMP,
+    created_at           TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    deprecated_at        TIMESTAMP,
+    deleted_at           TIMESTAMP,
+    CHECK (template_verdict IS NULL OR template_verdict IN ('pending','approved','rejected'))
+);
+CREATE INDEX IF NOT EXISTS idx_resources_arc     ON resources(produced_by_arc_id);
+CREATE INDEX IF NOT EXISTS idx_resources_sweep   ON resources(deprecated_at, pinned, deleted_at);
+CREATE INDEX IF NOT EXISTS idx_resources_content ON resources(content_type);
+CREATE INDEX IF NOT EXISTS idx_resources_kind    ON resources(kind);
+
+-- Arc-resource links: which Resources were consumed (input) or produced
+-- (output) by which arcs.  Lineage is reconstructed via this join plus
+-- resources.produced_by_arc_id.  Input role is enforced against the arc's
+-- integrity_level (untrusted arcs cannot read Resources).
+CREATE TABLE IF NOT EXISTS arc_resources (
+    id            INTEGER PRIMARY KEY,
+    arc_id        INTEGER NOT NULL REFERENCES arcs(id) ON DELETE CASCADE,
+    resource_id   INTEGER NOT NULL REFERENCES resources(id),
+    role          TEXT NOT NULL CHECK (role IN ('input','output')),
+    created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(arc_id, resource_id, role)
+);
+CREATE INDEX IF NOT EXISTS idx_arc_resources_arc ON arc_resources(arc_id);
+CREATE INDEX IF NOT EXISTS idx_arc_resources_res ON arc_resources(resource_id);
+
+-- File provenance for cross-trust read isolation (D10, 2026-04-29).
+-- handle_write records (path, writer_arc_id, writer_integrity_level) so
+-- handle_read can refuse when a trusted arc would otherwise read a file
+-- written by a non-trusted arc.  Path is the realpath; primary key by
+-- path so an overwrite by a more-tainted writer updates the row (the
+-- write-side audit trail lives in arc_history events of type
+-- 'file_written').  See tool_backends/files.py for the enforcement.
+CREATE TABLE IF NOT EXISTS file_provenance (
+    path                   TEXT PRIMARY KEY,
+    writer_arc_id          INTEGER NOT NULL,
+    writer_integrity_level TEXT NOT NULL,
+    written_at             TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_file_provenance_writer ON file_provenance(writer_arc_id);
+
+-- Per-package mutable state primitive (D24 / Phase 3a).
+-- Each capability package gets its own (key, value_json) keyspace,
+-- isolated from every other package by the (package_name, key) primary
+-- key and the FK ON DELETE CASCADE to ``installed_packages.name``.
+--
+-- ``version`` is a monotonically-increasing integer used for
+-- compare-and-swap (CAS) semantics — callers read (value, version) and
+-- then write with the expected version; if a concurrent writer bumped
+-- the row, the CAS fails and the caller retries.  This is the
+-- contention guard used by GmailPollTrigger's ``poll_in_progress`` flag.
+--
+-- Isolation invariant (I9): a ``PackageStateHandle`` is bound to a
+-- single package_name at construction; the methods only operate on
+-- ``self.package_name``.  Packages never receive another package's
+-- handle, and the SQL primary key precludes cross-package key access.
+CREATE TABLE IF NOT EXISTS package_state (
+    package_name TEXT NOT NULL,
+    key          TEXT NOT NULL,
+    value_json   TEXT NOT NULL,
+    version      INTEGER NOT NULL DEFAULT 1,
+    created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (package_name, key),
+    FOREIGN KEY (package_name) REFERENCES installed_packages(name)
+        ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_package_state_pkg ON package_state(package_name);
+
+-- Archive of per-package state preserved across uninstalls.  The
+-- chat-tool uninstall flow can preserve state (via archive=True), in
+-- which case the rows are copied here BEFORE the cascade delete on
+-- ``installed_packages`` wipes ``package_state``.  This table has no
+-- FK so it survives independently and can be restored on re-install.
+CREATE TABLE IF NOT EXISTS package_state_archive (
+    package_name TEXT NOT NULL,
+    key          TEXT NOT NULL,
+    value_json   TEXT NOT NULL,
+    version      INTEGER NOT NULL,
+    archived_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (package_name, key)
+);
+CREATE INDEX IF NOT EXISTS idx_package_state_archive_pkg
+    ON package_state_archive(package_name);
+
+-- Per-package vector store (D24 / Phase 2 PR-2 — D6).
+-- Each capability package gets its own (id, embedding, metadata)
+-- namespace in the ``package_vectors`` table, isolated from every
+-- other package by the (package_name, id) primary key and the FK
+-- ON DELETE CASCADE to ``installed_packages.name``.  Mirrors the
+-- ``package_state`` isolation pattern.
+--
+-- ``embedding`` is the raw binary blob produced by
+-- ``carpenter.embeddings.codec._serialize_embedding`` (little-endian
+-- packed float32).  ``model_identity`` records the embedding service's
+-- identity fingerprint at upsert time (e.g. ``local:all-MiniLM-L6-v2:384``)
+-- so search-time mismatches (model swapped under the data) raise
+-- ``EmbeddingModelMismatchError`` rather than silently returning
+-- wrong-dim cosine scores.  ``vector_dim`` is denormalised for cheap
+-- reads at deserialisation time.
+--
+-- Isolation invariant (I9): a ``PackageVectorStore`` is bound to a
+-- single package_name at construction; no method on the handle takes
+-- a package_name parameter.  Packages never receive another package's
+-- handle, and the SQL primary key precludes cross-package id access.
+-- Vector data is derived (rebuildable from source); D9 specifies it
+-- is wiped on uninstall via FK cascade, never archived.
+CREATE TABLE IF NOT EXISTS package_vectors (
+    package_name   TEXT NOT NULL,
+    id             TEXT NOT NULL,
+    embedding      BLOB NOT NULL,
+    model_identity TEXT NOT NULL,
+    vector_dim     INTEGER NOT NULL,
+    metadata_json  TEXT NOT NULL DEFAULT '{}',
+    created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (package_name, id),
+    FOREIGN KEY (package_name) REFERENCES installed_packages(name)
+        ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_package_vectors_pkg_model
+    ON package_vectors(package_name, model_identity);

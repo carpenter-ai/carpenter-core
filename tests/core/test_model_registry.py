@@ -12,7 +12,6 @@ from carpenter.core.models.registry import (
     _load_from_config,
     get_entry,
     get_entry_by_model_id,
-    get_local_downloadable_models,
     get_registry,
     load_registry,
     reload_registry,
@@ -38,7 +37,7 @@ def sample_yaml(tmp_path):
         models:
           opus:
             provider: anthropic
-            model_id: claude-opus-4-6
+            model_id: claude-opus-4-7
             quality_tier: 5
             cost_per_mtok_in: 15.0
             cost_per_mtok_out: 75.0
@@ -47,7 +46,7 @@ def sample_yaml(tmp_path):
             capabilities: [planning, review, code]
           haiku:
             provider: anthropic
-            model_id: claude-haiku-4-5-20251001
+            model_id: claude-haiku-4-5
             quality_tier: 2
             cost_per_mtok_in: 0.8
             cost_per_mtok_out: 4.0
@@ -82,7 +81,7 @@ class TestLoadFromYaml:
         assert isinstance(opus, ModelEntry)
         assert opus.key == "opus"
         assert opus.provider == "anthropic"
-        assert opus.model_id == "claude-opus-4-6"
+        assert opus.model_id == "claude-opus-4-7"
         assert opus.quality_tier == 5
         assert opus.cost_per_mtok_in == 15.0
         assert opus.cost_per_mtok_out == 75.0
@@ -122,14 +121,14 @@ class TestLoadFromConfig:
                 "models": {
                     "opus": {
                         "provider": "anthropic",
-                        "model_id": "claude-opus-4-6",
+                        "model_id": "claude-opus-4-7",
                         "cost_tier": "high",
                         "context_window": 200000,
                         "roles": ["planning", "review"],
                     },
                     "haiku": {
                         "provider": "anthropic",
-                        "model_id": "claude-haiku-4-5-20251001",
+                        "model_id": "claude-haiku-4-5",
                         "cost_tier": "low",
                         "context_window": 200000,
                         "roles": ["summarization"],
@@ -156,7 +155,7 @@ class TestRegistryLookup:
         import carpenter.core.models.registry as mod
         monkeypatch.setattr(mod, "_yaml_path", lambda: sample_yaml)
         load_registry()
-        entry = get_entry_by_model_id("claude-opus-4-6")
+        entry = get_entry_by_model_id("claude-opus-4-7")
         assert entry is not None
         assert entry.key == "opus"
 
@@ -164,7 +163,7 @@ class TestRegistryLookup:
         import carpenter.core.models.registry as mod
         monkeypatch.setattr(mod, "_yaml_path", lambda: sample_yaml)
         load_registry()
-        entry = get_entry_by_model_id("anthropic:claude-opus-4-6")
+        entry = get_entry_by_model_id("anthropic:claude-opus-4-7")
         assert entry is not None
         assert entry.key == "opus"
 
@@ -268,76 +267,3 @@ class TestGetRegistryAutoLoads:
         assert "test-model" in reg
 
 
-class TestDownloadMetadata:
-    """Tests for local GGUF download metadata fields."""
-
-    @pytest.fixture
-    def yaml_with_download(self, tmp_path):
-        content = textwrap.dedent("""\
-            models:
-              qwen2.5-3b-q4:
-                provider: local
-                model_id: qwen2.5-3b-instruct-q4_k_m
-                quality_tier: 1
-                cost_per_mtok_in: 0.0
-                cost_per_mtok_out: 0.0
-                cached_cost_per_mtok_in: 0.0
-                context_window: 16384
-                capabilities: [chat, simple_code]
-                description: "Qwen 2.5 3B (~3-5 tok/s on Pi5, recommended)"
-                hf_repo: Qwen/Qwen2.5-3B-Instruct-GGUF
-                gguf_filename: qwen2.5-3b-instruct-q4_k_m.gguf
-                download_size_mb: 2000
-              opus:
-                provider: anthropic
-                model_id: claude-opus-4-6
-                quality_tier: 5
-                cost_per_mtok_in: 15.0
-                cost_per_mtok_out: 75.0
-                cached_cost_per_mtok_in: 1.5
-                context_window: 200000
-                capabilities: [planning, review, code]
-        """)
-        path = tmp_path / "model_registry.yaml"
-        path.write_text(content)
-        return str(path)
-
-    def test_download_fields_parsed(self, yaml_with_download):
-        entries = _load_from_yaml(yaml_with_download)
-        qwen = entries["qwen2.5-3b-q4"]
-        assert qwen.hf_repo == "Qwen/Qwen2.5-3B-Instruct-GGUF"
-        assert qwen.gguf_filename == "qwen2.5-3b-instruct-q4_k_m.gguf"
-        assert qwen.download_size_mb == 2000
-        assert qwen.description == "Qwen 2.5 3B (~3-5 tok/s on Pi5, recommended)"
-
-    def test_download_fields_default_empty(self, yaml_with_download):
-        entries = _load_from_yaml(yaml_with_download)
-        opus = entries["opus"]
-        assert opus.hf_repo == ""
-        assert opus.gguf_filename == ""
-        assert opus.download_size_mb == 0
-
-    def test_get_local_downloadable_models(self, yaml_with_download, monkeypatch):
-        import carpenter.core.models.registry as mod
-        monkeypatch.setattr(mod, "_yaml_path", lambda: yaml_with_download)
-        load_registry()
-        catalog = get_local_downloadable_models()
-        assert "qwen2.5-3b-q4" in catalog
-        assert "opus" not in catalog  # No download metadata
-        entry = catalog["qwen2.5-3b-q4"]
-        assert entry["repo"] == "Qwen/Qwen2.5-3B-Instruct-GGUF"
-        assert entry["filename"] == "qwen2.5-3b-instruct-q4_k_m.gguf"
-        assert entry["size_mb"] == 2000
-        assert entry["label"] == "Qwen 2.5 3B (~3-5 tok/s on Pi5, recommended)"
-
-    def test_bundled_yaml_has_local_models(self):
-        """The bundled seed YAML includes the 4 local GGUF models."""
-        from pathlib import Path
-        seed_path = Path(__file__).resolve().parent.parent.parent / "config_seed" / "model-registry.yaml"
-        entries = _load_from_yaml(str(seed_path))
-        local_keys = [
-            k for k, e in entries.items() if e.hf_repo and e.gguf_filename
-        ]
-        assert len(local_keys) == 4
-        expected = {"qwen2.5-1.5b-q4", "gemma2-2b-q4", "qwen2.5-3b-q4", "phi3.5-mini-q4"}
-        assert set(local_keys) == expected

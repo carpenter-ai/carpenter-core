@@ -22,7 +22,18 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # Immutable allowlist — changing this IS a platform-level change.
-PLATFORM_TOOLS = frozenset({"submit_code", "escalate_current_arc", "escalate", "fetch_web_content"})
+PLATFORM_TOOLS = frozenset({
+    "submit_code",
+    "escalate_current_arc",
+    "escalate",
+    "fetch_web_content",
+    "set_conversation_model",
+    # D24 stage 3a: capability-package install/uninstall.  These mutate
+    # platform state (filesystem + DB) and use the standard chat-tool
+    # human-confirmation pattern (requires_user_confirm=True).
+    "install_package",
+    "uninstall_package",
+})
 
 _VALID_BOUNDARIES = frozenset({"chat", "platform"})
 

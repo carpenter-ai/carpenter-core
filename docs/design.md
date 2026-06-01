@@ -223,7 +223,7 @@ Each arc declares an agent type. A kernel-level capability matrix restricts whic
 
 - **PLANNER** — structural/messaging tools only (create arcs, send messages). No data access. Context is TRUSTED only.
 - **EXECUTOR** — full tool access within its integrity level.
-- **REVIEWER** — read tools + `submit_verdict`. Can read untrusted data (`can_read_untrusted` capability) for extraction purposes.
+- **REVIEWER** — read tools + `submit_verdict`. Can read untrusted data for extraction purposes (gated by the arc's `integrity_level` via the Resource read API).
 - **JUDGE** — not an LLM. Runs deterministic platform code (`security/judge.py`) to validate extracted data against security policies (default-deny allowlists). The judge's verdict is authoritative.
 - **CHAT** — standard chat agent tools. Context is TRUSTED only.
 

@@ -19,11 +19,11 @@ Configured in `config.yaml` under `escalation.stacks`:
 escalation:
   stacks:
     general:
-      - anthropic:claude-haiku-4-5-20251001
-      - anthropic:claude-sonnet-4-5-20250929
+      - anthropic:claude-haiku-4-5
+      - anthropic:claude-sonnet-4-6
     coding:
-      - anthropic:claude-haiku-4-5-20251001
-      - anthropic:claude-sonnet-4-5-20250929
+      - anthropic:claude-haiku-4-5
+      - anthropic:claude-sonnet-4-6
   require_confirmation: false
 ```
 

@@ -1,5 +1,7 @@
-"""Language model call tool. Tier 1: callback to platform."""
-from .._callback import callback
+"""Language model call tool declarations.
+
+See ``carpenter_tools`` package docstring for the invocation model.
+"""
 from ..tool_meta import tool
 
 
@@ -23,7 +25,7 @@ def call(
 
     Args:
         prompt: The user message to send to the model.
-        model: Explicit model string (e.g. 'anthropic:claude-sonnet-4-20250514').
+        model: Explicit model string (e.g. 'anthropic:claude-sonnet-4-6').
         model_role: Named role slot to resolve model from (e.g. 'default_step').
         agent_role: Named agent role for system prompt lookup.
         system: System prompt override (takes precedence over agent_role lookup).
@@ -33,17 +35,4 @@ def call(
     Returns:
         Dict with 'content', 'model', 'usage', 'role'.
     """
-    params = {"prompt": prompt}
-    if model is not None:
-        params["model"] = model
-    if model_role is not None:
-        params["model_role"] = model_role
-    if agent_role is not None:
-        params["agent_role"] = agent_role
-    if system is not None:
-        params["system"] = system
-    if temperature is not None:
-        params["temperature"] = temperature
-    if max_tokens is not None:
-        params["max_tokens"] = max_tokens
-    return callback("lm.call", params)
+    ...

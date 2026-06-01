@@ -124,10 +124,44 @@ def run_server(argv=None):
             e
         )
 
+    # At-rest DB encryption status banner. Operators should know with
+    # certainty whether platform.db (and the review_keys Fernet bytes
+    # inside it) is encrypted at rest. See docs/trust-invariants.md I7.
+    from .config import CONFIG as _CONFIG_FOR_BANNER
+    from . import db as _db_for_banner
+    _db_key_set = bool(_CONFIG_FOR_BANNER.get("db_encryption_key"))
+    _sqlcipher_available = _db_for_banner._sqlcipher_module is not None
+    if _db_key_set and _sqlcipher_available:
+        logger.info(
+            "DB encryption: ENABLED (SQLCipher via pysqlcipher3). "
+            "platform.db is encrypted at rest."
+        )
+    elif _db_key_set and not _sqlcipher_available:
+        # get_db() will raise on first use; surface the misconfiguration
+        # at startup so the operator sees it before the first request.
+        logger.error(
+            "DB encryption: MISCONFIGURED — db_encryption_key is set but "
+            "pysqlcipher3 is not installed. The server will fail to open "
+            "the database on the first request. Install pysqlcipher3 or "
+            "remove db_encryption_key from config. See "
+            "docs/trust-invariants.md I7."
+        )
+    else:
+        logger.info(
+            "DB encryption: DISABLED — platform.db contents (including "
+            "review_keys Fernet bytes used to protect non-trusted arc "
+            "state) are plaintext on disk. Set db_encryption_key and "
+            "install pysqlcipher3 to enable, or rely on filesystem-level "
+            "encryption (LUKS, dm-crypt). See docs/trust-invariants.md I7."
+        )
+
     from .config import CONFIG
+    from . import constants
 
     host = args.host if args.host is not None else CONFIG.get("host", "127.0.0.1")
-    port = args.port if args.port is not None else CONFIG.get("port", 7842)
+    port = args.port if args.port is not None else CONFIG.get(
+        "port", constants.DEFAULT_API_PORT,
+    )
 
     # Safety check: refuse non-loopback bind without auth
     err = _check_bind_safety(host, CONFIG)

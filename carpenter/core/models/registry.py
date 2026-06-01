@@ -28,8 +28,8 @@ class ModelEntry:
     """Metadata for a single model in the registry."""
 
     key: str  # "opus", "sonnet", etc.
-    provider: str  # "anthropic", "ollama", "local", "tinfoil"
-    model_id: str  # "claude-opus-4-6"
+    provider: str  # "anthropic", "ollama", "tinfoil"
+    model_id: str  # "claude-opus-4-7"
     quality_tier: int  # 1-5
     cost_per_mtok_in: float
     cost_per_mtok_out: float
@@ -38,10 +38,6 @@ class ModelEntry:
     capabilities: list[str] = field(default_factory=list)
     description: str = ""
     measured_speed: Optional[float] = None  # seconds per ktok output
-    # Download metadata for local GGUF models (used by install tooling)
-    hf_repo: str = ""  # HuggingFace repo, e.g. "Qwen/Qwen2.5-1.5B-Instruct-GGUF"
-    gguf_filename: str = ""  # GGUF file name, e.g. "qwen2.5-1.5b-instruct-q4_k_m.gguf"
-    download_size_mb: int = 0  # Approximate download size in MB
 
 
 # Module-level cache
@@ -88,9 +84,6 @@ def _load_from_yaml(yaml_path: str) -> dict[str, ModelEntry]:
                 capabilities=list(entry.get("capabilities", [])),
                 description=str(entry.get("description", "")),
                 measured_speed=entry.get("measured_speed"),
-                hf_repo=str(entry.get("hf_repo", "")),
-                gguf_filename=str(entry.get("gguf_filename", "")),
-                download_size_mb=int(entry.get("download_size_mb", 0)),
             )
         return result
     except (OSError, ValueError, TypeError, KeyError) as _exc:
@@ -181,8 +174,8 @@ def get_entry_by_model_id(model_id: str) -> ModelEntry | None:
     """Look up a model entry by its provider model_id string.
 
     Args:
-        model_id: Exact model ID (e.g., "claude-opus-4-6") or
-                  "provider:model_id" format (e.g., "anthropic:claude-opus-4-6").
+        model_id: Exact model ID (e.g., "claude-opus-4-7") or
+                  "provider:model_id" format (e.g., "anthropic:claude-opus-4-7").
 
     Returns:
         ModelEntry or None.
@@ -240,25 +233,3 @@ def update_measured_speed(key: str, speed: float) -> None:
             logger.exception("Failed to persist measured_speed to %s", yaml_path)
 
 
-def get_local_downloadable_models() -> dict[str, dict]:
-    """Return local models that have download metadata (hf_repo + gguf_filename).
-
-    This replaces the former MODEL_CATALOG dict that was hardcoded in
-    ``carpenter.agent.providers.local``.  Install tooling can call this to
-    discover available local GGUF models and their download coordinates.
-
-    Returns:
-        Dict mapping model key to a dict with keys:
-        ``repo``, ``filename``, ``size_mb``, ``label``.
-    """
-    reg = get_registry()
-    result = {}
-    for key, entry in reg.items():
-        if entry.hf_repo and entry.gguf_filename:
-            result[key] = {
-                "repo": entry.hf_repo,
-                "filename": entry.gguf_filename,
-                "size_mb": entry.download_size_mb,
-                "label": entry.description,
-            }
-    return result

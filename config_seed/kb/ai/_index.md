@@ -4,7 +4,7 @@ AI providers, model configuration, and language model tools.
 
 ## In this section
 - [[ai/tools]] — LM call tool
-- [[ai/providers]] — Anthropic, Ollama, local, Tinfoil
+- [[ai/providers]] — Anthropic, Ollama, Tinfoil
 - [[ai/config]] — Provider and model configuration
 
 ## Related

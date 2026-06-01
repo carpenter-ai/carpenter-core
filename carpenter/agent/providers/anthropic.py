@@ -155,7 +155,7 @@ def call(
     Args:
         system: System prompt text.
         messages: Conversation messages.
-        model: Model to use (defaults to config or claude-sonnet-4-20250514).
+        model: Model to use (defaults to config or claude-sonnet-4-6).
         max_tokens: Max tokens to generate.
         temperature: Sampling temperature.
         api_key: API key override.

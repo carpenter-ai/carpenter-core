@@ -1,16 +1,30 @@
-"""Tests for carpenter.security.judge (deterministic JUDGE)."""
+"""Tests for carpenter.security.judge (deterministic JUDGE).
+
+D24 §11: REVIEWER → JUDGE handoff rides on the Resources pipeline rather
+than the legacy ``_extraction_output``/``_judge_policy_checks`` arc-state
+shortcut.  These tests drive the JUDGE through pending Resources and
+verify ``mark_template_verdict`` is flipped to match the verdict.
+"""
 
 import json
+
 import pytest
 
 from carpenter.core.arcs import manager as arc_manager
+from carpenter.core.resources import (
+    derive_resource,
+    get_resource,
+    link_arc_resource,
+    resource_storage_path,
+)
 from carpenter.core.workflows import review_manager
 from carpenter.security.judge import (
-    run_policy_checks,
-    _get_review_target,
-    _get_extraction_data,
-    JudgeResult,
     PolicyCheck,
+    PolicyCheckList,
+    JudgeResult,
+    _find_pending_extraction_resource,
+    _get_review_target,
+    run_policy_checks,
 )
 from carpenter.security import policy_store
 from carpenter.tool_backends import arc as arc_backend
@@ -46,6 +60,56 @@ def _create_batch_with_judge(extra_arcs=None, parent_id=None):
     return result["arc_ids"]
 
 
+def _emit_extraction_resource(
+    *,
+    reviewer_arc_id: int,
+    template_name: str = "test-template",
+    checks: list[dict],
+    kind: str | None = "PolicyCheckList",
+    payload_override: object | None = None,
+) -> int:
+    """Emit a pending extraction Resource for a REVIEWER arc.
+
+    Mirrors the post-D24 §11 reviewer-side emission pattern: derive a
+    Resource with ``produced_by_template=<template>``,
+    ``template_verdict='pending'``, ``kind=<kind>``, write the JSON
+    bytes, and link it as the reviewer's output.
+
+    ``payload_override`` lets tests inject malformed/legacy shapes.
+    """
+    if payload_override is not None:
+        payload_obj = payload_override
+    elif kind == "PolicyCheckList":
+        payload_obj = {"checks": checks}
+    else:
+        # Legacy / kind-less raw-list shape.
+        payload_obj = checks
+
+    resource_id = derive_resource(
+        content_type="application/json",
+        file_path=None,
+        produced_by_arc_id=reviewer_arc_id,
+        produced_by_template=template_name,
+        template_verdict="pending",
+        kind=kind,
+    )
+    path = resource_storage_path(resource_id, "extraction.json")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload_obj), encoding="utf-8")
+    # Update file_path on the row.
+    db = get_db()
+    try:
+        db.execute(
+            "UPDATE resources SET file_path = ? WHERE id = ?",
+            (str(path), resource_id),
+        )
+        db.commit()
+    finally:
+        db.close()
+    link_arc_resource(arc_id=reviewer_arc_id, resource_id=resource_id, role="output")
+    return resource_id
+
+
 class TestGetReviewTarget:
 
     def test_returns_target_id(self):
@@ -60,120 +124,107 @@ class TestGetReviewTarget:
         assert _get_review_target(arc_id) is None
 
 
-class TestGetExtractionData:
+class TestFindPendingExtractionResource:
 
-    def test_returns_none_when_no_data(self):
+    def test_returns_none_when_no_resource(self):
         ids = _create_batch_with_judge()
         target_id = ids[0]
-        assert _get_extraction_data(target_id) is None
+        assert _find_pending_extraction_resource(target_id) is None
 
-    def test_reads_judge_policy_checks_from_target(self):
-        ids = _create_batch_with_judge()
-        target_id = ids[0]
-
-        # Set extraction data on target arc state
-        checks = [
-            {"field": "email", "policy_type": "email", "value": "admin@test.com"},
-        ]
-        db = get_db()
-        try:
-            db.execute(
-                "INSERT INTO arc_state (arc_id, key, value_json) VALUES (?, ?, ?)",
-                (target_id, "_judge_policy_checks", json.dumps(checks)),
-            )
-            db.commit()
-        finally:
-            db.close()
-
-        result = _get_extraction_data(target_id)
-        assert result is not None
-        assert len(result) == 1
-        assert result[0]["field"] == "email"
-
-    def test_reads_extraction_output_from_reviewer(self):
+    def test_finds_pending_resource_from_reviewer(self):
         ids = _create_batch_with_judge()
         target_id, reviewer_id, judge_id = ids
 
-        # Set extraction output on reviewer's arc state
-        extraction = [
-            {"field": "domain", "policy_type": "domain", "value": "safe.example.com"},
-        ]
-        db = get_db()
-        try:
-            db.execute(
-                "INSERT INTO arc_state (arc_id, key, value_json) VALUES (?, ?, ?)",
-                (reviewer_id, "_extraction_output", json.dumps(extraction)),
-            )
-            db.commit()
-        finally:
-            db.close()
+        rid = _emit_extraction_resource(
+            reviewer_arc_id=reviewer_id,
+            checks=[{"field": "domain", "policy_type": "domain", "value": "safe.example.com"}],
+        )
 
-        result = _get_extraction_data(target_id)
-        assert result is not None
-        assert result[0]["field"] == "domain"
+        row = _find_pending_extraction_resource(target_id)
+        assert row is not None
+        assert int(row["id"]) == rid
+        assert row["template_verdict"] == "pending"
+        assert row["kind"] == "PolicyCheckList"
+
+    def test_skips_resources_already_verdicted(self):
+        ids = _create_batch_with_judge()
+        target_id, reviewer_id, judge_id = ids
+
+        # Approved Resource — should not be returned as pending.
+        rid = derive_resource(
+            content_type="application/json",
+            file_path=None,
+            produced_by_arc_id=reviewer_id,
+            produced_by_template="t",
+            template_verdict="approved",
+            kind="PolicyCheckList",
+        )
+        link_arc_resource(arc_id=reviewer_id, resource_id=rid, role="output")
+        assert _find_pending_extraction_resource(target_id) is None
+
+    def test_multi_pending_collision_raises(self):
+        ids = _create_batch_with_judge()
+        target_id, reviewer_id, judge_id = ids
+
+        for _ in range(2):
+            _emit_extraction_resource(
+                reviewer_arc_id=reviewer_id,
+                checks=[{"field": "x", "policy_type": "", "value": "y"}],
+            )
+
+        with pytest.raises(ValueError, match="pending extraction Resources"):
+            _find_pending_extraction_resource(target_id)
 
 
 class TestRunPolicyChecks:
 
-    def test_auto_approve_when_no_extraction_data(self):
-        """With no structured data, judge approves by default."""
+    def test_auto_approve_when_no_extraction_resource(self):
+        """With no Resource, judge approves by default."""
         ids = _create_batch_with_judge()
         target_id, reviewer_id, judge_id = ids
 
         result = run_policy_checks(judge_id)
         assert result.approved is True
-        assert "no_extraction_data" in result.reason.lower() or "no structured" in result.reason.lower()
+        assert "no_extraction" in result.reason.lower() or "no structured" in result.reason.lower()
 
     def test_approve_when_all_checks_pass(self):
         """Judge approves when all policy checks pass."""
         ids = _create_batch_with_judge()
         target_id, reviewer_id, judge_id = ids
 
-        # Add policy for email
         policy_store.add_to_allowlist("email", "safe@example.com")
 
-        # Set policy checks on target
-        checks = [
-            {"field": "recipient", "policy_type": "email", "value": "safe@example.com"},
-        ]
-        db = get_db()
-        try:
-            db.execute(
-                "INSERT INTO arc_state (arc_id, key, value_json) VALUES (?, ?, ?)",
-                (target_id, "_judge_policy_checks", json.dumps(checks)),
-            )
-            db.commit()
-        finally:
-            db.close()
+        rid = _emit_extraction_resource(
+            reviewer_arc_id=reviewer_id,
+            checks=[{"field": "recipient", "policy_type": "email", "value": "safe@example.com"}],
+        )
 
         result = run_policy_checks(judge_id)
         assert result.approved is True
         assert len(result.checks) == 1
         assert result.checks[0].passed is True
 
+        # Resource verdict was flipped to approved.
+        row = get_resource(rid)
+        assert row["template_verdict"] == "approved"
+
     def test_reject_when_check_fails(self):
         """Judge rejects when a policy check fails."""
         ids = _create_batch_with_judge()
         target_id, reviewer_id, judge_id = ids
 
-        # Don't add any policies — default deny
-        checks = [
-            {"field": "target_email", "policy_type": "email", "value": "evil@hacker.com"},
-        ]
-        db = get_db()
-        try:
-            db.execute(
-                "INSERT INTO arc_state (arc_id, key, value_json) VALUES (?, ?, ?)",
-                (target_id, "_judge_policy_checks", json.dumps(checks)),
-            )
-            db.commit()
-        finally:
-            db.close()
+        rid = _emit_extraction_resource(
+            reviewer_arc_id=reviewer_id,
+            checks=[{"field": "target_email", "policy_type": "email", "value": "evil@hacker.com"}],
+        )
 
         result = run_policy_checks(judge_id)
         assert result.approved is False
         assert len(result.failed_checks) == 1
         assert result.failed_checks[0].field_name == "target_email"
+
+        row = get_resource(rid)
+        assert row["template_verdict"] == "rejected"
 
     def test_mixed_pass_and_fail(self):
         """Judge rejects if any check fails, even if others pass."""
@@ -181,47 +232,35 @@ class TestRunPolicyChecks:
         target_id, reviewer_id, judge_id = ids
 
         policy_store.add_to_allowlist("email", "good@example.com")
-        # "bad@evil.com" is NOT in allowlist
 
-        checks = [
-            {"field": "to", "policy_type": "email", "value": "good@example.com"},
-            {"field": "cc", "policy_type": "email", "value": "bad@evil.com"},
-        ]
-        db = get_db()
-        try:
-            db.execute(
-                "INSERT INTO arc_state (arc_id, key, value_json) VALUES (?, ?, ?)",
-                (target_id, "_judge_policy_checks", json.dumps(checks)),
-            )
-            db.commit()
-        finally:
-            db.close()
+        rid = _emit_extraction_resource(
+            reviewer_arc_id=reviewer_id,
+            checks=[
+                {"field": "to", "policy_type": "email", "value": "good@example.com"},
+                {"field": "cc", "policy_type": "email", "value": "bad@evil.com"},
+            ],
+        )
 
         result = run_policy_checks(judge_id)
         assert result.approved is False
         assert len(result.checks) == 2
         assert len(result.failed_checks) == 1
 
+        assert get_resource(rid)["template_verdict"] == "rejected"
+
     def test_fields_without_policy_type_pass(self):
         """Fields without policy_type constraint are auto-approved."""
         ids = _create_batch_with_judge()
         target_id, reviewer_id, judge_id = ids
 
-        checks = [
-            {"field": "summary", "value": "Any text here"},  # no policy_type
-        ]
-        db = get_db()
-        try:
-            db.execute(
-                "INSERT INTO arc_state (arc_id, key, value_json) VALUES (?, ?, ?)",
-                (target_id, "_judge_policy_checks", json.dumps(checks)),
-            )
-            db.commit()
-        finally:
-            db.close()
+        rid = _emit_extraction_resource(
+            reviewer_arc_id=reviewer_id,
+            checks=[{"field": "summary", "value": "Any text here"}],  # no policy_type
+        )
 
         result = run_policy_checks(judge_id)
         assert result.approved is True
+        assert get_resource(rid)["template_verdict"] == "approved"
 
     def test_nonexistent_judge_arc(self):
         result = run_policy_checks(99999)
@@ -235,18 +274,10 @@ class TestRunPolicyChecks:
 
         policy_store.add_to_allowlist("domain", "api.example.com")
 
-        checks = [
-            {"field": "api_host", "policy_type": "domain", "value": "api.example.com"},
-        ]
-        db = get_db()
-        try:
-            db.execute(
-                "INSERT INTO arc_state (arc_id, key, value_json) VALUES (?, ?, ?)",
-                (target_id, "_judge_policy_checks", json.dumps(checks)),
-            )
-            db.commit()
-        finally:
-            db.close()
+        rid = _emit_extraction_resource(
+            reviewer_arc_id=reviewer_id,
+            checks=[{"field": "api_host", "policy_type": "domain", "value": "api.example.com"}],
+        )
 
         result = run_policy_checks(judge_id)
         assert result.approved is True
@@ -258,21 +289,82 @@ class TestRunPolicyChecks:
 
         policy_store.add_to_allowlist("int_range", "80:443")
 
-        checks = [
-            {"field": "port", "policy_type": "int_range", "value": 443},
-        ]
+        rid = _emit_extraction_resource(
+            reviewer_arc_id=reviewer_id,
+            checks=[{"field": "port", "policy_type": "int_range", "value": 443}],
+        )
+
+        result = run_policy_checks(judge_id)
+        assert result.approved is True
+
+    def test_kindless_legacy_payload_still_works(self):
+        """A pending Resource with kind=NULL is decoded as raw JSON list.
+
+        D24 §11 keeps the kind-less back-compat path for in-flight rows
+        until B-min phases it out.  Verify the path still works.
+        """
+        ids = _create_batch_with_judge()
+        target_id, reviewer_id, judge_id = ids
+
+        policy_store.add_to_allowlist("email", "ok@example.com")
+
+        # No kind, payload is a bare list (the legacy shape).
+        rid = _emit_extraction_resource(
+            reviewer_arc_id=reviewer_id,
+            kind=None,
+            checks=[{"field": "to", "policy_type": "email", "value": "ok@example.com"}],
+        )
+
+        result = run_policy_checks(judge_id)
+        assert result.approved is True
+
+    def test_unknown_kind_is_rejected(self):
+        """Unknown kind on the Resource is a JUDGE-time rejection."""
+        ids = _create_batch_with_judge()
+        target_id, reviewer_id, judge_id = ids
+
+        rid = _emit_extraction_resource(
+            reviewer_arc_id=reviewer_id,
+            kind="NoSuchKind",
+            checks=[{"field": "x", "policy_type": "", "value": "y"}],
+        )
+
+        result = run_policy_checks(judge_id)
+        assert result.approved is False
+        assert "Unknown extraction kind" in result.reason
+        assert get_resource(rid)["template_verdict"] == "rejected"
+
+    def test_malformed_payload_is_rejected(self):
+        """Bytes that aren't JSON cause the JUDGE to reject."""
+        ids = _create_batch_with_judge()
+        target_id, reviewer_id, judge_id = ids
+
+        rid = derive_resource(
+            content_type="application/json",
+            file_path=None,
+            produced_by_arc_id=reviewer_id,
+            produced_by_template="t",
+            template_verdict="pending",
+            kind="PolicyCheckList",
+        )
+        path = resource_storage_path(rid, "extraction.json")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("not-json", encoding="utf-8")
         db = get_db()
         try:
             db.execute(
-                "INSERT INTO arc_state (arc_id, key, value_json) VALUES (?, ?, ?)",
-                (target_id, "_judge_policy_checks", json.dumps(checks)),
+                "UPDATE resources SET file_path = ? WHERE id = ?",
+                (str(path), rid),
             )
             db.commit()
         finally:
             db.close()
+        link_arc_resource(arc_id=reviewer_id, resource_id=rid, role="output")
 
         result = run_policy_checks(judge_id)
-        assert result.approved is True
+        assert result.approved is False
+        assert "decode" in result.reason.lower() or "Failed" in result.reason
+        assert get_resource(rid)["template_verdict"] == "rejected"
 
 
 class TestJudgeResultDataclass:
@@ -287,3 +379,31 @@ class TestJudgeResultDataclass:
         )
         assert len(result.failed_checks) == 1
         assert result.failed_checks[0].field_name == "b"
+
+
+class TestPolicyCheckListDataclass:
+
+    def test_default_empty(self):
+        pcl = PolicyCheckList()
+        assert pcl.checks == []
+
+    def test_round_trip_via_kind_dispatch(self):
+        """A Resource emitted with kind=PolicyCheckList is read back as the dataclass."""
+        from carpenter.security.judge import (
+            _load_extraction_resource,
+            _extraction_to_checks,
+        )
+
+        ids = _create_batch_with_judge()
+        target_id, reviewer_id, judge_id = ids
+
+        rid = _emit_extraction_resource(
+            reviewer_arc_id=reviewer_id,
+            checks=[{"field": "f", "policy_type": "", "value": "v"}],
+        )
+        row = get_resource(rid)
+        extraction = _load_extraction_resource(row)
+        assert isinstance(extraction, PolicyCheckList)
+        assert _extraction_to_checks(extraction) == [
+            {"field": "f", "policy_type": "", "value": "v"}
+        ]

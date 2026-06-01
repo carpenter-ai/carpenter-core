@@ -111,14 +111,15 @@ arc.create_batch(
 
 ## Error: "Clean arc cannot read output from tainted arc"
 
-**Symptom**: You try to read `arc.read_output_UNTRUSTED()` from a clean arc and get HTTP 403.
+**Symptom**: A trusted arc needs the contents of a Resource produced by an untrusted arc (e.g. a web fetch), but `read_resource` returns an "untrusted" refusal.
 
-**Root cause**: Clean arcs are isolated from untrusted data. The callback handler enforces this.
+**Root cause**: Trusted arcs can only read Resources whose `template_verdict` is `approved`. Raw Resources (`produced_by_template=NULL`) and Resources whose verdict is `pending` or `rejected` are refused by design -- the trust boundary requires a review step before untrusted bytes are surfaced to trusted consumers.
 
 **Solution**:
-- Create a review arc (with `agent_type="REVIEWER"` and `taint_level="review"`)
-- The review arc CAN read untrusted output
-- After the review arc completes and the judge approves, subsequent clean arcs can depend on the review outcome (stored in clean state)
+- Create a review-arc pipeline: an untrusted producer writes the raw Resource, a REVIEWER arc (optionally followed by a JUDGE) processes it and uses `resource.finalize` / `derive_resource` to produce a derived Resource under a declared template.
+- Have the REVIEWER (or JUDGE) submit a verdict that marks the derivation `approved`.
+- The trusted consumer can then call `read_resource` on the derived Resource and receive its content.
+- For web fetches specifically, the `fetch_web_content` chat tool already wires this pipeline end-to-end.
 
 ## Common Architectural Misunderstandings
 

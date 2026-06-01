@@ -1,0 +1,54 @@
+name: skill-kb-review
+description: Review modifications to skill knowledge base entries
+triggers:
+  - name: on-skill-kb-write
+    # YAML 1.1 parses bare ``on:`` as boolean True; subscriptions.load
+    # accepts either form, but use the quoted string for clarity.
+    "on": kb.entry_written
+    filter:
+      # Only agent-initiated writes to the ``skills/`` KB subtree. The
+      # platform emits ``kb.entry_written`` for every write; this filter
+      # keeps the trigger feature-local (matches the legacy kb/store.py
+      # hook semantics exactly: ``path.startswith("skills/") and
+      # auto_source is None``).
+      path:
+        $starts_with: "skills/"
+      auto_source:
+        $is_null: true
+    action:
+      type: create_arc
+      template_name: skill-kb-review
+      arc_name: skill-kb-review
+      arc_goal: "Review skill KB modification"
+      initial_arc_state:
+        kb_path: "{event.payload.path}"
+        content_hash: "{event.payload.content_hash}"
+        conversation_id: "{event.payload.conversation_id}"
+steps:
+  - name: classify-source
+    description: Determine if the modification source is clean or tainted
+    role: classify
+    order: 0
+    # Handled by the template package's ``step_handlers.handle_classify_source``
+    # (registered via handler_registry) — no AI agent.
+  - name: text-review
+    description: Progressive text review for tainted sources (paranoid processing)
+    role: text-review
+    order: 1
+    arc_role: verifier
+    required_pass: true
+    # Runs only for tainted sources; auto-passed for clean. Template-package handler.
+  - name: intent-review
+    description: Check that the KB change aligns with user intent
+    role: intent-review
+    order: 2
+    agent_type: REVIEWER
+    model_policy: careful-coding
+    arc_role: verifier
+    required_pass: true
+  - name: human-escalation
+    description: Escalate to human for approval (tainted sources only by default)
+    role: escalate
+    order: 3
+    # Template-package handler — auto-skips for clean sources, blocks and
+    # notifies for tainted sources.

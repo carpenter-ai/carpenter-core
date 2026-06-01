@@ -200,8 +200,8 @@ def test_new_key_takes_precedence_over_old(tmp_path):
 
 
 def test_non_credential_env_vars_not_loaded(tmp_path, monkeypatch):
-    """Arbitrary env vars (like the old TC_* convention) are not auto-loaded."""
-    monkeypatch.setenv("TC_HEARTBEAT_SECONDS", "999")
+    """Arbitrary prefixed env vars are not auto-loaded into config."""
+    monkeypatch.setenv("EXTERNAL_HEARTBEAT_SECONDS", "999")
 
     from carpenter.config import load_config
 
@@ -392,3 +392,116 @@ def test_coerce_invalid_int_left_as_string(tmp_path):
 
     config = load_config(yaml_path=str(yaml_file))
     assert config["port"] == "not-a-number"  # left as string, no crash
+
+
+# ---------------------------------------------------------------------------
+# Path derivation from base_dir (layout-agnostic install.sh support)
+# ---------------------------------------------------------------------------
+
+
+def test_minimal_yaml_derives_all_paths_from_base_dir(tmp_path):
+    """A config.yaml with only base_dir produces a fully-populated path config.
+
+    install.sh should be able to emit just ``base_dir`` and let the server
+    derive every layout-dependent path.  This verifies that contract.
+    """
+    base = tmp_path / "foo"
+    yaml_file = tmp_path / "config.yaml"
+    yaml_file.write_text(f"base_dir: {base}\n")
+
+    from carpenter.config import load_config
+
+    config = load_config(yaml_path=str(yaml_file))
+
+    base_s = str(base)
+    assert config["base_dir"] == base_s
+    assert config["database_path"] == os.path.join(base_s, "data", "platform.db")
+    assert config["log_dir"] == os.path.join(base_s, "data", "logs")
+    assert config["code_dir"] == os.path.join(base_s, "data", "code")
+    assert config["workspaces_dir"] == os.path.join(base_s, "data", "workspaces")
+    assert config["templates_dir"] == os.path.join(base_s, "config", "templates")
+    assert config["tools_dir"] == os.path.join(base_s, "config", "tools")
+    assert config["data_models_dir"] == os.path.join(base_s, "data_models")
+    assert config["prompts_dir"] == os.path.join(base_s, "config", "prompts")
+    assert config["coding_prompts_dir"] == os.path.join(base_s, "config", "coding-prompts")
+    assert config["coding_tools_dir"] == os.path.join(base_s, "config", "coding-tools")
+    assert config["chat_tools_dir"] == os.path.join(base_s, "config", "chat_tools")
+    assert config["prompt_templates_dir"] == os.path.join(base_s, "config", "prompt-templates")
+    assert config["kb"]["dir"] == os.path.join(base_s, "config", "kb")
+
+
+def test_explicit_path_overrides_preserved(tmp_path):
+    """An explicit YAML override for a layout-dependent key wins over derivation.
+
+    Back-compat: existing deployments that write fully-populated path values
+    in config.yaml continue to use those values unchanged.
+    """
+    base = tmp_path / "foo"
+    custom_kb = tmp_path / "my-kb"
+    custom_prompts = tmp_path / "my-prompts"
+    yaml_file = tmp_path / "config.yaml"
+    yaml_file.write_text(
+        f"base_dir: {base}\n"
+        f"prompts_dir: {custom_prompts}\n"
+        "kb:\n"
+        f"  dir: {custom_kb}\n"
+    )
+
+    from carpenter.config import load_config
+
+    config = load_config(yaml_path=str(yaml_file))
+
+    # Explicit values preserved
+    assert config["prompts_dir"] == str(custom_prompts)
+    assert config["kb"]["dir"] == str(custom_kb)
+    # Unset keys still derived from base_dir
+    assert config["data_models_dir"] == os.path.join(str(base), "data_models")
+    assert config["coding_prompts_dir"] == os.path.join(str(base), "config", "coding-prompts")
+
+
+def test_derived_paths_respect_tilde_expansion(tmp_path, monkeypatch):
+    """Tilde-expanded base_dir flows into derived path values."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    yaml_file = tmp_path / "config.yaml"
+    yaml_file.write_text("base_dir: ~/mycarp\n")
+
+    from carpenter.config import load_config
+
+    config = load_config(yaml_path=str(yaml_file))
+
+    expected_base = str(tmp_path / "mycarp")
+    assert config["base_dir"] == expected_base
+    assert config["log_dir"] == os.path.join(expected_base, "data", "logs")
+    assert config["kb"]["dir"] == os.path.join(expected_base, "config", "kb")
+
+
+def test_derived_paths_match_seed_manifest(tmp_path):
+    """Derived defaults for seeded targets match SEED_MANIFEST.
+
+    The seed installer and the config loader must agree on where seeded
+    content lives; any drift would break first-install seeding.
+    """
+    base = tmp_path / "foo"
+    yaml_file = tmp_path / "config.yaml"
+    yaml_file.write_text(f"base_dir: {base}\n")
+
+    from carpenter.config import load_config
+    from carpenter.seed import SEED_MANIFEST
+
+    config = load_config(yaml_path=str(yaml_file))
+
+    name_to_config_key = {
+        "prompts": "prompts_dir",
+        "coding-prompts": "coding_prompts_dir",
+        "data_models": "data_models_dir",
+    }
+    for entry in SEED_MANIFEST:
+        cfg_key = name_to_config_key.get(entry.name)
+        if not cfg_key:
+            continue
+        assert config[cfg_key] == os.path.join(str(base), entry.default_rel_target), (
+            f"Derived {cfg_key} doesn't match SEED_MANIFEST target for {entry.name!r}"
+        )
+    # kb is stored under a nested dict
+    kb_entry = next(e for e in SEED_MANIFEST if e.name == "kb")
+    assert config["kb"]["dir"] == os.path.join(str(base), kb_entry.default_rel_target)

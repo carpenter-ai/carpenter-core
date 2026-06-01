@@ -353,7 +353,7 @@ class TestApiCallPersistence:
         mock_client.call.return_value = {
             "content": [{"type": "text", "text": "Hello!"}],
             "stop_reason": "end_turn",
-            "model": "claude-haiku-4-5-20251001",
+            "model": "claude-haiku-4-5",
             "usage": {
                 "input_tokens": 500,
                 "output_tokens": 25,
@@ -376,7 +376,7 @@ class TestApiCallPersistence:
 
         assert len(rows) == 1
         row = dict(rows[0])
-        assert row["model"] == "claude-haiku-4-5-20251001"
+        assert row["model"] == "claude-haiku-4-5"
         assert row["input_tokens"] == 500
         assert row["output_tokens"] == 25
         assert row["cache_creation_input_tokens"] == 300

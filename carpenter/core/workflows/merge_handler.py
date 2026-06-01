@@ -168,8 +168,10 @@ async def handle_attempt_merge(work_id: int, payload: dict):
             buf = io.BytesIO()
             porcelain.diff(source_dir, outstream=buf)
             conflict_diff = buf.getvalue().decode("utf-8", errors="replace")
-        except Exception:
-            pass
+        except (OSError, UnicodeDecodeError):
+            # Conflict diff is best-effort context for the resolver; if dulwich
+            # can't produce it we still want to proceed with the abort+resolve flow.
+            logger.debug("Could not produce conflict diff for arc %d", arc_id, exc_info=True)
 
         # Abort: reset to pre-merge state
         r = Repo(source_dir)
@@ -178,7 +180,9 @@ async def handle_attempt_merge(work_id: int, payload: dict):
             head_ref = head_symrefs[b"HEAD"]
             branch_name = head_ref.split(b"/")[-1].decode()
             porcelain.reset(source_dir, "hard", f"refs/heads/{branch_name}")
-        except Exception:
+        except (KeyError, IndexError, UnicodeDecodeError):
+            # Fall back to HEAD if the symref lookup or branch-name decode fails
+            # (detached HEAD, missing HEAD symref, non-utf8 ref name).
             porcelain.reset(source_dir, "hard", "HEAD")
 
         # Store conflict state for the resolve step
@@ -246,6 +250,7 @@ async def handle_resolve_conflicts(work_id: int, payload: dict):
         from ... import thread_pools
         result = await thread_pools.run_in_work_pool(
             coding_dispatch.invoke_coding_agent, ws_path, prompt,
+            arc_id=arc_id,
         )
         _set_arc_state(arc_id, "resolve_result", result)
 

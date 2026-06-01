@@ -13,7 +13,7 @@ Usage::
         constraints=PolicyConstraints(min_quality=4),
         preference=(0.1, 0.6, 0.3),  # (cost, quality, speed)
     )
-    result = select_model(policy, current_model="anthropic:claude-sonnet-4-5-20250929")
+    result = select_model(policy, current_model="anthropic:claude-sonnet-4-6")
     if result:
         print(result.model_id, result.score, result.reason)
 """

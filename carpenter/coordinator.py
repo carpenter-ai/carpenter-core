@@ -8,6 +8,7 @@ import asyncio
 import logging
 import os
 import sqlite3
+from pathlib import Path
 
 from . import config
 from . import thread_pools
@@ -69,22 +70,6 @@ class Coordinator:
             except (sqlite3.Error, ValueError, TypeError) as _exc:
                 logger.exception("Failed to ensure model policy presets")
 
-    def _start_local_inference_server(self) -> None:
-        """Start local inference server if ai_provider is 'local'."""
-        if config.CONFIG.get("ai_provider") == "local":
-            try:
-                from .inference import get_inference_server
-                server = get_inference_server()
-                if server.start():
-                    logger.info("Local inference server started")
-                else:
-                    logger.error(
-                        "Local inference server failed to start — "
-                        "circuit breaker will handle connection failures"
-                    )
-            except (ImportError, OSError, RuntimeError) as _exc:
-                logger.exception("Failed to start local inference server")
-
     def _validate_tools(self) -> None:
         """Validate tool metadata and dispatch classification."""
         from .api.callbacks import validate_tool_classification
@@ -114,6 +99,49 @@ class Coordinator:
             load_chat_tools(chat_tools_dir)
             register_reload_hook(chat_tools_dir)
         logger.info("Chat tool trust boundaries validated")
+
+    def _discover_capability_packages(self) -> None:
+        """Discover and register Phase A capability packages.
+
+        Runs after ``_load_chat_tools`` so that
+        ``register_extension_tool`` has the loaded-tools dict to merge
+        into.  Search paths come from
+        ``config["capability_packages"]["search_paths"]`` when set,
+        otherwise the conventional defaults (per D22 — zero-action
+        discovery when ``carpenter-packages`` is cloned alongside
+        ``carpenter-core``).
+
+        Failures are logged and swallowed: a misbehaving package must
+        not block the daemon from starting.
+        """
+        from pathlib import Path
+        from .packages import discover_and_register
+
+        cfg = config.CONFIG.get("capability_packages", {}) or {}
+        configured = cfg.get("search_paths")
+        search_paths: list[Path] | None = None
+        if configured:
+            if not isinstance(configured, list):
+                logger.error(
+                    "config['capability_packages']['search_paths'] must be "
+                    "a list; falling back to defaults",
+                )
+            else:
+                search_paths = [
+                    Path(os.path.expanduser(str(p))) for p in configured
+                ]
+
+        try:
+            from .db import db_transaction
+            with db_transaction() as db:
+                discover_and_register(
+                    search_paths=search_paths, db_conn=db,
+                )
+        except Exception:
+            logger.exception(
+                "Capability package discovery failed; "
+                "continuing without packages",
+            )
 
     def _recover_review_links(self) -> None:
         """Recover review links from previous session."""
@@ -180,17 +208,8 @@ class Coordinator:
         arc_notify_handler.register_handlers(main_loop.register_handler)
         logger.info("Arc chat notification handler registered")
 
-        # Skill-KB review handler has no custom event types (uses arc.dispatch
-        # intercepts), but import to validate the module loads cleanly.
-        from .core.workflows import skill_kb_review_handler  # noqa: F401
-        logger.info("Skill-KB review handler loaded")
-
-    async def _init_trigger_subscription_pipeline(self, base_dir: str, app) -> dict:
-        """Set up triggers, subscriptions, and endpoint routes.
-
-        Returns:
-            The reflection_config dict (needed by later phases).
-        """
+    async def _init_trigger_subscription_pipeline(self, base_dir: str, app) -> None:
+        """Set up triggers, subscriptions, and endpoint routes."""
         from .core.engine.triggers import registry as trigger_registry
         from .core.engine.triggers.timer import TimerTrigger
         from .core.engine.triggers.counter import CounterTrigger
@@ -210,28 +229,12 @@ class Coordinator:
                 trigger_plugins_dir = _os.path.join(base_dir, trigger_plugins_dir)
             trigger_registry.load_user_triggers(trigger_plugins_dir)
 
-        # Activate reflection triggers when reflection.enabled is True.
-        # Deep-copy to avoid mutating config.DEFAULTS (shallow dict copy
-        # in CONFIG shares list/dict references with DEFAULTS).
+        # Config-driven triggers (no feature-specific wiring here —
+        # template packages declare their own triggers via the
+        # ``triggers:`` section, loaded below by
+        # ``load_template_triggers``).
         import copy
         trigger_configs = copy.deepcopy(config.CONFIG.get("triggers", []))
-        reflection_config = config.CONFIG.get("reflection", {})
-        if reflection_config.get("enabled", False):
-            _REFLECTION_CRON_MAP = {
-                "daily-reflection": "daily_cron",
-                "weekly-reflection": "weekly_cron",
-                "monthly-reflection": "monthly_cron",
-            }
-            for tcfg in trigger_configs:
-                tname = tcfg.get("name", "")
-                if tname in _REFLECTION_CRON_MAP:
-                    tcfg["enabled"] = True
-                    # Apply per-cadence cron overrides from reflection config
-                    cron_key = _REFLECTION_CRON_MAP[tname]
-                    override = reflection_config.get(cron_key)
-                    if override:
-                        tcfg["schedule"] = override
-            logger.info("Reflection triggers activated via reflection.enabled")
 
         # Load triggers from config
         if trigger_configs:
@@ -247,10 +250,57 @@ class Coordinator:
         # Load built-in subscriptions (timer forwarding, webhook dispatch, etc.)
         subscriptions.load_builtin_subscriptions()
 
+        # Register the weekly Resource sweep.  Seeds a cron entry that
+        # emits ``resources.sweep`` via the generic timer.fired pipeline,
+        # plus a work-item handler that runs :func:`run_sweep`.
+        from .core.resources import sweep as _resource_sweep
+        _resource_sweep.register_weekly_sweep(main_loop.register_handler)
+
         # Load subscriptions from config
         sub_configs = config.CONFIG.get("subscriptions", [])
         if sub_configs:
             subscriptions.load_subscriptions(sub_configs)
+
+        # Load subscriptions declared by loaded templates' `triggers:` sections.
+        from .core.engine import template_manager as _tmpl_mgr
+        tmpl_sub_count = _tmpl_mgr.load_template_triggers()
+        if tmpl_sub_count:
+            logger.info(
+                "Loaded %d subscription(s) from template triggers", tmpl_sub_count,
+            )
+
+        # B-full (D24): re-register trigger subscriptions that installed
+        # capability packages contributed at install time.  The on-disk
+        # ``_subscriptions.json`` files under each install dir are the
+        # source of truth — install-time in-memory registrations don't
+        # survive a restart, but the JSON record does.
+        try:
+            from .packages.installer import list_install_records as _list
+            from .db import db_connection as _db_connection
+            import json as _json
+            with _db_connection() as _db:
+                pkg_records = _list(_db)
+            sub_records: list[tuple[str, list[dict]]] = []
+            for rec in pkg_records:
+                ip = Path(rec["install_path"]) / "_subscriptions.json"
+                if not ip.is_file():
+                    continue
+                try:
+                    entries = _json.loads(ip.read_text())
+                except (ValueError, OSError):
+                    logger.warning(
+                        "Could not read package subscriptions for %r at %s",
+                        rec["name"], ip,
+                    )
+                    continue
+                if isinstance(entries, list):
+                    sub_records.append((rec["name"], entries))
+            if sub_records:
+                subscriptions.load_package_subscriptions(sub_records)
+        except Exception:  # noqa: BLE001 — best-effort startup wiring
+            logger.exception(
+                "Failed to load capability-package subscriptions at startup",
+            )
 
         total_subs = len(subscriptions.get_subscriptions())
         if total_subs:
@@ -295,41 +345,83 @@ class Coordinator:
         main_loop.register_handler(
             "subscription.notification", _handle_subscription_notification,
         )
+
+        async def _handle_subscription_create_arc(work_id, payload):
+            """Create an arc (optionally from a template) for a subscription."""
+            from .core.engine import subscriptions as _subs
+            _subs.handle_subscription_create_arc(payload)
+
+        main_loop.register_handler(
+            "subscription.create_arc", _handle_subscription_create_arc,
+        )
+
+        # B-full (D24): package_dispatch action enqueues ``package.dispatch``
+        # work items that route to the package's manifest-declared handler.
+        from .packages.subscription_handler import dispatch_package_handler
+        main_loop.register_handler(
+            "package.dispatch", dispatch_package_handler,
+        )
         logger.info("Trigger and subscription pipeline initialized")
 
-        return reflection_config
+    def _install_config_seeds(self, base_dir: str) -> dict:
+        """Install all config_seed/ targets via the unified seed installer.
 
-    def _register_reflection_handler(self, reflection_config: dict) -> None:
-        """Register reflection template handler if reflections are enabled."""
-        if reflection_config.get("enabled", False):
-            from .core.workflows import reflection_template_handler
-            reflection_template_handler.register_handlers(main_loop.register_handler)
-            logger.info("Reflection template handler registered")
+        Replaces what used to be three separate per-target installer calls
+        (prompts, coding-prompts, data_models, kb). Honors the existing
+        config overrides so custom paths still work.
 
-    def _install_prompt_and_tool_defaults(self, base_dir: str) -> None:
-        """Install prompt templates, coding prompts, and coding tool defaults."""
+        Returns the per-target result dict so other init steps (e.g. KB)
+        can re-read the outcome without re-invoking the installers.
+        """
+        if not base_dir:
+            return {}
+
+        from .seed import install_config_seed, SEED_MANIFEST
+
+        # Honor explicit overrides from config for backward compat.
+        overrides: dict[str, Path] = {}
+        for entry in SEED_MANIFEST:
+            cfg_key = {
+                "prompts": "prompts_dir",
+                "coding-prompts": "coding_prompts_dir",
+                "kb": None,  # kb dir is resolved later in _init_knowledge_base
+                "data_models": "data_models_dir",
+            }.get(entry.name)
+            if cfg_key:
+                override = config.CONFIG.get(cfg_key, "")
+                if override:
+                    overrides[entry.name] = Path(override)
+
+        # KB dir override from kb config (parity with prior _init_knowledge_base).
+        kb_cfg = config.CONFIG.get("kb", {}) or {}
+        kb_dir_override = kb_cfg.get("dir", "")
+        if kb_dir_override:
+            overrides["kb"] = Path(kb_dir_override)
+
+        results = install_config_seed(base_dir, overrides=overrides)
+
+        # Preserve the prior per-target log messages.
+        log_labels = {
+            "prompts": "Prompt defaults installed: %d files",
+            "coding-prompts": "Coding prompt defaults installed: %d files",
+            "data_models": "Data model defaults installed: %d files",
+            "kb": "KB seed installed: %d entries",
+        }
+        for name, result in results.items():
+            if result.get("status") == "installed":
+                logger.info(log_labels.get(name, name + ": %d files"), result["copied"])
+
+        return results
+
+    def _install_coding_tool_defaults(self, base_dir: str) -> None:
+        """Install coding tool defaults (not part of config_seed/ manifest).
+
+        coding-tools is sourced from a separate seed location and has its
+        own installer; it stays outside the unified install_config_seed()
+        flow so we don't accidentally change its on-disk layout here.
+        """
         if not base_dir:
             return
-
-        # Install prompt template defaults
-        prompts_dir = config.CONFIG.get("prompts_dir", "") or os.path.join(base_dir, "config", "prompts")
-        from .prompts import install_prompt_defaults
-        prompt_result = install_prompt_defaults(prompts_dir)
-        if prompt_result.get("status") == "installed":
-            logger.info(
-                "Prompt defaults installed: %d files", prompt_result["copied"],
-            )
-
-        # Install coding agent prompt defaults
-        coding_prompts_dir = config.CONFIG.get("coding_prompts_dir", "") or os.path.join(base_dir, "config", "coding-prompts")
-        from .prompts import install_coding_prompt_defaults
-        coding_prompt_result = install_coding_prompt_defaults(coding_prompts_dir)
-        if coding_prompt_result.get("status") == "installed":
-            logger.info(
-                "Coding prompt defaults installed: %d files", coding_prompt_result["copied"],
-            )
-
-        # Install coding tool defaults
         coding_tools_dir = config.CONFIG.get("coding_tools_dir", "") or os.path.join(base_dir, "config", "coding-tools")
         from .tool_loader import install_coding_tool_defaults
         coding_tool_result = install_coding_tool_defaults(coding_tools_dir)
@@ -338,36 +430,33 @@ class Coordinator:
                 "Coding tool defaults installed: %d files", coding_tool_result["copied"],
             )
 
-    def _install_data_model_defaults(self, base_dir: str) -> None:
-        """Install data_models seed files."""
-        if not base_dir:
-            return
-        data_models_dir = config.CONFIG.get("data_models_dir", "") or os.path.join(base_dir, "config", "data_models")
-        from .db import install_data_models_defaults
-        dm_result = install_data_models_defaults(data_models_dir)
-        if dm_result.get("status") == "installed":
-            logger.info(
-                "Data model defaults installed: %d files", dm_result["copied"],
-            )
-
     def _init_knowledge_base(self, base_dir: str) -> None:
         """Initialize Knowledge Base: seed, sync, autogen, handlers, backfill."""
         kb_config = config.CONFIG.get("kb", {})
         if not kb_config.get("enabled", True):
             return
 
-        from .kb import install_seed, get_store
+        # Phase 2 PR-1: warm up the process-wide embedding service so the
+        # first user query doesn't pay the ~1.5–3s ONNX session load cost.
+        # Failures are non-fatal — the first real query will retry.
+        try:
+            from .embeddings import get_embedding_service
+            get_embedding_service().warm_up()
+        except Exception:  # pragma: no cover - defensive
+            logger.warning(
+                "Embedding service warm-up raised unexpectedly; "
+                "daemon will continue, first query may be slow",
+                exc_info=True,
+            )
+
+        from .kb import get_store
         kb_dir = kb_config.get("dir", "")
         if not kb_dir:
             kb_dir = os.path.join(base_dir, "config", "kb") if base_dir else ""
         if not kb_dir:
             return
 
-        seed_result = install_seed(kb_dir)
-        if seed_result.get("status") == "installed":
-            logger.info(
-                "KB seed installed: %d entries", seed_result["copied"],
-            )
+        # KB seed install is now handled up front by _install_config_seeds().
         store = get_store(kb_dir)
         sync_result = store.sync_from_filesystem()
         if sync_result["added"] or sync_result["updated"]:
@@ -411,27 +500,41 @@ class Coordinator:
             "kb.conversation_summary", _handle_conversation_summary,
         )
 
-        # Register reflection -> KB handler
-        async def _handle_reflection_summary(work_id, payload):
-            from .kb.reflection_kb import create_reflection_entry
+        # Register generic KB write handler. Feature packages construct
+        # the fully-formatted entry (path, frontmatter+body content,
+        # description, entry_type) and enqueue a ``kb.write_entry`` work
+        # item; this handler performs the store write with no knowledge
+        # of the feature that produced the entry.
+        async def _handle_kb_write_entry(work_id, payload):
             from .kb import get_store
-            create_reflection_entry(payload["reflection_id"], get_store())
+            path = payload.get("kb_path") or payload.get("path")
+            content = payload.get("content")
+            if not path or not content:
+                logger.warning(
+                    "kb.write_entry work %s: missing required "
+                    "fields (kb_path, content); skipping",
+                    work_id,
+                )
+                return
+            get_store().write_entry(
+                path=path,
+                content=content,
+                description=payload.get("description") or "",
+                entry_type=payload.get("entry_type", "knowledge"),
+                trust_level=payload.get("trust_level", "trusted"),
+                validate_links=payload.get("validate_links", False),
+            )
 
         main_loop.register_handler(
-            "kb.reflection_summary", _handle_reflection_summary,
+            "kb.write_entry", _handle_kb_write_entry,
         )
-        logger.info("KB conversation/reflection handlers registered")
+        logger.info("KB conversation/write-entry handlers registered")
 
-        # One-time backfill of existing conversations and reflections
+        # One-time backfill of existing conversations.
         from .kb.conversation_kb import backfill_conversations
-        from .kb.reflection_kb import backfill_reflections
         conv_count = backfill_conversations(store)
-        refl_count = backfill_reflections(store)
-        if conv_count or refl_count:
-            logger.info(
-                "KB backfill: %d conversations, %d reflections",
-                conv_count, refl_count,
-            )
+        if conv_count:
+            logger.info("KB backfill: %d conversations", conv_count)
 
     def _register_cron_message_handler(self) -> None:
         """Register cron.message handler for recurring message delivery."""
@@ -475,18 +578,17 @@ class Coordinator:
         self._init_database()
         self._load_workflow_templates()
         self._ensure_model_policy_presets()
-        self._start_local_inference_server()
         self._validate_tools()
         self._load_chat_tools(base_dir)
+        self._discover_capability_packages()
         self._recover_review_links()
 
         logger.info("Coordinator started")
 
         self._register_work_handlers()
-        reflection_config = await self._init_trigger_subscription_pipeline(base_dir, app)
-        self._register_reflection_handler(reflection_config)
-        self._install_prompt_and_tool_defaults(base_dir)
-        self._install_data_model_defaults(base_dir)
+        await self._init_trigger_subscription_pipeline(base_dir, app)
+        self._install_config_seeds(base_dir)
+        self._install_coding_tool_defaults(base_dir)
         self._init_knowledge_base(base_dir)
         self._register_cron_message_handler()
         await self._init_connector_registry(app)
@@ -550,17 +652,6 @@ class Coordinator:
         from .core import notifications
 
         shutdown_timeout = config.CONFIG.get("shutdown_timeout", 25)
-
-        # 0. Stop local inference server if running
-        if config.CONFIG.get("ai_provider") == "local":
-            try:
-                from .inference import get_inference_server
-                server = get_inference_server()
-                if server.running:
-                    server.stop()
-                    logger.info("Local inference server stopped")
-            except (ImportError, OSError, RuntimeError) as _exc:
-                logger.exception("Error stopping local inference server")
 
         # 1. Stop accepting new work
         coding_shutdown.set()

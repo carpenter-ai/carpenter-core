@@ -9,10 +9,13 @@ from carpenter.review.pipeline import (
     is_previously_approved,
     record_approval,
     clear_cache,
+    determine_outcome,
     PipelineResult,
+    ReviewOutcome,
 )
 from carpenter.review.profiles import PROFILE_PLANNER
 from carpenter.review.code_reviewer import ReviewResult
+from carpenter.review.qqr import QqrSignal, QqrVerdict
 from carpenter.agent import conversation
 from carpenter import config
 
@@ -37,7 +40,7 @@ def conv_id(test_db):
 def review_config(test_db, monkeypatch):
     """Set up review config for tests."""
     current = config.CONFIG.copy()
-    current["review"] = {"reviewer_model": "anthropic:claude-sonnet-4-20250514"}
+    current["review"] = {"reviewer_model": "anthropic:claude-sonnet-4-6"}
     current["claude_api_key"] = "test-key"
     monkeypatch.setattr(config, "CONFIG", current)
 
@@ -353,3 +356,200 @@ class TestProgressiveTextReview:
         )
         run_review_pipeline("x = UnstructuredText('some text')\n", conv_id)
         mock_ptr.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# QQR aggregation table — every row of the §2.4 composition rules
+# (disabled / errored verification fallback path).
+# ---------------------------------------------------------------------------
+
+def _qqr(verdict: QqrVerdict | None) -> QqrSignal | None:
+    if verdict is None:
+        return None
+    if verdict == QqrVerdict.ABSTAIN:
+        return QqrSignal.abstain("test")
+    return QqrSignal(
+        verdict=verdict,
+        category="none",
+        confidence="medium",
+        reason_html="[QQR] test",
+    )
+
+
+@pytest.mark.parametrize(
+    "main, qqr, expected",
+    [
+        # main_approve x QQR
+        ("approve", QqrVerdict.APPROVE, ReviewOutcome.APPROVE),
+        ("approve", QqrVerdict.MAJOR, ReviewOutcome.MAJOR),
+        ("approve", QqrVerdict.MINOR, ReviewOutcome.APPROVE),  # advisory
+        ("approve", QqrVerdict.ABSTAIN, ReviewOutcome.APPROVE),
+        ("approve", None, ReviewOutcome.APPROVE),
+        # main_minor x QQR — main is authoritative on correctness
+        ("minor", QqrVerdict.APPROVE, ReviewOutcome.REWORK),
+        ("minor", QqrVerdict.MAJOR, ReviewOutcome.MAJOR),  # MAJOR wins
+        ("minor", QqrVerdict.MINOR, ReviewOutcome.REWORK),
+        ("minor", QqrVerdict.ABSTAIN, ReviewOutcome.REWORK),
+        ("minor", None, ReviewOutcome.REWORK),
+        # main_major x QQR
+        ("major", QqrVerdict.APPROVE, ReviewOutcome.MAJOR),
+        ("major", QqrVerdict.MAJOR, ReviewOutcome.MAJOR),
+        ("major", QqrVerdict.MINOR, ReviewOutcome.MAJOR),
+        ("major", QqrVerdict.ABSTAIN, ReviewOutcome.MAJOR),
+        ("major", None, ReviewOutcome.MAJOR),
+    ],
+)
+def test_qqr_aggregation_table(main, qqr, expected):
+    """determine_outcome composes main reviewer + QQR per §2.4."""
+    outcome = determine_outcome(
+        syntax_valid=True,
+        import_star_violation=False,
+        injection_flags=[],
+        ai_review_result=main,
+        ai_review_reason="",
+        qqr_signal=_qqr(qqr),
+    )
+    assert outcome == expected, (
+        f"main={main} qqr={qqr} expected={expected} got={outcome}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Integration: chat history could steer the main reviewer to APPROVE,
+# but QQR (which doesn't see history) flags MAJOR → aggregate is MAJOR.
+# This exercises the load-bearing change.
+# ---------------------------------------------------------------------------
+
+class TestQqrIntegration:
+    """End-to-end pipeline behaviour with QQR enabled."""
+
+    @pytest.fixture(autouse=True)
+    def disable_verification(self, monkeypatch):
+        """Force the disabled/errored verification fallback path."""
+        cfg = config.CONFIG.copy()
+        cfg["verification"] = {"enabled": False}
+        cfg["review"] = {
+            "reviewer_model": "anthropic:claude-sonnet-4-6",
+            "qqr": {
+                "enabled": True,
+                "allowed_models": ["anthropic:claude-haiku-4-5"],
+                "fail_closed": True,
+            },
+        }
+        cfg["claude_api_key"] = "test-key"
+        monkeypatch.setattr(config, "CONFIG", cfg)
+
+    @patch("carpenter.review.pipeline.run_qqr")
+    @patch("carpenter.review.pipeline.review_code")
+    def test_main_approve_qqr_major_yields_major(
+        self, mock_review, mock_qqr, conv_id,
+    ):
+        mock_review.return_value = ReviewResult(
+            status="approve", reason="", sanitized_code="a = 1",
+        )
+        mock_qqr.return_value = QqrSignal(
+            verdict=QqrVerdict.MAJOR,
+            category="safety",
+            confidence="high",
+            reason_html="[QQR] suspicious external call",
+        )
+        result = run_review_pipeline("x = 1\n", conv_id)
+        assert result.status == "major_alert"
+        assert result.outcome == ReviewOutcome.MAJOR
+        # Reason should make clear this is a QQR-driven upgrade.
+        assert "QQR" in result.reason or "Quarantined" in result.reason
+        assert result.qqr_signal is mock_qqr.return_value
+
+    @patch("carpenter.review.pipeline.run_qqr")
+    @patch("carpenter.review.pipeline.review_code")
+    def test_both_approve_yields_approve(
+        self, mock_review, mock_qqr, conv_id,
+    ):
+        mock_review.return_value = ReviewResult(
+            status="approve", reason="", sanitized_code="a = 1",
+        )
+        mock_qqr.return_value = QqrSignal(
+            verdict=QqrVerdict.APPROVE,
+            category="none",
+            confidence="high",
+            reason_html="[QQR] ok",
+        )
+        result = run_review_pipeline("x = 1\n", conv_id)
+        assert result.status == "approved"
+        assert result.outcome == ReviewOutcome.APPROVE
+
+    @patch("carpenter.review.pipeline.run_qqr")
+    @patch("carpenter.review.pipeline.review_code")
+    def test_qqr_abstain_falls_back_to_main_approve(
+        self, mock_review, mock_qqr, conv_id,
+    ):
+        mock_review.return_value = ReviewResult(
+            status="approve", reason="", sanitized_code="a = 1",
+        )
+        mock_qqr.return_value = QqrSignal.abstain("network down")
+        result = run_review_pipeline("x = 1\n", conv_id)
+        # Today's behaviour preserved: main alone determines outcome.
+        assert result.status == "approved"
+        assert result.outcome == ReviewOutcome.APPROVE
+        assert result.qqr_signal.verdict == QqrVerdict.ABSTAIN
+
+    @patch("carpenter.review.pipeline.review_code")
+    def test_qqr_disabled_in_config_skipped(
+        self, mock_review, conv_id, monkeypatch,
+    ):
+        cfg = config.CONFIG.copy()
+        cfg["verification"] = {"enabled": False}
+        cfg["review"] = {
+            "reviewer_model": "anthropic:claude-sonnet-4-6",
+            "qqr": {"enabled": False},
+        }
+        cfg["claude_api_key"] = "test-key"
+        monkeypatch.setattr(config, "CONFIG", cfg)
+
+        mock_review.return_value = ReviewResult(
+            status="approve", reason="", sanitized_code="a = 1",
+        )
+        result = run_review_pipeline("x = 1\n", conv_id)
+        assert result.status == "approved"
+        # QQR was not run → signal is None.
+        assert result.qqr_signal is None
+
+    @patch("carpenter.review.pipeline.run_qqr")
+    @patch("carpenter.review.pipeline.review_code")
+    def test_qqr_only_receives_severity_labels(
+        self, mock_review, mock_qqr, conv_id,
+    ):
+        """QQR must receive ONLY severity labels, never flag descriptions."""
+        mock_review.return_value = ReviewResult(
+            status="approve", reason="", sanitized_code="a = 1",
+        )
+        mock_qqr.return_value = QqrSignal(
+            verdict=QqrVerdict.APPROVE,
+            category="none",
+            confidence="high",
+            reason_html="[QQR] ok",
+        )
+        # ctypes triggers a real injection-defense flag; we want to
+        # verify run_qqr was called with severity strings only.
+        run_review_pipeline("import ctypes\nx = 1\n", conv_id)
+        assert mock_qqr.called
+        _args, _kwargs = mock_qqr.call_args
+        # Third positional arg is advisory_severities.
+        severities = _args[2]
+        assert isinstance(severities, list)
+        for s in severities:
+            assert s in {"HIGH", "MEDIUM", "LOW", "INFO"}, (
+                f"QQR received non-severity-label payload: {s!r}"
+            )
+
+    def test_qqr_skipped_on_planner_profile(self, conv_id):
+        """PROFILE_PLANNER does not run QQR — intent_review_only short-circuits."""
+        with (
+            patch("carpenter.review.pipeline.run_qqr") as mock_qqr,
+            patch("carpenter.review.pipeline.review_code_for_intent") as mock_intent,
+        ):
+            mock_intent.return_value = ReviewResult(
+                status="approve", reason="", sanitized_code="x = 1",
+            )
+            run_review_pipeline("x = 1\n", conv_id, profile=PROFILE_PLANNER)
+            mock_qqr.assert_not_called()

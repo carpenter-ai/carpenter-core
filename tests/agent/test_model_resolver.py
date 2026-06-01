@@ -15,23 +15,23 @@ def mock_escalation_config(monkeypatch):
             "stacks": {
                 "coding": [
                     "ollama:qwen2.5-coder:32b",
-                    "anthropic:claude-haiku-4.5-20241022",
-                    "anthropic:claude-sonnet-4-20250514",
+                    "anthropic:claude-haiku-4-5",
+                    "anthropic:claude-sonnet-4-6",
                 ],
                 "writing": [
                     "ollama:llama3.1:70b",
-                    "anthropic:claude-haiku-4.5-20241022",
-                    "anthropic:claude-opus-4-6",
+                    "anthropic:claude-haiku-4-5",
+                    "anthropic:claude-opus-4-7",
                 ],
                 "general": [
-                    "anthropic:claude-haiku-4.5-20241022",
-                    "anthropic:claude-sonnet-4-20250514",
+                    "anthropic:claude-haiku-4-5",
+                    "anthropic:claude-sonnet-4-6",
                 ],
             },
             "pricing": {
-                "anthropic:claude-haiku-4.5-20241022": [0.80, 4.00],
-                "anthropic:claude-sonnet-4-20250514": [3.00, 15.00],
-                "anthropic:claude-opus-4-6": [15.00, 75.00],
+                "anthropic:claude-haiku-4-5": [0.80, 4.00],
+                "anthropic:claude-sonnet-4-6": [3.00, 15.00],
+                "anthropic:claude-opus-4-7": [15.00, 75.00],
                 "ollama:qwen2.5-coder:32b": [0.00, 0.00],
                 "ollama:llama3.1:70b": [0.00, 0.00],
             },
@@ -42,9 +42,9 @@ def mock_escalation_config(monkeypatch):
 
 def test_parse_model_string_valid():
     """Parse valid model string."""
-    provider, model = model_resolver.parse_model_string("anthropic:claude-haiku-4.5")
+    provider, model = model_resolver.parse_model_string("anthropic:claude-haiku-4-5")
     assert provider == "anthropic"
-    assert model == "claude-haiku-4.5"
+    assert model == "claude-haiku-4-5"
 
 
 def test_parse_model_string_ollama_colon():
@@ -73,8 +73,8 @@ def test_get_escalation_stack_coding():
     stack = model_resolver.get_escalation_stack("coding")
     assert stack == [
         "ollama:qwen2.5-coder:32b",
-        "anthropic:claude-haiku-4.5-20241022",
-        "anthropic:claude-sonnet-4-20250514",
+        "anthropic:claude-haiku-4-5",
+        "anthropic:claude-sonnet-4-6",
     ]
 
 
@@ -82,23 +82,23 @@ def test_get_escalation_stack_fallback():
     """Fall back to general stack if task_type not found."""
     stack = model_resolver.get_escalation_stack("nonexistent")
     assert stack == [
-        "anthropic:claude-haiku-4.5-20241022",
-        "anthropic:claude-sonnet-4-20250514",
+        "anthropic:claude-haiku-4-5",
+        "anthropic:claude-sonnet-4-6",
     ]
 
 
 def test_get_next_model_finds_next():
     """Find next model in escalation stack."""
     next_model = model_resolver.get_next_model(
-        "anthropic:claude-haiku-4.5-20241022", "coding"
+        "anthropic:claude-haiku-4-5", "coding"
     )
-    assert next_model == "anthropic:claude-sonnet-4-20250514"
+    assert next_model == "anthropic:claude-sonnet-4-6"
 
 
 def test_get_next_model_at_top():
     """Return None when already at highest tier."""
     next_model = model_resolver.get_next_model(
-        "anthropic:claude-sonnet-4-20250514", "coding"
+        "anthropic:claude-sonnet-4-6", "coding"
     )
     assert next_model is None
 
@@ -115,7 +115,7 @@ def test_get_next_model_not_in_stack():
 def test_create_client_for_model_anthropic():
     """Return claude_client for anthropic provider."""
     from carpenter.agent.providers import anthropic as claude_client
-    client = model_resolver.create_client_for_model("anthropic:claude-haiku-4.5")
+    client = model_resolver.create_client_for_model("anthropic:claude-haiku-4-5")
     assert client is claude_client
 
 
@@ -135,8 +135,8 @@ def test_create_client_for_model_unknown():
 def test_estimate_cost_multiplier_3x():
     """Estimate 3x cost increase from haiku to sonnet."""
     cost = model_resolver.estimate_cost_multiplier(
-        "anthropic:claude-haiku-4.5-20241022",
-        "anthropic:claude-sonnet-4-20250514",
+        "anthropic:claude-haiku-4-5",
+        "anthropic:claude-sonnet-4-6",
     )
     # haiku avg = 2.40, sonnet avg = 9.00 => 3.75x => "~3x"
     assert cost == "~3x"
@@ -145,8 +145,8 @@ def test_estimate_cost_multiplier_3x():
 def test_estimate_cost_multiplier_10x():
     """Estimate 10x+ cost increase from haiku to opus."""
     cost = model_resolver.estimate_cost_multiplier(
-        "anthropic:claude-haiku-4.5-20241022",
-        "anthropic:claude-opus-4-6",
+        "anthropic:claude-haiku-4-5",
+        "anthropic:claude-opus-4-7",
     )
     # haiku avg = 2.40, opus avg = 45.00 => ~18.75x
     assert cost == "~18x"
@@ -165,7 +165,7 @@ def test_estimate_cost_multiplier_paid():
     """Show 'paid' when going from free to paid model."""
     cost = model_resolver.estimate_cost_multiplier(
         "ollama:qwen2.5-coder:32b",
-        "anthropic:claude-haiku-4.5-20241022",
+        "anthropic:claude-haiku-4-5",
     )
     assert cost == "paid"
 
@@ -189,15 +189,6 @@ def test_estimate_cost_multiplier_similar():
         assert cost == "similar cost"
 
 
-# -- Local provider --
-
-def test_create_client_for_model_local():
-    """Return local_client for local provider."""
-    from carpenter.agent.providers import local as local_client
-    client = model_resolver.create_client_for_model("local:qwen2.5-1.5b")
-    assert client is local_client
-
-
 def test_create_client_for_model_chain():
     """Return chain_client for chain provider."""
     from carpenter.agent.providers import chain as chain_client
@@ -205,36 +196,8 @@ def test_create_client_for_model_chain():
     assert client is chain_client
 
 
-def test_get_model_for_role_local(monkeypatch):
-    """get_model_for_role auto-detects local provider with model path."""
-    test_config = {
-        **config.CONFIG,
-        "ai_provider": "local",
-        "local_model_path": "/home/pi/models/qwen2.5-1.5b-instruct-q4_k_m.gguf",
-        "model_roles": {"default": "", "chat": ""},
-    }
-    monkeypatch.setattr(config, "CONFIG", test_config)
-    result = model_resolver.get_model_for_role("chat")
-    assert result == "local:qwen2.5-1.5b-instruct-q4_k_m"
-
-
-def test_get_model_for_role_local_no_path(monkeypatch):
-    """get_model_for_role falls back to local:default when no model path."""
-    test_config = {
-        **config.CONFIG,
-        "ai_provider": "local",
-        "local_model_path": "",
-        "model_roles": {"default": "", "chat": ""},
-    }
-    monkeypatch.setattr(config, "CONFIG", test_config)
-    result = model_resolver.get_model_for_role("chat")
-    assert result == "local:default"
-
-
-def test_estimate_cost_multiplier_local_free():
-    """Show 'free' for local models (same as Ollama)."""
-    cost = model_resolver.estimate_cost_multiplier(
-        "local:qwen2.5-1.5b",
-        "local:qwen2.5-3b",
-    )
-    assert cost == "free"
+def test_create_client_for_model_unknown_provider():
+    """Unknown provider raises ValueError."""
+    import pytest
+    with pytest.raises(ValueError, match="Unknown AI provider"):
+        model_resolver.create_client_for_model("bogus:foo")

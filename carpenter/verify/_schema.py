@@ -64,7 +64,8 @@ def _get_output_contract(arc_id: int) -> str | None:
             if row is not None:
                 return row["output_contract"]
     except Exception as _exc:  # broad catch: DB may not be available during verification
-        logger.debug("Could not look up output_contract for arc %s", arc_id)
+        # Intentional: DB may legitimately be unavailable in verification contexts.
+        logger.info("Could not look up output_contract for arc %s", arc_id, exc_info=True)
     return None
 
 

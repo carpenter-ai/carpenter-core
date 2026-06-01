@@ -318,12 +318,6 @@ def _run_single(code: str, input_mapping: dict[str, Any]) -> DryRunResult:
         def get_children_plan(self, *args, **kwargs):
             return wrap_value([], _T)
 
-        def read_output_UNTRUSTED(self, *args, **kwargs):
-            return Tracked("", _C)
-
-        def read_state_UNTRUSTED(self, *args, **kwargs):
-            return Tracked("", _C)
-
     # ── Mock messaging modules (split act vs read) ───────────────
     class MockActMessaging:
         def send(self, *args, **kwargs):
@@ -752,6 +746,7 @@ def _run_single(code: str, input_mapping: dict[str, Any]) -> DryRunResult:
             error_detail=str(e),
         )
     except Exception as e:  # broad catch: dry run involves complex tool dispatch
+        logger.exception("Dry-run execution failed")
         return DryRunResult(
             passed=False,
             reason=f"Execution error during dry-run: {type(e).__name__}: {e}",

@@ -1,5 +1,7 @@
-"""Read-only webhook tools. Tier 1: callback to platform."""
-from .._callback import callback
+"""Read-only webhook tool declarations.
+
+See ``carpenter_tools`` package docstring for the invocation model.
+"""
 from ..tool_meta import tool
 
 
@@ -9,12 +11,9 @@ def list_subscriptions(source_type: str | None = None) -> list[dict]:
     """List active webhook subscriptions.
 
     Args:
-        source_type: Optional filter by source type (e.g. 'forgejo').
+        source_type: Optional filter by configured forge name (e.g. 'forgejo').
 
     Returns:
         List of subscription dicts.
     """
-    result = callback("webhook.list", {
-        "source_type": source_type,
-    })
-    return result.get("subscriptions", [])
+    ...

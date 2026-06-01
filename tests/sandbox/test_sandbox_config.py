@@ -323,10 +323,10 @@ class TestSandboxShellCommand:
 
 class TestEnvVarBlocking:
     def test_sandbox_env_vars_ignored(self):
-        """Arbitrary env vars (like the old TC_SANDBOX_* pattern) do not override sandbox config."""
+        """Arbitrary SANDBOX_* env vars do not override sandbox config."""
         env_patch = {
-            "TC_SANDBOX_METHOD": "none",
-            "TC_SANDBOX_ON_FAILURE": "open",
+            "EXTERNAL_SANDBOX_METHOD": "none",
+            "EXTERNAL_SANDBOX_ON_FAILURE": "open",
         }
         with patch.dict(os.environ, env_patch):
             from carpenter.config import _load_env

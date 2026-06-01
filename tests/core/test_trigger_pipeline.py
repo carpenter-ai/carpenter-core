@@ -776,7 +776,7 @@ class TestWebhookParsers:
 
     def test_forgejo_parser(self):
         """Forgejo parser extracts key fields."""
-        from carpenter.core.engine.triggers.webhook import _parse_forgejo
+        from carpenter.forges.forgejo import ForgejoProvider
 
         headers = {
             "x-forgejo-event": "push",
@@ -789,7 +789,7 @@ class TestWebhookParsers:
             "sender": {"login": "user"},
         }
 
-        event_type, payload, delivery_id = _parse_forgejo(headers, body)
+        event_type, payload, delivery_id = ForgejoProvider().parse_webhook_trigger(headers, body)
         assert event_type == "push"
         assert delivery_id == "abc-123"
         assert payload["ref"] == "refs/heads/main"
@@ -797,8 +797,13 @@ class TestWebhookParsers:
         assert payload["repo_full_name"] == "user/repo"
 
     def test_github_parser(self):
-        """GitHub parser extracts key fields."""
-        from carpenter.core.engine.triggers.webhook import _parse_github
+        """GitHub parser path falls back to generic until Phase C lands.
+
+        D5 reserves the slot in the registry; without a registered GitHub
+        provider, the trigger pipeline parser falls back to the built-in
+        generic parser.
+        """
+        from carpenter.core.engine.triggers.webhook import _parse
 
         headers = {
             "x-github-event": "pull_request",
@@ -811,11 +816,11 @@ class TestWebhookParsers:
             "sender": {"login": "dev"},
         }
 
-        event_type, payload, delivery_id = _parse_github(headers, body)
-        assert event_type == "pull_request"
-        assert delivery_id == "gh-456"
-        assert payload["action"] == "opened"
-        assert payload["pr_number"] == 42
+        event_type, payload, delivery_id = _parse("github", headers, body)
+        # Generic fallback: event_type is "generic", payload wraps body in {"data": ...}
+        assert event_type == "generic"
+        assert delivery_id is None
+        assert payload == {"data": body}
 
     def test_generic_parser(self):
         """Generic parser passes through raw body."""

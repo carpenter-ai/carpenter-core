@@ -212,10 +212,10 @@ def test_root_arc_failure_with_escalation_stack(monkeypatch):
     assert row is not None
     assert row["goal"] == "do something important"
 
-    # Check agent_config_id points to the escalated model
-    assert row["agent_config_id"] is not None
-    cfg = arc_manager.get_agent_config(row["agent_config_id"])
-    assert cfg["model"] == "model-medium"
+    # Check model_policy_id points to the escalated model
+    assert row["model_policy_id"] is not None
+    policy = arc_manager.get_model_policy(row["model_policy_id"])
+    assert policy["model"] == "model-medium"
 
     # Check _escalated_from in arc_state
     db = get_db()

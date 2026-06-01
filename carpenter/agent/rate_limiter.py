@@ -176,7 +176,7 @@ def update_from_headers(headers: dict, model: str | None = None):
 
     Args:
         headers: Response headers (httpx Headers or dict-like).
-        model: Model name to update limits for (e.g. "claude-haiku-4-5-20251001").
+        model: Model name to update limits for (e.g. "claude-haiku-4-5").
     """
     rpm_limit = headers.get("anthropic-ratelimit-requests-limit")
     itpm_limit = headers.get("anthropic-ratelimit-tokens-limit")

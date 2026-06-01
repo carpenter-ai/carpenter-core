@@ -1,5 +1,7 @@
-"""Scheduling tools. Tier 1: callback to platform (delayed execution)."""
-from .._callback import callback
+"""Scheduling tool declarations.
+
+See ``carpenter_tools`` package docstring for the invocation model.
+"""
 from ..tool_meta import tool
 
 
@@ -8,27 +10,20 @@ from ..tool_meta import tool
 def add_once(name: str, at_iso: str, event_type: str, event_payload: dict | None = None) -> int:
     """Add a one-shot trigger that fires once at the given ISO timestamp.
 
-    After firing, the entry is automatically deleted. Returns cron ID.
+    Auto-deletes after firing. Returns cron ID. PREFER
+    ``event_type='cron.message'`` for reminders. Use ``'arc.dispatch'``
+    only when the fire must run code.
 
     Args:
         name: Unique name for this trigger.
-        at_iso: ISO datetime string for when to fire.
-            Use LOCAL time without timezone suffix — the platform converts
-            to UTC automatically.  Example: '2026-04-05T14:30:00'
-            (fires at 2:30 PM local time).
-            Do NOT append 'Z' or '+00:00' unless you mean UTC.
-        event_type: Must be 'cron.message' or 'arc.dispatch'.
-            Use 'cron.message' for simple message delivery (with event_payload
-            containing {"message": "..."}). conversation_id is auto-injected.
-            Use 'arc.dispatch' to execute an arc (with event_payload
-            containing {"arc_id": <id>}).
-        event_payload: Payload dict — required keys depend on event_type.
+        at_iso: ISO datetime in LOCAL time, no timezone suffix (platform
+            converts to UTC). Example: '2026-04-05T14:30:00'.
+        event_type: 'cron.message' or 'arc.dispatch'.
+        event_payload: For 'cron.message': {"message": "<non-empty string>"}.
+            For 'arc.dispatch': {"arc_id": <int from arc.create()['arc_id']>}.
+            conversation_id is auto-injected.
     """
-    result = callback("scheduling.add_once", {
-        "name": name, "at_iso": at_iso,
-        "event_type": event_type, "event_payload": event_payload,
-    })
-    return result["cron_id"]
+    ...
 
 
 @tool(local=True, readonly=False, side_effects=True,
@@ -36,41 +31,50 @@ def add_once(name: str, at_iso: str, event_type: str, event_payload: dict | None
 def add_cron(name: str, cron_expr: str, event_type: str, event_payload: dict | None = None) -> int:
     """Add a recurring cron entry. Returns cron ID.
 
+    PREFER ``event_type='cron.message'`` for any "monitor / ping / remind /
+    tell me each time" request — one call, no per-fire code, cannot fail
+    at runtime. Use ``'arc.dispatch'`` only when each fire must run code
+    (e.g. "alert me when price < X").
+
+    Cron's finest granularity is 1 minute. Sub-minute requests round UP
+    to ``'* * * * *'`` — reviewer-approved; don't refuse or present options.
+
     Args:
         name: Unique name for this cron entry.
-        cron_expr: Cron expression (e.g. '*/5 * * * *' for every 5 minutes).
-        event_type: Must be 'cron.message' or 'arc.dispatch'.
-            Use 'cron.message' for simple message delivery (with event_payload
-            containing {"message": "..."}). conversation_id is auto-injected.
-            Use 'arc.dispatch' to execute an arc (with event_payload
-            containing {"arc_id": <id>}).
-        event_payload: Payload dict — required keys depend on event_type.
+        cron_expr: e.g. '*/5 * * * *' (every 5 min), '* * * * *' (every min).
+        event_type: 'cron.message' or 'arc.dispatch'.
+        event_payload: For 'cron.message': {"message": "<non-empty string>"}.
+            For 'arc.dispatch': {"arc_id": <int from arc.create()['arc_id']>}.
+            The arc MUST itself call messaging.send() in its goal or the
+            user sees nothing. conversation_id is auto-injected.
     """
-    result = callback("scheduling.add_cron", {
-        "name": name, "cron_expr": cron_expr,
-        "event_type": event_type, "event_payload": event_payload,
-    })
-    return result["cron_id"]
+    ...
 
 
 @tool(local=True, readonly=False, side_effects=True,
       param_types={"name": "Label"})
 def remove_cron(name: str) -> bool:
-    """Remove a cron entry by name. Returns True if found."""
-    result = callback("scheduling.remove_cron", {"name": name})
-    return result["removed"]
+    """Remove a cron entry by name. Returns ``{"removed": True}`` if found.
+
+    This is the ONLY cancel API — no ``cancel_cron`` / ``delete_cron`` /
+    ``stop_cron`` exists. No-op (``{"removed": False}``) if name missing.
+
+    Args:
+        name: The exact ``name`` originally given to ``add_cron`` /
+            ``add_once``. Example:
+            ``scheduling.remove_cron(name="s031-monitor-httpbin")``.
+    """
+    ...
 
 
 @tool(local=True, readonly=False, side_effects=True)
 def list_cron() -> list[dict]:
-    """List all cron entries."""
-    result = callback("scheduling.list_cron", {})
-    return result["entries"]
+    """List all cron entries. Useful before ``remove_cron`` to confirm names."""
+    ...
 
 
 @tool(local=True, readonly=False, side_effects=True,
       param_types={"name": "Label"})
 def enable_cron(name: str, enabled: bool = True) -> bool:
     """Enable or disable a cron entry."""
-    result = callback("scheduling.enable_cron", {"name": name, "enabled": enabled})
-    return result["found"]
+    ...

@@ -217,20 +217,58 @@ def read_arc_result(tool_input, **kwargs):
                 break
 
     if not result:
-        return f"Arc #{arc_id} has no result content."
+        body = f"Arc #{arc_id} has no result content."
+    else:
+        total_len = len(result)
+        chunk = result[offset:offset + char_limit]
 
-    total_len = len(result)
-    chunk = result[offset:offset + char_limit]
+        if total_len <= char_limit and offset == 0:
+            body = chunk
+        else:
+            # Include pagination metadata for large results
+            remaining = max(0, total_len - offset - char_limit)
+            body = (
+                f"[Showing characters {offset}-{offset + len(chunk)} of "
+                f"{total_len} total"
+                f"{f', {remaining} remaining' if remaining else ''}]\n{chunk}"
+            )
 
-    if total_len <= char_limit and offset == 0:
-        return chunk
+    # Append a Resources nudge if the arc produced or consumed any.
+    nudge = _build_resources_nudge(arc_id)
+    if nudge:
+        return f"{body}\n{nudge}"
+    return body
 
-    # Include pagination metadata for large results
-    remaining = max(0, total_len - offset - char_limit)
-    return (
-        f"[Showing characters {offset}-{offset + len(chunk)} of {total_len} total"
-        f"{f', {remaining} remaining' if remaining else ''}]\n{chunk}"
+
+def _build_resources_nudge(arc_id: int) -> str:
+    """Build a trailing bracketed block listing Resources linked to arc_id.
+
+    Returns an empty string when the arc has no Resources so the caller
+    can preserve prior output byte-for-byte.
+    """
+    from carpenter.core.resources import (
+        list_resources_for_arc,
+        resource_trust,
     )
+
+    resources = list_resources_for_arc(arc_id)
+    if not resources:
+        return ""
+
+    lines = [f"[Resources associated with arc #{arc_id}:"]
+    for r in resources:
+        rid = r["id"]
+        ct = r.get("content_type") or "unknown"
+        trust = resource_trust(r)
+        if trust == "trusted" and r.get("deleted_at") is None:
+            action = f"use read_resource({rid}) for full content"
+        elif r.get("deleted_at") is not None:
+            action = "cleaned up"
+        else:
+            action = "not readable from chat"
+        lines.append(f"  - Resource #{rid} ({ct}, {trust}) — {action}")
+    lines.append("]")
+    return "\n".join(lines)
 
 
 @chat_tool(

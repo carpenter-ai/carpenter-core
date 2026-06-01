@@ -1,0 +1,14 @@
+name: reflection-kb-action-gated
+description: Human-gated variant of reflection-kb-action. Spawned by dispatch-actions when the reflected arc's subtree contained tainted conversations. The await-approval step blocks on arc.manual_trigger before execute-action runs.
+capabilities:
+  - kb.write
+steps:
+  - name: await-approval
+    description: Wait for human approval before running the reflection-proposed KB action (reflected arc was tainted)
+    order: 0
+    activation_event: arc.manual_trigger
+  - name: execute-action
+    description: Run the KB action described in the parent arc's goal
+    order: 1
+    agent_type: EXECUTOR
+    agent_model: sonnet

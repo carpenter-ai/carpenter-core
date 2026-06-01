@@ -39,6 +39,48 @@ def test_add_cron_returns_id():
     assert cid > 0
 
 
+def test_add_cron_is_idempotent_on_name_conflict():
+    """Re-adding a cron with the same name updates in place; no UNIQUE error."""
+    cid1 = trigger_manager.add_cron(
+        "dup-job", "*/5 * * * *", "cron.fire",
+    )
+    # Same name, different params — must NOT raise IntegrityError.
+    cid2 = trigger_manager.add_cron(
+        "dup-job", "*/10 * * * *", "cron.message",
+        event_payload={"message": "hi"},
+    )
+    assert cid2 == cid1, "Idempotent upsert should preserve the cron ID"
+    entry = trigger_manager.get_cron("dup-job")
+    assert entry is not None
+    assert entry["cron_expr"] == "*/10 * * * *"
+    assert entry["event_type"] == "cron.message"
+    assert entry["enabled"]  # upsert re-enables
+
+
+def test_add_once_is_idempotent_on_name_conflict():
+    """Re-adding a one-shot with the same name updates in place."""
+    future_iso = (
+        datetime.now(timezone.utc) + timedelta(minutes=5)
+    ).isoformat()
+    later_iso = (
+        datetime.now(timezone.utc) + timedelta(minutes=10)
+    ).isoformat()
+    cid1 = trigger_manager.add_once(
+        "once-dup", future_iso, "cron.message",
+        event_payload={"message": "first"},
+    )
+    cid2 = trigger_manager.add_once(
+        "once-dup", later_iso, "cron.message",
+        event_payload={"message": "second"},
+    )
+    assert cid2 == cid1
+    entry = trigger_manager.get_cron("once-dup")
+    assert entry is not None
+    assert entry["one_shot"]
+    # next_fire_at should reflect the second add
+    assert entry["next_fire_at"].startswith(later_iso.split("+")[0][:16])
+
+
 def test_add_cron_invalid_expression():
     """add_cron raises ValueError for invalid cron expression."""
     with pytest.raises(ValueError, match="Invalid cron expression"):

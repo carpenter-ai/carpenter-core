@@ -123,7 +123,7 @@ class TestCodingChangeArcFlow:
         )
 
         # Mock the coding agent to make a real file change
-        def mock_coding_agent(workspace, prompt, agent_name=None):
+        def mock_coding_agent(workspace, prompt, agent_name=None, arc_id=None):
             # Simulate agent editing a file in the workspace
             utils_path = os.path.join(workspace, "utils.py")
             with open(utils_path) as f:
@@ -197,7 +197,7 @@ class TestCodingChangeArcFlow:
             goal=f"Bad change to {source_project}",
         )
 
-        def mock_coding_agent(workspace, prompt, agent_name=None):
+        def mock_coding_agent(workspace, prompt, agent_name=None, arc_id=None):
             utils_path = os.path.join(workspace, "utils.py")
             with open(utils_path, "w") as f:
                 f.write("# everything deleted\n")
@@ -246,7 +246,7 @@ class TestCodingChangeArcFlow:
             goal=f"Revise change to {source_project}",
         )
 
-        def mock_coding_agent(workspace, prompt, agent_name=None):
+        def mock_coding_agent(workspace, prompt, agent_name=None, arc_id=None):
             with open(os.path.join(workspace, "utils.py"), "a") as f:
                 f.write("\ndef stub(): pass\n")
             return {"stdout": "Added stub.", "exit_code": 0, "iterations": 1}
@@ -303,7 +303,7 @@ class TestMainLoopProcessing:
             goal=f"Loop test for {source_project}",
         )
 
-        def mock_coding_agent(workspace, prompt, agent_name=None):
+        def mock_coding_agent(workspace, prompt, agent_name=None, arc_id=None):
             with open(os.path.join(workspace, "main.py"), "a") as f:
                 f.write("\ndef loop_test(): pass\n")
             return {"stdout": "Done.", "exit_code": 0, "iterations": 1}

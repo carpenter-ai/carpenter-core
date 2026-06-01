@@ -5,6 +5,27 @@ import pytest
 from unittest.mock import patch, MagicMock, AsyncMock
 
 from carpenter.core.workflows import pr_review_handler as handler
+from carpenter import forges as _forges
+
+
+@pytest.fixture
+def fake_forge(monkeypatch):
+    """Swap the registered "forgejo" provider for a MagicMock under D5.
+
+    Tests can set methods on the returned mock, e.g.::
+
+        fake_forge.get_pr = MagicMock(return_value={...})
+
+    Restores the original provider on teardown.
+    """
+    fake = MagicMock()
+    original = _forges._REGISTRY.get("forgejo")
+    _forges._REGISTRY["forgejo"] = fake
+    yield fake
+    if original is not None:
+        _forges._REGISTRY["forgejo"] = original
+    else:
+        _forges._REGISTRY.pop("forgejo", None)
 
 
 @pytest.fixture
@@ -52,7 +73,7 @@ def mock_notify(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_fetch_pr_success(mock_arc, mock_state, mock_notify, monkeypatch):
+async def test_fetch_pr_success(mock_arc, mock_state, mock_notify, fake_forge):
     """Successful PR fetch stores metadata + diff and enqueues ai-review."""
     _, mock_wq = mock_arc
     mock_state[(1, "repo_owner")] = "owner"
@@ -72,8 +93,8 @@ async def test_fetch_pr_success(mock_arc, mock_state, mock_notify, monkeypatch):
     mock_get_diff = MagicMock(return_value={
         "diff": "--- a/file.py\n+++ b/file.py\n@@ -1 +1,2 @@\n hello\n+world",
     })
-    monkeypatch.setattr(handler.forgejo_api_backend, "handle_get_pr", mock_get_pr)
-    monkeypatch.setattr(handler.forgejo_api_backend, "handle_get_pr_diff", mock_get_diff)
+    fake_forge.get_pr = mock_get_pr
+    fake_forge.get_pr_diff = mock_get_diff
 
     await handler.handle_fetch_pr(1, {"arc_id": 1})
 
@@ -97,7 +118,7 @@ async def test_fetch_pr_missing_coordinates(mock_arc, mock_state, mock_notify):
 
 
 @pytest.mark.asyncio
-async def test_fetch_pr_api_error(mock_arc, mock_state, mock_notify, monkeypatch):
+async def test_fetch_pr_api_error(mock_arc, mock_state, mock_notify, fake_forge):
     """PR fetch API error marks arc as failed."""
     mock_am, _ = mock_arc
     mock_state[(1, "repo_owner")] = "owner"
@@ -105,7 +126,7 @@ async def test_fetch_pr_api_error(mock_arc, mock_state, mock_notify, monkeypatch
     mock_state[(1, "pr_number")] = 42
 
     mock_get_pr = MagicMock(return_value={"error": "Not found"})
-    monkeypatch.setattr(handler.forgejo_api_backend, "handle_get_pr", mock_get_pr)
+    fake_forge.get_pr = mock_get_pr
 
     await handler.handle_fetch_pr(1, {"arc_id": 1})
 
@@ -131,10 +152,10 @@ async def test_ai_review_success(mock_arc, mock_state, mock_notify, monkeypatch)
 
     # Mock model resolution
     monkeypatch.setattr(handler, "config", MagicMock())
-    handler.config.CONFIG = {"model_roles": {"pr_review": "anthropic:claude-sonnet-4-20250514"}}
+    handler.config.CONFIG = {"model_roles": {"pr_review": "anthropic:claude-sonnet-4-6"}}
 
-    mock_get_role = MagicMock(return_value="anthropic:claude-sonnet-4-20250514")
-    mock_parse = MagicMock(return_value=("anthropic", "claude-sonnet-4-20250514"))
+    mock_get_role = MagicMock(return_value="anthropic:claude-sonnet-4-6")
+    mock_parse = MagicMock(return_value=("anthropic", "claude-sonnet-4-6"))
     mock_client = MagicMock()
     mock_client.chat.return_value = {
         "content": [{"type": "text", "text": json.dumps({
@@ -245,7 +266,7 @@ def test_parse_review_invalid_verdict_normalized():
 
 
 @pytest.mark.asyncio
-async def test_post_review_success(mock_arc, mock_state, mock_notify, monkeypatch):
+async def test_post_review_success(mock_arc, mock_state, mock_notify, fake_forge):
     """Successful review post enqueues notify step."""
     _, mock_wq = mock_arc
     mock_state[(1, "repo_owner")] = "owner"
@@ -259,7 +280,7 @@ async def test_post_review_success(mock_arc, mock_state, mock_notify, monkeypatc
     }
 
     mock_post = MagicMock(return_value={"review_id": 99, "state": "APPROVED"})
-    monkeypatch.setattr(handler.forgejo_api_backend, "handle_post_pr_review", mock_post)
+    fake_forge.post_pr_review = mock_post
 
     await handler.handle_post_review(1, {"arc_id": 1})
 
@@ -272,7 +293,7 @@ async def test_post_review_success(mock_arc, mock_state, mock_notify, monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_post_review_with_line_comments(mock_arc, mock_state, mock_notify, monkeypatch):
+async def test_post_review_with_line_comments(mock_arc, mock_state, mock_notify, fake_forge):
     """Review with issues includes line comments."""
     _, mock_wq = mock_arc
     mock_state[(1, "repo_owner")] = "owner"
@@ -289,7 +310,7 @@ async def test_post_review_with_line_comments(mock_arc, mock_state, mock_notify,
     }
 
     mock_post = MagicMock(return_value={"review_id": 100, "state": "REQUEST_CHANGES"})
-    monkeypatch.setattr(handler.forgejo_api_backend, "handle_post_pr_review", mock_post)
+    fake_forge.post_pr_review = mock_post
 
     await handler.handle_post_review(1, {"arc_id": 1})
 
@@ -300,7 +321,7 @@ async def test_post_review_with_line_comments(mock_arc, mock_state, mock_notify,
 
 
 @pytest.mark.asyncio
-async def test_post_review_api_error(mock_arc, mock_state, mock_notify, monkeypatch):
+async def test_post_review_api_error(mock_arc, mock_state, mock_notify, fake_forge):
     """Post review API error marks arc as failed."""
     mock_am, _ = mock_arc
     mock_state[(1, "repo_owner")] = "owner"
@@ -309,7 +330,7 @@ async def test_post_review_api_error(mock_arc, mock_state, mock_notify, monkeypa
     mock_state[(1, "review_result")] = {"verdict": "COMMENT", "body": "OK", "issues": []}
 
     mock_post = MagicMock(return_value={"error": "Unauthorized"})
-    monkeypatch.setattr(handler.forgejo_api_backend, "handle_post_pr_review", mock_post)
+    fake_forge.post_pr_review = mock_post
 
     await handler.handle_post_review(1, {"arc_id": 1})
 

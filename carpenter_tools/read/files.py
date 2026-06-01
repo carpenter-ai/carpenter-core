@@ -1,4 +1,7 @@
-"""Read-only file tools. Tier 2: runs directly, no callback."""
+"""Read-only file tool declarations.
+
+See ``carpenter_tools`` package docstring for the invocation model.
+"""
 import os
 
 from ..tool_meta import tool

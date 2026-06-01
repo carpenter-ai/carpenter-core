@@ -11,7 +11,6 @@ import logging
 import uuid
 from pathlib import Path
 
-import httpx
 from starlette.exceptions import HTTPException
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse
@@ -20,6 +19,8 @@ import attrs
 import cattrs
 
 from .. import config
+from ..forges import get_forge_provider
+from ..util.dot_env import update_dot_env, _dot_env_lock  # noqa: F401 (re-exported for tests)
 from .static import read_asset, load_template
 
 logger = logging.getLogger(__name__)
@@ -62,34 +63,24 @@ def create_credential_request(
 
 
 def _update_dot_env(key: str, value: str) -> None:
-    """Write a credential to {base_dir}/.env and reload config."""
-    import re
+    """Write a credential to ``{base_dir}/.env`` and reload config.
 
+    Thin wrapper that resolves the ``.env`` path from ``CONFIG["base_dir"]``
+    and delegates to :func:`carpenter.util.dot_env.update_dot_env` for the
+    actual atomic+locked+chmod+fsync write.  The shared helper is also
+    used by ``carpenter.__main__._cmd_setup_credential`` so the operator
+    CLI and the OAuth callback path get identical durability and
+    permission guarantees.
+
+    After the write succeeds, this function reloads the platform config
+    so the new credential is immediately available to in-process code.
+    """
     base_dir = config.CONFIG.get("base_dir", "")
     if not base_dir:
         raise RuntimeError("base_dir not configured")
 
     dot_env_path = Path(base_dir) / ".env"
-    existing_lines: list[str] = []
-    if dot_env_path.is_file():
-        existing_lines = dot_env_path.read_text().splitlines()
-
-    new_lines: list[str] = []
-    updated = False
-    for line in existing_lines:
-        if re.match(rf'^{re.escape(key)}\s*=', line.strip()):
-            new_lines.append(f"{key}={value}")
-            updated = True
-        else:
-            new_lines.append(line)
-
-    if not updated:
-        if new_lines and new_lines[-1].strip():
-            new_lines.append("")  # blank separator
-        new_lines.append(f"{key}={value}")
-
-    dot_env_path.parent.mkdir(parents=True, exist_ok=True)
-    dot_env_path.write_text("\n".join(new_lines) + "\n")
+    update_dot_env(dot_env_path, key, value)
 
     # Reload config so the new credential is immediately available
     config.reload_config()
@@ -98,7 +89,9 @@ def _update_dot_env(key: str, value: str) -> None:
 def verify_credential(key: str) -> dict:
     """Verify a stored credential by testing it.
 
-    For git_token/forgejo_token: calls GET {git_server_url}/api/v1/user.
+    For git_token/forgejo_token: delegates to the configured forge
+    provider's ``verify_token`` (today: Forgejo's
+    ``GET /api/v1/user``).
     For other keys: checks that the value is non-empty.
 
     Never returns the credential value.
@@ -111,26 +104,10 @@ def verify_credential(key: str) -> dict:
 
     if key in ("GIT_TOKEN", "FORGEJO_TOKEN") or config_key in ("git_token", "forgejo_token"):
         server_url = config.CONFIG.get("git_server_url", "") or config.CONFIG.get("forgejo_url", "")
-        if not server_url:
-            return {"valid": False, "reason": "git_server_url not configured"}
-
-        url = server_url.rstrip("/") + "/api/v1/user"
-        try:
-            response = httpx.get(
-                url,
-                headers={"Authorization": f"token {value}"},
-                timeout=15.0,
-            )
-            if response.status_code == 200:
-                data = response.json()
-                return {
-                    "valid": True,
-                    "username": data.get("login", ""),
-                }
-            else:
-                return {"valid": False, "reason": f"HTTP {response.status_code}"}
-        except (OSError, ValueError, KeyError) as e:
-            return {"valid": False, "reason": str(e)}
+        provider = get_forge_provider()
+        if provider is None:
+            return {"valid": False, "reason": "no forge provider registered"}
+        return provider.verify_token(server_url=server_url, token=value)
 
     # Generic: non-empty means valid
     return {"valid": True}

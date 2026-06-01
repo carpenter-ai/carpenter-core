@@ -1,0 +1,10 @@
+name: reflection-kb-action
+description: Execute a single reflection-proposed KB action. Spawned by the reflection template's dispatch-actions step. The parent arc's goal is the fully-rendered action prompt.
+capabilities:
+  - kb.write
+steps:
+  - name: execute-action
+    description: Run the KB action described in the parent arc's goal
+    order: 0
+    agent_type: EXECUTOR
+    agent_model: sonnet

@@ -265,6 +265,9 @@ def _get_head_sha(config_dir: str) -> str | None:
         head = repo.head()
         return head.decode() if isinstance(head, bytes) else str(head)
     except Exception:
+        # Suppression intentional: probe returns None when HEAD unavailable
+        # (no commits yet, or other repo state).
+        logger.info("Could not read HEAD sha from %s", config_dir, exc_info=True)
         return None
 
 

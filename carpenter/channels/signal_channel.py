@@ -195,6 +195,7 @@ class SignalChannelConnector(ChannelConnector):
                 last_seen=self._last_healthy,
             )
         except Exception as e:
+            logger.exception("Signal REST API health check failed for account %s", self._account)
             return HealthStatus(
                 healthy=False,
                 detail=str(e),
@@ -366,7 +367,9 @@ class SignalChannelConnector(ChannelConnector):
                 },
             )
         except Exception:
-            pass
+            # Best-effort rejection notice; do not bubble — caller already
+            # decided to drop the message.
+            logger.info("Signal REST rejection send failed for %s", recipient, exc_info=True)
 
     # -- Internal: shared --
 
@@ -400,7 +403,8 @@ class SignalChannelConnector(ChannelConnector):
                         "message": "Sorry, you are not authorized to use this service.",
                     })
                 except Exception:
-                    pass
+                    # Best-effort rejection notice; do not bubble.
+                    logger.info("Signal RPC rejection send failed for %s", source, exc_info=True)
             return
 
         # Extract display name from profile if available

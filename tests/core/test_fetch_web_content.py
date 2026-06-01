@@ -1,33 +1,14 @@
 """Tests for the fetch_web_content chat tool and arc.create_batch linking."""
 
 import json
-import os
 from unittest.mock import patch, MagicMock
 
 import pytest
 
 from carpenter.core.arcs import manager as arc_manager
-from carpenter.core.engine import template_manager
 from carpenter.agent import conversation
 from carpenter.agent.invocation import _handle_fetch_web_content
 from carpenter.db import get_db
-
-
-_FETCH_WEB_YAML_PATH = os.path.join(
-    os.path.dirname(__file__), "..", "..",
-    "config_seed", "templates", "fetch_web.yaml",
-)
-
-
-@pytest.fixture(autouse=True)
-def _load_fetch_web_template():
-    """Ensure the fetch_web template row exists in this test's isolated DB.
-
-    Production loads templates at coordinator startup; tests run with
-    an empty DB so we have to load it explicitly here.
-    """
-    template_manager.load_template(_FETCH_WEB_YAML_PATH)
-    yield
 
 
 def test_fetch_web_content_creates_parent_and_children():
@@ -167,6 +148,9 @@ def test_fetch_web_content_goal_in_child_arcs():
     # Executor goal contains the pre-verified fetch script
     assert "fetch_url" in executor["goal"]
     assert "web.fetch_webpage" in executor["goal"]
+    # PR3: executor goal also references the raw resource output path/id
+    assert "raw_resource_path" in executor["goal"]
+    assert "raw_resource_id" in executor["goal"]
     # Reviewer goal includes the user's goal
     assert goal_text in reviewer["goal"]
 
@@ -198,7 +182,13 @@ def test_fetch_web_content_sets_url_in_arc_state():
 
 
 def test_fetch_script_runs_in_restricted_sandbox():
-    """_FETCH_SCRIPT compiles and dispatches correctly in RestrictedPython."""
+    """_FETCH_SCRIPT compiles and dispatches correctly in RestrictedPython.
+
+    PR3: the script now reads URL + raw_resource_path + raw_resource_id
+    from arc state, fetches the URL, writes the HTML to disk via
+    files.write, and calls resource.finalize to populate byte_size /
+    content_hash on the raw Resource row.
+    """
     from carpenter.agent.invocation import _FETCH_SCRIPT
     from carpenter.executor.restricted import RestrictedExecutor
 
@@ -207,11 +197,20 @@ def test_fetch_script_runs_in_restricted_sandbox():
     def handler(tool_name, params):
         calls.append((tool_name, dict(params)))
         if tool_name == "state.get":
-            return {"value": "https://example.com/weather"}
+            key = params.get("key")
+            if key == "fetch_url":
+                return {"value": "https://example.com/weather"}
+            if key == "raw_resource_path":
+                return {"value": "/tmp/raw.html"}
+            if key == "raw_resource_id":
+                return {"value": 42}
+            return {"value": None}
         if tool_name == "web.fetch_webpage":
             return {"content": "<html>sunny</html>", "status_code": 200}
-        if tool_name == "state.set":
+        if tool_name == "files.write":
             return {"success": True}
+        if tool_name == "resource.finalize":
+            return {"ok": True, "byte_size": 17, "content_hash": "abc"}
         return {"ok": True}
 
     executor = RestrictedExecutor(tool_handler=handler)
@@ -220,13 +219,14 @@ def test_fetch_script_runs_in_restricted_sandbox():
     assert result.exit_code == 0, f"Script failed: {result.error}"
     assert result.error == ""
 
-    # Verify the three dispatch calls happened in order
-    assert len(calls) == 3
+    # 3 state.get + 1 web.fetch_webpage + 1 files.write + 1 resource.finalize
+    assert len(calls) == 6, calls
     assert calls[0] == ("state.get", {"key": "fetch_url"})
-    assert calls[1] == ("web.fetch_webpage", {"url": "https://example.com/weather"})
-    assert calls[2][0] == "state.set"
-    assert calls[2][1]["key"] == "fetched_content"
-    assert calls[2][1]["value"]["content"] == "<html>sunny</html>"
+    assert calls[1] == ("state.get", {"key": "raw_resource_path"})
+    assert calls[2] == ("state.get", {"key": "raw_resource_id"})
+    assert calls[3] == ("web.fetch_webpage", {"url": "https://example.com/weather"})
+    assert calls[4] == ("files.write", {"path": "/tmp/raw.html", "content": "<html>sunny</html>"})
+    assert calls[5] == ("resource.finalize", {"resource_id": 42})
 
 
 # -- dispatch_bridge.py linking test --
