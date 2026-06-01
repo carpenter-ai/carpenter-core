@@ -153,6 +153,11 @@ def _make_dispatch_fn(
                 f"Tool '{tool_name}' is not in the allowed tools list"
             )
 
+        # TRIPWIRE: every value crossing the dispatch boundary MUST be JSON-serialized
+        # (both request and response, both directions). Reason: passing live Python
+        # objects across the queue would let user code reach back into platform state
+        # via attribute access on a returned object. The JSON round-trip is the only
+        # thing guaranteeing the boundary is a value boundary, not a reference one.
         # Serialize to JSON to prevent object reference leakage
         try:
             request_json = json.dumps({
@@ -180,6 +185,12 @@ def _make_dispatch_fn(
         # contents. Tool-name-only is sufficient for the current consumer
         # (a single test); the size fields are cheap defense-in-depth for
         # any future debugging tool.
+        # TRIPWIRE: dispatch_log entries MUST contain only tool_name + sizes (and
+        # a redacted error boolean below). Never add `params`, `result`, or error
+        # text. Reason: user code may be running on behalf of an untrusted arc, in
+        # which case params/results carry plaintext untrusted state. Persisting them
+        # via ExecutionResult.dispatch_log defeats the I7 at-rest encryption
+        # guarantee. Related: trust-invariants I7.
         log_entry = {
             "tool_name": tool_name,
             "params_size": len(request_json),
@@ -238,6 +249,13 @@ def _build_namespace(
     # sub-modules from the compatibility namespace.  This allows code
     # written for the subprocess executor (``from carpenter_tools.act
     # import arc``) to work unmodified in the restricted sandbox.
+    # TRIPWIRE: _restricted_import MUST allow only the `carpenter_tools` namespace
+    # and raise ImportError for everything else. Reason: any other importable
+    # module is an immediate sandbox escape (os, subprocess, ctypes, builtins…).
+    # The final `raise ImportError` branch below is load-bearing — do not add
+    # an "else: return ..." fallback for unknown names.
+    # Related: coding-invariants I5 (executor attests to nothing — platform-level
+    # whitelisting is authoritative).
     def _restricted_import(name, globals=None, locals=None, fromlist=(), level=0):
         # Only allow importing from the carpenter_tools namespace
         if name == "carpenter_tools" or name.startswith("carpenter_tools."):

@@ -186,6 +186,13 @@ def run_review_pipeline(
     Returns:
         PipelineResult with status and standardised outcome.
     """
+    # TRIPWIRE: Pipeline stages must execute in this order: hash-check, formal
+    # verification, import-star check, syntax validation, (sanitize), reviewer.
+    # Reason: each later stage assumes the earlier ones ran — e.g. sanitize_for_review
+    # AST-transforms code that must already parse; the LLM reviewer must see sanitised
+    # text, never raw. Re-ordering can silently downgrade defence-in-depth.
+    # Related: coding-invariants I4 ("primary defense is at submission time"), I7 (fail-closed).
+
     # Step 1: Hash check for previously approved code
     if is_previously_approved(conversation_id, code):
         logger.info("Code hash matches previous approval — skipping review")
@@ -218,8 +225,18 @@ def run_review_pipeline(
                     outcome=ReviewOutcome.REJECTED,
                 )
         except Exception:  # broad catch: verification involves imports + AST analysis
+            # TRIPWIRE: a verification-system crash MUST leave verification_result=None
+            # (treated as "not verifiable"), not auto-approve. Any change that converts
+            # the exception path into an APPROVE outcome bypasses CaMeL entirely.
+            # Related: coding-invariants I7 (fail-closed).
             logger.exception("Verification system error — failing closed to human review")
             # verification_result stays None — treated as "not verifiable"
+
+    # TRIPWIRE: `import *` MUST map to ReviewOutcome.REJECTED (no retry, not REWORK).
+    # Reason: REJECTED is the only outcome that prevents the coding agent from
+    # looping on the same violation; downgrading to REWORK gives an attacker
+    # unlimited attempts to smuggle a wildcard import past the reviewer.
+    # Related: coding-invariants I6 (deterministic checks on hard boundaries).
 
     # Step 2: Import star check (policy violation - auto-reject)
     import_star_result = check_import_star(code)
