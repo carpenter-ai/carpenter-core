@@ -240,7 +240,14 @@ def create_verification_arcs(
             name=quality_name,
             goal=(
                 f"Verify code quality of '{impl_name}' (arc #{implementation_arc_id}): "
-                f"check style, naming, structure, error handling for platform/tool code."
+                f"check style, naming, structure, error handling for platform/tool code.\n\n"
+                f"PROSE ACCURACY. Every factual claim you write — about what the code "
+                f"does, what style issues exist, what patterns are followed, what error "
+                f"handling is present — must be traceable to a tool result you observed "
+                f"in this arc's session (e.g. an exact `read_file` result). If you cannot "
+                f"point to an exact tool output that proves a claim, do not write the "
+                f"claim. Hedge (\"did not inspect X\") or omit it. Do not infer from the "
+                f"diff summary, the arc goal, or background knowledge — read the code."
             ),
             parent_id=parent_id,
             step_order=base_order,
@@ -268,7 +275,16 @@ def create_verification_arcs(
         name=correctness_name,
         goal=(
             f"Verify correctness of '{impl_name}' (arc #{implementation_arc_id}): "
-            f"run tests, check behavior matches spec, validate no regressions."
+            f"run tests, check behavior matches spec, validate no regressions.\n\n"
+            f"PROSE ACCURACY. Every factual claim you write — about which tests ran, "
+            f"which passed or failed, what behavior was exercised, which regressions "
+            f"were checked — must be traceable to a tool result you observed in this "
+            f"arc's session (e.g. an exact `run_tests`, `read_file`, or `get_state` "
+            f"output). If you cannot point to an exact tool result that proves a claim, "
+            f"do not write the claim. Hedge (\"did not verify X\") or omit it. \"No "
+            f"regressions detected\" is only acceptable if you actually ran a regression "
+            f"check whose output you can cite — do not infer it from a passing happy-path "
+            f"test or from the diff."
         ),
         parent_id=parent_id,
         step_order=base_order + (1 if needs_quality else 0),
@@ -326,7 +342,18 @@ def create_verification_arcs(
         goal=(
             f"Post-verification documentation for '{impl_name}' "
             f"(arc #{implementation_arc_id}): read the reviewed code, "
-            f"write docstrings and arc summary."
+            f"write docstrings and arc summary.\n\n"
+            f"PROSE ACCURACY (CRITICAL FOR THIS STEP). Docstrings and the arc summary "
+            f"are durable artifacts that other agents and humans will rely on. Every "
+            f"claim about what a function, class, or change does must be backed by an "
+            f"exact `read_file` result from this session — not inferred from the diff, "
+            f"the implementation arc's goal, the function name, or background knowledge. "
+            f"Read the actual code before describing it. If you have not read the body "
+            f"of a function, do not write a docstring claiming what it does. For the "
+            f"arc summary: only describe behavior, test coverage, or verification "
+            f"outcomes that you can point to a specific tool result for. When in doubt, "
+            f"hedge (\"this module appears to…\" / \"based on the visible code, …\") or "
+            f"omit. Do not invent."
         ),
         parent_id=parent_id,
         step_order=judge_step + 1,
