@@ -1,3 +1,12 @@
+# TRIPWIRE: This module is deterministic platform code. It MUST NOT import or
+# call any LLM client (anthropic, openai, ollama, carpenter.agent.llm, etc.).
+# Reason: the JUDGE is the sole mechanism that promotes a Resource from
+# untrusted to trusted (trust-invariants I3). Routing any part of that
+# decision through a model — even advisory — converts a deterministic policy
+# check into a model-influenced one, collapsing the trust boundary.
+# Related: coding-invariants I6 (deterministic checks on hard boundaries),
+# trust-invariants I3.
+
 """Deterministic JUDGE for Carpenter.
 
 JUDGE arcs run platform-level deterministic policy checks instead of
@@ -415,6 +424,11 @@ def _load_extraction_resource(resource_row: dict) -> Any:
     resource_id = int(resource_row["id"])
     kind = resource_row.get("kind")
 
+    # TRIPWIRE: caller_arc_id MUST be None here. Passing the JUDGE arc id would
+    # trigger the I2 gate (trusted arc reading untrusted Resource) and raise
+    # PermissionError — JUDGE arcs are integrity_level='trusted' and the pending
+    # Resource is derived 'untrusted' until this very call approves it.
+    # Related: trust-invariants I2, I3 (JUDGE is the promotion path).
     text = read_resource_content(resource_id, caller_arc_id=None)
     payload = json.loads(text)
 
