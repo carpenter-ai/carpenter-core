@@ -8,6 +8,10 @@ tree is rejected before the backend is called.
 import os
 
 from carpenter.chat_tool_loader import chat_tool
+from carpenter.security.platform_paths import (
+    audit_path_decision,
+    is_invisible,
+)
 
 
 def _allowed_base() -> str:
@@ -53,6 +57,28 @@ def _check_path(path: str) -> str | None:
     always_available=True,
 )
 def read_file(tool_input, **kwargs):
+    # Platform-integrity tier check (I12).  Belt-and-suspenders alongside
+    # the backend check in ``files.chat_read_provenance_check`` — running
+    # the check here first means a misconfigured ``base_dir`` cannot
+    # accidentally let a T0 path through under a different base_dir
+    # resolution, and chat callers get a tool-friendly denial rather
+    # than a raw DispatchError.
+    path = tool_input["path"]
+    try:
+        if is_invisible(path):
+            audit_path_decision(
+                None,
+                "t0_read_refused",
+                os.path.realpath(os.path.expanduser(path)),
+                {"tool": "chat.read_file"},
+            )
+            return (
+                "Access denied: path is platform-invisible "
+                "(credentials, platform database, or other restricted "
+                "platform state)."
+            )
+    except Exception:  # noqa: BLE001 — fail open; backend will recheck
+        pass
     error = _check_path(tool_input["path"])
     if error:
         return error
@@ -97,7 +123,19 @@ def list_files(tool_input, **kwargs):
     from carpenter.tool_backends import files as files_backend
     result = files_backend.handle_list(tool_input)
     files = result.get("files", [])
-    return "\n".join(files) if files else "(empty directory)"
+    # Belt-and-suspenders: the backend already filters T0 entries.
+    # Re-filter here so a stale handler import (or a backend bypass)
+    # still doesn't leak invisible filenames into the chat surface.
+    directory = tool_input["dir"]
+    safe: list[str] = []
+    for name in files:
+        try:
+            if is_invisible(os.path.join(directory, name)):
+                continue
+        except Exception:  # noqa: BLE001
+            pass
+        safe.append(name)
+    return "\n".join(safe) if safe else "(empty directory)"
 
 
 @chat_tool(
