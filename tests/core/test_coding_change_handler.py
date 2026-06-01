@@ -217,69 +217,17 @@ class TestHandleGenerateReview:
 
 
 class TestSuspiciousFileDetection:
-    @pytest.mark.asyncio
-    async def test_warns_on_config_yaml(self, test_db, source_dir):
-        """Suspicious config.yaml in changed files triggers warning in arc history."""
-        arc_id = arc_manager.create_arc(
-            name="coding-change-suspicious",
-            goal=f"changes for {source_dir}",
-        )
-        arc_manager.update_status(arc_id, "active")
-
-        from carpenter.core import workspace_manager
-        ws, _ = workspace_manager.create_workspace(source_dir, "suspicious")
-
-        # Create a suspicious config.yaml file (agent confusion artifact)
-        with open(os.path.join(ws, "config.yaml"), "w") as f:
-            f.write("model: gpt-4\n")
-        # Also make a legitimate change
-        with open(os.path.join(ws, "main.py"), "w") as f:
-            f.write("print('modified')\n")
-
-        coding_change_handler._set_arc_state(arc_id, "workspace_path", ws)
-        coding_change_handler._set_arc_state(arc_id, "source_dir", source_dir)
-
-        await coding_change_handler.handle_generate_review(1, {"arc_id": arc_id})
-
-        # Arc should still proceed to waiting (warning doesn't block)
-        arc = arc_manager.get_arc(arc_id)
-        assert arc["status"] == "waiting"
-
-        # Warning should appear in arc history
-        history = arc_manager.get_history(arc_id)
-        warning_entries = [h for h in history if h["entry_type"] == "warning"]
-        assert len(warning_entries) >= 1
-        assert "config.yaml" in json.loads(warning_entries[0]["content_json"])["message"]
-
-    @pytest.mark.asyncio
-    async def test_warns_on_kb_prefix(self, test_db, source_dir):
-        """Files starting with kb/ trigger suspicious file warning."""
-        arc_id = arc_manager.create_arc(
-            name="coding-change-kb",
-            goal=f"changes for {source_dir}",
-        )
-        arc_manager.update_status(arc_id, "active")
-
-        from carpenter.core import workspace_manager
-        ws, _ = workspace_manager.create_workspace(source_dir, "kb-test")
-
-        os.makedirs(os.path.join(ws, "kb"))
-        with open(os.path.join(ws, "kb", "notes.md"), "w") as f:
-            f.write("# Notes\n")
-
-        coding_change_handler._set_arc_state(arc_id, "workspace_path", ws)
-        coding_change_handler._set_arc_state(arc_id, "source_dir", source_dir)
-
-        await coding_change_handler.handle_generate_review(1, {"arc_id": arc_id})
-
-        history = arc_manager.get_history(arc_id)
-        warning_entries = [h for h in history if h["entry_type"] == "warning"]
-        assert len(warning_entries) >= 1
-        assert "kb/" in json.loads(warning_entries[0]["content_json"])["message"]
+    """The legacy ``_CONFUSION_FILES``/``_CONFUSION_PREFIXES`` heuristic was
+    removed in favour of the T1 tier gate (see
+    ``test_coding_change_handler_tier.py``).  Suspicious-by-content alone is
+    no longer signalled — only T1 destination paths cause a warning, and
+    a T2 source_dir (as used in these unit tests) yields T2 destinations,
+    so no warning is expected.
+    """
 
     @pytest.mark.asyncio
     async def test_no_warning_for_legitimate_files(self, test_db, source_dir):
-        """Normal file changes don't trigger suspicious file warning."""
+        """Normal file changes don't trigger any warning."""
         arc_id = arc_manager.create_arc(
             name="coding-change-legit",
             goal=f"changes for {source_dir}",
@@ -300,6 +248,34 @@ class TestSuspiciousFileDetection:
         history = arc_manager.get_history(arc_id)
         warning_entries = [h for h in history if h["entry_type"] == "warning"]
         assert len(warning_entries) == 0
+
+    @pytest.mark.asyncio
+    async def test_t2_config_yaml_no_warning(self, test_db, source_dir):
+        """A config.yaml under a T2 source_dir no longer warns (the legacy
+        confusion-filename heuristic has been removed).  Only T1 tier paths
+        force a warning now."""
+        arc_id = arc_manager.create_arc(
+            name="coding-change-config",
+            goal=f"changes for {source_dir}",
+        )
+        arc_manager.update_status(arc_id, "active")
+
+        from carpenter.core import workspace_manager
+        ws, _ = workspace_manager.create_workspace(source_dir, "config")
+
+        with open(os.path.join(ws, "config.yaml"), "w") as f:
+            f.write("model: gpt-4\n")
+
+        coding_change_handler._set_arc_state(arc_id, "workspace_path", ws)
+        coding_change_handler._set_arc_state(arc_id, "source_dir", source_dir)
+
+        await coding_change_handler.handle_generate_review(1, {"arc_id": arc_id})
+
+        history = arc_manager.get_history(arc_id)
+        warning_entries = [h for h in history if h["entry_type"] == "warning"]
+        # No warning: tier check on T2 destination yields T2.
+        assert warning_entries == []
+        assert coding_change_handler._get_arc_state(arc_id, "_review_mode") is None
 
 
 class TestHandleApproval:

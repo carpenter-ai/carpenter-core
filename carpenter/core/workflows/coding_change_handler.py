@@ -396,31 +396,69 @@ async def handle_generate_review(work_id: int, payload: dict):
 
         changed_files = workspace_manager.get_changed_files(workspace_path)
 
-        # Warn about file patterns that suggest agent confusion
-        _CONFUSION_FILES = {"config.yaml", "config.json", "config.toml"}
-        _CONFUSION_PREFIXES = ("kb/", ".carpenter_")
-        suspicious = [
-            f for f in changed_files
-            if f in _CONFUSION_FILES
-            or any(f.startswith(p) for p in _CONFUSION_PREFIXES)
-        ]
-        if suspicious:
-            logger.warning(
-                "generate-review: arc %d has suspicious changed files "
-                "(possible agent confusion): %s",
-                arc_id, suspicious,
-            )
-            arc_manager.add_history(
-                arc_id, "warning",
-                {"message": f"Suspicious files in diff: {suspicious}",
-                 "suspicious_files": suspicious},
-            )
-
         _set_arc_state(arc_id, "diff", diff)
         _set_arc_state(arc_id, "changed_files", changed_files)
 
         # Check for duplicate tool names before proceeding to review.
         source_dir = _get_arc_state(arc_id, "source_dir", "")
+
+        # Platform-integrity T1 gate (I12 enforcement).
+        #
+        # Map each workspace-relative changed path to its DESTINATION path
+        # (where the change would land if approved/merged) by joining with
+        # source_dir, then classify via path_tier().  Any T1 destination
+        # forces ``_review_mode = "human"`` for the downstream await-approval
+        # step — even if the arc was created with affected_paths empty or
+        # mis-declared, the runtime cannot auto-approve a T1-touching diff.
+        #
+        # This subsumes the legacy _CONFUSION_FILES / _CONFUSION_PREFIXES
+        # heuristic: T1 classification of repo source paths (carpenter/,
+        # config_seed/, etc.) is strictly broader and more principled than
+        # the old prefix list.
+        try:
+            from ...security.platform_paths import (
+                path_tier,
+                audit_path_decision,
+                PATH_TIER_T1,
+            )
+            t1_destinations: list[str] = []
+            for rel in changed_files:
+                if source_dir:
+                    dest = os.path.normpath(os.path.join(source_dir, rel))
+                else:
+                    dest = rel
+                if path_tier(dest) == PATH_TIER_T1:
+                    t1_destinations.append(dest)
+            if t1_destinations:
+                _set_arc_state(arc_id, "_review_mode", "human")
+                _set_arc_state(arc_id, "_t1_files_detected", t1_destinations)
+                audit_path_decision(
+                    arc_id,
+                    "t1_change_proposed",
+                    t1_destinations[0],
+                    {
+                        "arc_id": arc_id,
+                        "t1_paths": t1_destinations,
+                        "forced_human_review": True,
+                    },
+                )
+                arc_manager.add_history(
+                    arc_id, "warning",
+                    {
+                        "message": (
+                            "T1 (platform-protected) files in diff — human "
+                            "review is mandatory."
+                        ),
+                        "t1_files": t1_destinations,
+                    },
+                )
+        except Exception:  # noqa: BLE001 — classifier should not block review
+            logger.warning(
+                "generate-review: T1 tier check failed for arc %d; "
+                "continuing without forcing human review",
+                arc_id, exc_info=True,
+            )
+
         dupes = _check_duplicate_tool_names(workspace_path, changed_files, source_dir)
         if dupes:
             names = ", ".join(d[0] for d in dupes)
