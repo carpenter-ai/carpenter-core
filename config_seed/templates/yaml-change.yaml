@@ -1,0 +1,45 @@
+name: yaml-change
+description: |
+  Workflow for changes that touch only YAML files. Mirrors coding-change
+  but swaps the test-execution verifier for a deterministic YAML lint
+  step (no test runner in scope) and additionally runs
+  ``verify_yaml_template`` for any file under ``config_seed/templates/``.
+  Selected automatically by ``select_workflow_for_paths`` when every
+  affected path is in the ``yaml`` change-category.
+steps:
+  - name: invoke-agent
+    description: Set up workspace and run coding agent
+    order: 0
+  - name: generate-review
+    description: Generate diff, create review link, and spawn verification arcs
+    order: 1
+  - name: verify-quality
+    description: Static review of the YAML diff — keys, structure, naming
+    order: 2
+    arc_role: verifier
+    agent_type: REVIEWER
+    model_policy: careful-coding
+  - name: lint-yaml
+    description: |
+      Deterministic Python-only lint of every changed YAML file.
+      ``yaml.safe_load`` each file; any parse error fails the step.
+      Files under ``config_seed/templates/*.yaml`` additionally run
+      ``carpenter.verify.yaml_template.verify_yaml_template``.
+    order: 3
+    arc_role: verifier
+    # Handled by dedicated Python code in carpenter.core.workflows.yaml_lint_handler
+    # No agent_type — Python-only deterministic step (I6).
+  - name: judge-verification
+    description: Python-only boolean aggregation of verification results (no AI)
+    order: 4
+    arc_role: verifier
+    # Handled by dedicated Python code in arc_dispatch_handler, not an AI agent
+  - name: post-verification-docs
+    description: Read reviewed code, write docstrings and arc summary
+    order: 5
+    agent_type: EXECUTOR
+    model_policy: background-batch
+  - name: await-approval
+    description: Wait for human to approve, reject, or request changes
+    order: 6
+    activation_event: arc.manual_trigger
