@@ -50,6 +50,13 @@ import os
 
 from .. import config
 from ..db import db_connection, db_transaction
+from ..security.platform_paths import (
+    PATH_TIER_T0,
+    PATH_TIER_T1,
+    audit_path_decision,
+    is_invisible,
+    path_tier,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -234,6 +241,21 @@ def chat_read_provenance_check(path: str) -> str | None:
     (no provenance row) read freely.
     """
     realpath = os.path.realpath(path)
+    # Platform-integrity tier check (I12).  T0 paths are invisible —
+    # return a chat-friendly denial without echoing bytes or revealing
+    # whether the file exists beyond what the caller already knows.
+    if path_tier(realpath) == PATH_TIER_T0:
+        audit_path_decision(
+            None,
+            "t0_read_refused",
+            realpath,
+            {"tool": "chat.read_file"},
+        )
+        return (
+            "Access denied: path is platform-invisible "
+            "(credentials, platform database, or other restricted "
+            "platform state)."
+        )
     prov = _lookup_provenance(realpath)
     if prov is None:
         return None
@@ -296,6 +318,33 @@ def handle_read(params: dict) -> dict:
         raise DispatchError(
             "workspace file path resolves through a symlink; "
             "refusing to follow symlinks inside per-arc workspaces",
+            status_code=403,
+        )
+
+    # Platform-integrity tier check (I12).  T0 paths (credentials,
+    # platform.db, secrets) are invisible — refuse the read regardless
+    # of caller integrity.  This is the first enforcement target for
+    # tier classification on the read path.  Reads of T1 (platform
+    # source) are intentionally allowed: trusted coding agents
+    # legitimately read source to understand context.
+    if path_tier(realpath) == PATH_TIER_T0:
+        audit_path_decision(
+            caller_arc_id,
+            "t0_read_refused",
+            realpath,
+            {
+                "tool": "files.read",
+                "caller_integrity": caller_integrity,
+            },
+        )
+        logger.warning(
+            "files.read refused: T0 (invisible) path %s for caller arc %s",
+            realpath,
+            caller_arc_id,
+        )
+        DispatchError = _get_dispatch_error_cls()
+        raise DispatchError(
+            "path is platform-invisible (T0)",
             status_code=403,
         )
 
@@ -386,6 +435,57 @@ def handle_write(params: dict) -> dict:
                 status_code=403,
             )
 
+    # Platform-integrity tier check (I12) on the write path.  Applies to
+    # ALL callers including trusted: T0 paths (credentials, platform.db)
+    # are invisible, and T1 paths (carpenter source tree, config_seed,
+    # security tests) must only be modified via the coding-change
+    # workflow — which writes to a workspace copy, NOT through
+    # ``files.write``.  Coding-change workflows use direct ``open(...)``
+    # in ``carpenter/agent/coding_agent.py`` against workspace dirs
+    # (T2) so this gate is safe and does not interfere with that path.
+    target_tier = path_tier(target_realpath)
+    if target_tier == PATH_TIER_T0:
+        audit_path_decision(
+            caller_arc_id,
+            "t0_write_refused",
+            target_realpath,
+            {
+                "tool": "files.write",
+                "caller_integrity": caller_integrity,
+            },
+        )
+        logger.warning(
+            "files.write refused: T0 (invisible) path %s for caller arc %s",
+            target_realpath,
+            caller_arc_id,
+        )
+        DispatchError = _get_dispatch_error_cls()
+        raise DispatchError(
+            "path is platform-invisible (T0)",
+            status_code=403,
+        )
+    if target_tier == PATH_TIER_T1:
+        audit_path_decision(
+            caller_arc_id,
+            "t1_write_refused",
+            target_realpath,
+            {
+                "tool": "files.write",
+                "caller_integrity": caller_integrity,
+            },
+        )
+        logger.warning(
+            "files.write refused: T1 (platform) path %s for caller arc %s",
+            target_realpath,
+            caller_arc_id,
+        )
+        DispatchError = _get_dispatch_error_cls()
+        raise DispatchError(
+            "direct write to platform path (T1) is not allowed; "
+            "use the coding-change workflow",
+            status_code=403,
+        )
+
     if parent:
         os.makedirs(parent, exist_ok=True)
     with open(path, 'w') as f:
@@ -409,7 +509,31 @@ def handle_write(params: dict) -> dict:
 
 def handle_list(params: dict) -> dict:
     directory = params["dir"]
-    return {"files": os.listdir(directory)}
+    raw = os.listdir(directory)
+    filtered: list[str] = []
+    removed = 0
+    for name in raw:
+        try:
+            if is_invisible(os.path.join(directory, name)):
+                removed += 1
+                continue
+        except Exception:  # noqa: BLE001 — fail open on classifier errors
+            # Classifier failure must not block legitimate listings.
+            # The classifier itself logs a WARNING on failure; entry is
+            # kept rather than dropped to avoid hiding legitimate files.
+            pass
+        filtered.append(name)
+    if removed:
+        # Audit row must NOT include the filtered filenames — leaking
+        # the names partially defeats T0 invisibility.  Record only the
+        # count.
+        audit_path_decision(
+            params.get("_caller_arc_id"),
+            "listing_filtered",
+            directory,
+            {"dir": directory, "removed_count": removed},
+        )
+    return {"files": filtered}
 
 
 def handle_file_count(params: dict) -> dict:
@@ -432,9 +556,28 @@ def handle_file_count(params: dict) -> dict:
         return {"file_count": 0, "error": f"Path is not a directory: {directory}"}
 
     try:
-        # Count only files, not subdirectories
+        # Count only files, not subdirectories — and filter T0 entries
+        # so file_count is consistent with handle_list (invisible files
+        # don't contribute to the count).
         entries = os.listdir(directory)
-        file_count = sum(1 for entry in entries
+        kept: list[str] = []
+        removed = 0
+        for entry in entries:
+            try:
+                if is_invisible(os.path.join(directory, entry)):
+                    removed += 1
+                    continue
+            except Exception:  # noqa: BLE001
+                pass
+            kept.append(entry)
+        if removed:
+            audit_path_decision(
+                params.get("_caller_arc_id"),
+                "listing_filtered",
+                directory,
+                {"dir": directory, "removed_count": removed},
+            )
+        file_count = sum(1 for entry in kept
                         if os.path.isfile(os.path.join(directory, entry)))
 
         return {"file_count": file_count}
