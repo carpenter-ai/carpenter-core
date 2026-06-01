@@ -7,11 +7,11 @@ Exact function signatures for git operations. Use these — do NOT guess paramet
 NEVER hardcode Forgejo URLs (like git.harack.us, git.magi.systems, etc.) in code OR in arc goals. ALWAYS read the URL from config at runtime:
 ```python
 from carpenter_tools.read import config
-server_url = config.get_value('git_server_url')['value']
+server_url = config.get_value('git_url')['value']
 ```
 
 When creating child arcs for git workflows, do NOT put URLs in the goal. Instead write:
-- "Clone the repository owner/repo using config.get_value('git_server_url') and git.setup_repo()"
+- "Clone the repository owner/repo using config.get_value('git_url') and git.setup_repo()"
 
 ## Function signatures
 
@@ -20,7 +20,7 @@ Clone a repository. All three positional args required:
 ```python
 from carpenter_tools.act import git
 from carpenter_tools.read import config
-server_url = config.get_value('git_server_url')['value']
+server_url = config.get_value('git_url')['value']
 workspace = '/home/pi/carpenter/data/workspaces/my-task'
 git.setup_repo(
     repo_url=f'{server_url}/owner/repo.git',
@@ -79,7 +79,7 @@ For simple file additions, do everything in ONE submit_code call:
 ```python
 from carpenter_tools.act import git, files
 from carpenter_tools.read import config
-server_url = config.get_value('git_server_url')['value']
+server_url = config.get_value('git_url')['value']
 workspace = '/home/pi/carpenter/data/workspaces/my-task'
 git.setup_repo(
     repo_url=f'{server_url}/owner/repo.git',

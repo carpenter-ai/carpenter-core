@@ -99,7 +99,7 @@ def update_dot_env(dot_env_path: Path, key: str, value: str) -> bool:
     Args:
         dot_env_path: Path to the ``.env`` file.  Parent directories
             are created as needed.
-        key: Env-var name (e.g. ``FORGEJO_TOKEN``).
+        key: Env-var name (e.g. ``GIT_TOKEN``).
         value: Env-var value.
 
     Returns:

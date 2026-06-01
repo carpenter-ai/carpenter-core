@@ -446,7 +446,7 @@ class ForgejoProvider:
         ``{"valid": False, "reason": str}`` on failure.
         """
         if not server_url:
-            return {"valid": False, "reason": "git_server_url not configured"}
+            return {"valid": False, "reason": "git_url not configured"}
 
         url = server_url.rstrip("/") + "/api/v1/user"
         try:

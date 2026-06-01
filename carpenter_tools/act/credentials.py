@@ -26,7 +26,7 @@ def request(key: str, label: str = "", description: str = "") -> dict:
 def verify(key: str) -> dict:
     """Test a stored credential by making a verification call.
 
-    For GIT_TOKEN/FORGEJO_TOKEN, delegates to the configured forge to check validity.
+    For GIT_TOKEN, delegates to the configured forge to check validity.
     For other keys, checks non-empty. Never returns the credential value.
     """
     ...

@@ -30,8 +30,8 @@ def setup_function():
 def test_create_credential_request():
     """Create a one-time credential request."""
     result = create_credential_request(
-        key="FORGEJO_TOKEN",
-        label="Forgejo API Token",
+        key="GIT_TOKEN",
+        label="Git Server API Token",
         description="Token for accessing the forge API.",
     )
 
@@ -40,8 +40,8 @@ def test_create_credential_request():
 
     req = get_credential_request(result["request_id"])
     assert req is not None
-    assert req["key"] == "FORGEJO_TOKEN"
-    assert req["label"] == "Forgejo API Token"
+    assert req["key"] == "GIT_TOKEN"
+    assert req["label"] == "Git Server API Token"
     assert req["description"] == "Token for accessing the forge API."
     assert req["fulfilled"] is False
 
@@ -197,7 +197,7 @@ def test_verify_credential_git_token_success(monkeypatch):
     """Verify git token calls the API and returns username."""
     monkeypatch.setattr("carpenter.api.credentials.config.CONFIG", {
         "git_token": "tok_abc",
-        "git_server_url": "https://forge.example.com",
+        "git_url": "https://forge.example.com",
     })
 
     mock_response = MagicMock()
@@ -215,30 +215,11 @@ def test_verify_credential_git_token_success(monkeypatch):
     assert "/api/v1/user" in call_args[0][0]
 
 
-def test_verify_credential_forgejo_token_backward_compat(monkeypatch):
-    """Verify FORGEJO_TOKEN still works via backward compat."""
-    monkeypatch.setattr("carpenter.api.credentials.config.CONFIG", {
-        "git_token": "tok_abc",
-        "git_server_url": "https://forge.example.com",
-    })
-
-    mock_response = MagicMock()
-    mock_response.status_code = 200
-    mock_response.json.return_value = {"login": "bot-user"}
-
-    with patch("carpenter.forges.forgejo.httpx") as mock_httpx:
-        mock_httpx.get.return_value = mock_response
-        result = verify_credential("FORGEJO_TOKEN")
-
-    assert result["valid"] is True
-    assert result["username"] == "bot-user"
-
-
 def test_verify_credential_git_token_failure(monkeypatch):
     """Verify git token returns invalid on HTTP error."""
     monkeypatch.setattr("carpenter.api.credentials.config.CONFIG", {
         "git_token": "bad_token",
-        "git_server_url": "https://forge.example.com",
+        "git_url": "https://forge.example.com",
     })
 
     mock_response = MagicMock()
