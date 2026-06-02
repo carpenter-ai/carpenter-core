@@ -137,3 +137,71 @@ async def handle_lint_yaml(work_id: int, payload: dict) -> None:
             arc_manager.update_status(arc_id, "failed")
         except ValueError:
             pass
+
+
+async def handle_lint_yaml_step(arc_id: int, arc_info: dict) -> None:
+    """Step-handler wrapper for the ``yaml-change.lint-yaml`` step (PR 7).
+
+    Called by ``dispatch_handler`` via ``handler_registry`` lookup against
+    the (template_name, step_name) pair.  Reads the implementation arc's
+    workspace via the verifier arc's ``verification_target_id``, lints
+    every changed YAML, records findings on *this* arc, then completes
+    + freezes + propagates so the judge sibling can run.
+    """
+    from ..arcs.dispatch_handler import _propagate_completion
+
+    if arc_info.get("status") == "pending":
+        try:
+            arc_manager.update_status(arc_id, "active")
+        except ValueError:
+            pass
+
+    impl_arc_id = arc_info.get("verification_target_id")
+    if not impl_arc_id:
+        msg = f"lint-yaml arc {arc_id}: no verification_target_id"
+        logger.error(msg)
+        _set_arc_state(arc_id, "_lint_yaml_result", {"ok": False, "findings": [{"message": msg}]})
+        arc_manager.add_history(arc_id, "lint_yaml_failed", {"message": msg})
+        try:
+            arc_manager.update_status(arc_id, "failed")
+        except ValueError:
+            pass
+        arc_manager.freeze_arc(arc_id)
+        _propagate_completion(arc_id)
+        return
+
+    workspace_path = _get_arc_state(impl_arc_id, "workspace_path")
+    if not workspace_path or not os.path.isdir(workspace_path):
+        msg = (
+            f"workspace_path missing or absent on impl arc "
+            f"{impl_arc_id}: {workspace_path!r}"
+        )
+        logger.error("lint-yaml arc %d: %s", arc_id, msg)
+        _set_arc_state(arc_id, "_lint_yaml_result", {"ok": False, "findings": [{"message": msg}]})
+        arc_manager.add_history(arc_id, "lint_yaml_failed", {"message": msg})
+        try:
+            arc_manager.update_status(arc_id, "failed")
+        except ValueError:
+            pass
+        arc_manager.freeze_arc(arc_id)
+        _propagate_completion(arc_id)
+        return
+
+    result = lint_workspace_yaml(workspace_path)
+    _set_arc_state(arc_id, "_lint_yaml_result", result)
+    arc_manager.add_history(
+        arc_id,
+        "lint_yaml_completed",
+        {
+            "ok": result["ok"],
+            "file_count": len(result["files"]),
+            "finding_count": len(result["findings"]),
+        },
+    )
+
+    try:
+        arc_manager.update_status(arc_id, "completed" if result["ok"] else "failed")
+    except ValueError:
+        pass
+    arc_manager.freeze_arc(arc_id)
+    _propagate_completion(arc_id)

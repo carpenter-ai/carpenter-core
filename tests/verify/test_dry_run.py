@@ -784,6 +784,27 @@ arc.invoke_coding_change("/src", "Fix the bug")
         assert any(tc.module == "arc" and tc.function == "invoke_coding_change"
                    for tc in result.tool_calls)
 
+    def test_arc_invoke_coding_change_with_affected_paths(self):
+        """PR 7 close-out: ``affected_paths`` is accepted as a keyword
+        argument and flows through to the recorded tool call."""
+        code = """
+from carpenter_tools.act import arc
+arc.invoke_coding_change(
+    source_dir="platform",
+    prompt="Fix typo",
+    affected_paths=["config_seed/kb/notes/x.md"],
+)
+"""
+        result = run_dry_run(code, [])
+        assert result.passed
+        matching = [
+            tc for tc in result.tool_calls
+            if tc.module == "arc" and tc.function == "invoke_coding_change"
+        ]
+        assert matching, "expected an invoke_coding_change tool call"
+        kwargs = matching[0].kwargs
+        assert kwargs.get("affected_paths") == ["config_seed/kb/notes/x.md"]
+
     def test_arc_request_ai_review(self):
         code = """
 from carpenter_tools.act import arc

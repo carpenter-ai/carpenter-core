@@ -187,3 +187,71 @@ async def handle_verify_kb_format(work_id: int, payload: dict) -> None:
             arc_manager.update_status(arc_id, "failed")
         except ValueError:
             pass
+
+
+async def handle_verify_kb_format_step(arc_id: int, arc_info: dict) -> None:
+    """Step-handler wrapper for the ``kb-change.verify-kb-format`` step (PR 7).
+
+    Called by ``dispatch_handler`` via ``handler_registry`` lookup against
+    the (template_name, step_name) pair.  Reads the implementation arc's
+    workspace via the verifier arc's ``verification_target_id``, runs the
+    deterministic KB-format check, records findings on *this* arc, then
+    completes + freezes + propagates so the judge sibling can run.
+    """
+    from ..arcs.dispatch_handler import _propagate_completion
+
+    if arc_info.get("status") == "pending":
+        try:
+            arc_manager.update_status(arc_id, "active")
+        except ValueError:
+            pass
+
+    impl_arc_id = arc_info.get("verification_target_id")
+    if not impl_arc_id:
+        msg = f"verify-kb-format arc {arc_id}: no verification_target_id"
+        logger.error(msg)
+        _set_arc_state(arc_id, "_kb_format_result", {"ok": False, "findings": [{"message": msg}]})
+        arc_manager.add_history(arc_id, "verify_kb_format_failed", {"message": msg})
+        try:
+            arc_manager.update_status(arc_id, "failed")
+        except ValueError:
+            pass
+        arc_manager.freeze_arc(arc_id)
+        _propagate_completion(arc_id)
+        return
+
+    workspace_path = _get_arc_state(impl_arc_id, "workspace_path")
+    if not workspace_path or not os.path.isdir(workspace_path):
+        msg = (
+            f"workspace_path missing or absent on impl arc "
+            f"{impl_arc_id}: {workspace_path!r}"
+        )
+        logger.error("verify-kb-format arc %d: %s", arc_id, msg)
+        _set_arc_state(arc_id, "_kb_format_result", {"ok": False, "findings": [{"message": msg}]})
+        arc_manager.add_history(arc_id, "verify_kb_format_failed", {"message": msg})
+        try:
+            arc_manager.update_status(arc_id, "failed")
+        except ValueError:
+            pass
+        arc_manager.freeze_arc(arc_id)
+        _propagate_completion(arc_id)
+        return
+
+    result = check_workspace_kb(workspace_path)
+    _set_arc_state(arc_id, "_kb_format_result", result)
+    arc_manager.add_history(
+        arc_id,
+        "verify_kb_format_completed",
+        {
+            "ok": result["ok"],
+            "file_count": len(result["files"]),
+            "finding_count": len(result["findings"]),
+        },
+    )
+
+    try:
+        arc_manager.update_status(arc_id, "completed" if result["ok"] else "failed")
+    except ValueError:
+        pass
+    arc_manager.freeze_arc(arc_id)
+    _propagate_completion(arc_id)

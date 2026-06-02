@@ -168,6 +168,33 @@ class Coordinator:
         from .core.arcs import dispatch_handler as arc_dispatch_handler
         arc_dispatch_handler.register_handlers(main_loop.register_handler)
 
+        # PR 7 close-out: deterministic Python-only verification steps for
+        # the yaml-change / kb-change workflows.  These swap the LLM
+        # REVIEWER correctness arc in ``create_verification_arcs`` for a
+        # Python step, which dispatch_handler routes here via the
+        # (template_name, step_name/step_role) lookup.  Register both the
+        # step_name and step_role keys so dispatch's role-first lookup
+        # also resolves.
+        from .core.engine import handler_registry as _handler_registry
+        from .core.workflows.yaml_lint_handler import handle_lint_yaml_step
+        from .core.workflows.kb_format_handler import handle_verify_kb_format_step
+        _handler_registry.register_step_handler(
+            "yaml-change", "lint-yaml", handle_lint_yaml_step,
+        )
+        _handler_registry.register_step_handler(
+            "yaml-change", "verifier-lint-yaml", handle_lint_yaml_step,
+        )
+        _handler_registry.register_step_handler(
+            "kb-change", "verify-kb-format", handle_verify_kb_format_step,
+        )
+        _handler_registry.register_step_handler(
+            "kb-change", "verifier-kb-format", handle_verify_kb_format_step,
+        )
+        logger.info(
+            "Deterministic verification step handlers registered "
+            "(yaml-change.lint-yaml, kb-change.verify-kb-format)"
+        )
+
         from .core.models import monitor as health_monitor
         main_loop.register_heartbeat_hook(health_monitor.check_health)
         logger.info("Health monitor heartbeat hook registered")
