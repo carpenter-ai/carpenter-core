@@ -84,6 +84,7 @@ def invoke_coding_change(
     source_dir: str = "platform",
     prompt: str = "",
     coding_agent: str | None = None,
+    affected_paths: list[str] | None = None,
 ) -> int:
     """Start the coding-change workflow on a source directory.
 
@@ -97,6 +98,17 @@ def invoke_coding_change(
             path can also be provided for external repositories.
         prompt: Description of the coding task / changes required.
         coding_agent: Optional coding agent profile name (default: platform default).
+        affected_paths: Optional list of file paths the change will touch.
+            When provided, the platform classifies each path's tier and
+            change-category to select the right workflow template
+            (``coding-change`` / ``yaml-change`` / ``kb-change``) and to
+            decide whether to force human review. Pass paths when the
+            user has named specific files (e.g. "edit foo.yaml"); leave
+            empty when the coding agent will decide which files to edit.
+            The post-implementation safety gate (T1 path check at
+            review time) still runs even when this list is empty, so
+            omitting it is safe — passing it earlier just routes through
+            the more specialized workflow.
 
     Returns:
         The new arc ID (int).

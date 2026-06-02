@@ -234,6 +234,53 @@ def test_predicate_allows_proposed_t2_kb_target(monkeypatch, tmp_path):
     ) is False
 
 
+def test_per_action_gating_mixed_batch(monkeypatch, tmp_path):
+    """PR 7 close-out: when a reflect output contains both a T1 backticked
+    path action and a non-path action, only the T1 action's spawned arc
+    is routed to the gated variant.  This pins per-action review_mode
+    computation rather than per-batch.
+    """
+    monkeypatch.setitem(
+        carpenter_config.CONFIG, "repo_dir", str(tmp_path / "repo"),
+    )
+    step_handlers = _load_package_handlers(tmp_path)
+
+    # Trusted source arc so taint arm is silent.
+    trusted_id = arc_manager.create_arc(
+        name="user-goal-trusted", goal="clean reflection source",
+    )
+
+    t1_path = str(tmp_path / "repo" / "carpenter" / "security" / "judge.py")
+    reflect_output = (
+        f"- Refactor `{t1_path}` for clarity\n"
+        "- Add a kb entry on the topic\n"
+    )
+    root_id, _, dispatch_id = _make_reflection_arc_tree(reflect_output)
+    set_arc_state(root_id, "reflected_arc_id", trusted_id)
+
+    _run(step_handlers.handle_dispatch_actions, dispatch_id)
+
+    resp = get_arc_state(dispatch_id, "_agent_response")
+    assert len(resp["spawned_arcs"]) == 2
+    # The dispatch records any_restricted across the batch.
+    assert resp["tainted"] is True
+
+    code_gated = template_manager.get_template_by_name(
+        "reflection-code-action-gated",
+    )
+    kb_auto = template_manager.get_template_by_name("reflection-kb-action")
+
+    arcs = [arc_manager.get_arc(aid) for aid in resp["spawned_arcs"]]
+    templates = sorted(a["template_id"] for a in arcs)
+    assert code_gated["id"] in templates
+    assert kb_auto["id"] in templates
+
+    review_modes = sorted(
+        (get_arc_state(a["id"], "_review_mode") or "auto") for a in arcs
+    )
+    assert review_modes == ["auto", "human"]
+
+
 def test_legacy_alias_still_works(tmp_path):
     """``_is_reflected_arc_tainted`` is preserved as an alias so any
     out-of-tree caller (e.g. tests that import the name directly)

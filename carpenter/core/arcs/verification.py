@@ -36,6 +36,18 @@ _BUILTIN_QUALITY_CHECK = "verify-quality"
 _BUILTIN_JUDGE_VERIFICATION = "judge-verification"
 _BUILTIN_DOCUMENTATION_ARC = "post-verification-docs"
 
+# Per-workflow correctness-step replacements (PR 7 close-out).  When the
+# implementation arc was created from a non-default workflow template
+# (yaml-change / kb-change), the "verify-correctness" sibling is swapped
+# for a deterministic Python-only check whose handler is registered in
+# ``coordinator.py`` against the (template_name, step_name) key.  Each
+# entry is ``(step_name, step_role)`` so dispatch_handler can look up
+# the handler by either key.
+_WORKFLOW_CORRECTNESS_STEP: dict[str, tuple[str, str]] = {
+    "yaml-change": ("lint-yaml", "verifier-lint-yaml"),
+    "kb-change": ("verify-kb-format", "verifier-kb-format"),
+}
+
 
 def _get_verification_config() -> dict:
     """Return the verification section of the config, with defaults."""
@@ -210,6 +222,27 @@ def create_verification_arcs(
     needs_quality = is_platform_or_tool_code(impl_arc)
     impl_name = impl_arc.get("name", f"arc-{implementation_arc_id}")
 
+    # PR 7 close-out: consult the workflow template recorded at arc
+    # creation (set by ``handle_invoke_coding_change``).  yaml-change /
+    # kb-change swap the LLM correctness arc for a deterministic
+    # Python-only check.  Default (``coding-change`` or missing) keeps
+    # the legacy ``verify-correctness`` REVIEWER arc.
+    workflow_template = "coding-change"
+    try:
+        from ..workflows._arc_state import get_arc_state as _get_arc_state
+        wt = _get_arc_state(implementation_arc_id, "_workflow_template")
+        if isinstance(wt, str) and wt:
+            workflow_template = wt
+    except Exception:
+        logger.debug(
+            "verification: could not read _workflow_template for arc %d; "
+            "defaulting to coding-change",
+            implementation_arc_id,
+            exc_info=True,
+        )
+
+    correctness_override = _WORKFLOW_CORRECTNESS_STEP.get(workflow_template)
+
     created_ids = []
 
     # Determine step_order for verification arcs (after all existing siblings)
@@ -267,42 +300,81 @@ def create_verification_arcs(
             {"verification_arc_id": quality_id, "check_type": "quality"},
         )
 
-    # 2. Correctness check (after quality -- quality gates correctness)
-    correctness_policy_id = _get_model_policy_for_verification_step(
-        template_id, "verify-correctness"
-    )
-    correctness_id = arc_manager.create_arc(
-        name=correctness_name,
-        goal=(
-            f"Verify correctness of '{impl_name}' (arc #{implementation_arc_id}): "
-            f"run tests, check behavior matches spec, validate no regressions.\n\n"
-            f"PROSE ACCURACY. Every factual claim you write — about which tests ran, "
-            f"which passed or failed, what behavior was exercised, which regressions "
-            f"were checked — must be traceable to a tool result you observed in this "
-            f"arc's session (e.g. an exact `run_tests`, `read_file`, or `get_state` "
-            f"output). If you cannot point to an exact tool result that proves a claim, "
-            f"do not write the claim. Hedge (\"did not verify X\") or omit it. \"No "
-            f"regressions detected\" is only acceptable if you actually ran a regression "
-            f"check whose output you can cite — do not infer it from a passing happy-path "
-            f"test or from the diff."
-        ),
-        parent_id=parent_id,
-        step_order=base_order + (1 if needs_quality else 0),
-        step_role="verifier-correctness",
-        arc_role="verifier",
-        verification_target_id=implementation_arc_id,
-        agent_type="REVIEWER",
-        integrity_level="trusted",
-        model_policy_id=correctness_policy_id,  # From template
-    )
-    created_ids.append(correctness_id)
-    _inherit_source_category(implementation_arc_id, correctness_id)
+    # 2. Correctness check (after quality -- quality gates correctness).
+    #
+    # For yaml-change / kb-change, swap the LLM REVIEWER for a
+    # deterministic Python-only step.  The Python handler is wired via
+    # ``handler_registry`` against the (template, step_name) pair in
+    # ``coordinator._register_work_handlers``; dispatch routes here by
+    # consulting the arc's template_id + step_name/step_role.
+    correctness_step_order = base_order + (1 if needs_quality else 0)
+    if correctness_override is not None:
+        ov_step_name, ov_step_role = correctness_override
+        correctness_id = arc_manager.create_arc(
+            name=ov_step_name,
+            goal=(
+                f"Deterministic '{ov_step_name}' check for '{impl_name}' "
+                f"(arc #{implementation_arc_id}): runs Python-only "
+                f"validation on the workspace diff; no LLM invocation."
+            ),
+            parent_id=parent_id,
+            step_order=correctness_step_order,
+            step_role=ov_step_role,
+            arc_role="verifier",
+            verification_target_id=implementation_arc_id,
+            # No agent_type — handled by the registered Python step handler.
+            agent_type="EXECUTOR",
+            integrity_level="trusted",
+            template_id=template_id,
+        )
+        created_ids.append(correctness_id)
+        _inherit_source_category(implementation_arc_id, correctness_id)
 
-    arc_manager.add_history(
-        implementation_arc_id,
-        "verification_arc_created",
-        {"verification_arc_id": correctness_id, "check_type": "correctness"},
-    )
+        arc_manager.add_history(
+            implementation_arc_id,
+            "verification_arc_created",
+            {
+                "verification_arc_id": correctness_id,
+                "check_type": ov_step_name,
+                "workflow_template": workflow_template,
+            },
+        )
+    else:
+        correctness_policy_id = _get_model_policy_for_verification_step(
+            template_id, "verify-correctness"
+        )
+        correctness_id = arc_manager.create_arc(
+            name=correctness_name,
+            goal=(
+                f"Verify correctness of '{impl_name}' (arc #{implementation_arc_id}): "
+                f"run tests, check behavior matches spec, validate no regressions.\n\n"
+                f"PROSE ACCURACY. Every factual claim you write — about which tests ran, "
+                f"which passed or failed, what behavior was exercised, which regressions "
+                f"were checked — must be traceable to a tool result you observed in this "
+                f"arc's session (e.g. an exact `run_tests`, `read_file`, or `get_state` "
+                f"output). If you cannot point to an exact tool result that proves a claim, "
+                f"do not write the claim. Hedge (\"did not verify X\") or omit it. \"No "
+                f"regressions detected\" is only acceptable if you actually ran a regression "
+                f"check whose output you can cite — do not infer it from a passing happy-path "
+                f"test or from the diff."
+            ),
+            parent_id=parent_id,
+            step_order=correctness_step_order,
+            step_role="verifier-correctness",
+            arc_role="verifier",
+            verification_target_id=implementation_arc_id,
+            agent_type="REVIEWER",
+            integrity_level="trusted",
+            model_policy_id=correctness_policy_id,  # From template
+        )
+        created_ids.append(correctness_id)
+        _inherit_source_category(implementation_arc_id, correctness_id)
+
+        arc_manager.add_history(
+            implementation_arc_id,
+            "verification_arc_created",
+            {"verification_arc_id": correctness_id, "check_type": "correctness"},
+        )
 
     # 3. Judge -- Python-only boolean aggregation (no AI agent)
     # The dedicated handler in arc_dispatch_handler reads sibling statuses

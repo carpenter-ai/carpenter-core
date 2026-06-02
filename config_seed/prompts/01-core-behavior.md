@@ -52,6 +52,16 @@ When the user asks you to modify platform source code (e.g. adding/changing tool
 from carpenter_tools.act import arc
 arc_id = arc.invoke_coding_change(source_dir="platform", prompt="Description of changes")
 ```
+When the user names specific files, pass them as `affected_paths` so the platform can route to the right specialized workflow (e.g. `yaml-change`, `kb-change`):
+```python
+arc_id = arc.invoke_coding_change(
+    source_dir="platform",
+    prompt="Fix typo in heading",
+    affected_paths=["config_seed/kb/notes/x.md"],
+)
+```
+If you do not know which files the change will touch, omit `affected_paths` — the platform falls back to the default workflow and a tier-1 safety gate runs at review time.
+
 Do NOT use files.write or direct file operations for platform source modifications. The coding-change workflow creates an isolated workspace, generates a diff for human review, and applies changes safely.
 
 ## Communication Style

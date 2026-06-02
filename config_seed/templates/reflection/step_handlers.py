@@ -217,15 +217,14 @@ def _is_reflection_restricted(
        wires category-specific workflows (``coding-change``,
        ``yaml-change``, ``kb-change``).
 
-    TODO(PR 5): ``proposed_action_parser.parse_proposed_actions`` currently
-    returns plain strings — there is no target path field on the parsed
-    action.  Until the parser is extended to surface a structured target
-    (e.g. ``{"description": ..., "target_path": ...}``), only the taint
-    arm fires here.  The path/category arms are wired but unreachable.
-    The instruction set for PR 4 explicitly calls out this gap; PR 5
-    should extend ``parse_proposed_actions`` to emit a target-path field
-    (e.g. by extracting backticked paths from the description) and then
-    pass it through ``handle_dispatch_actions`` below.
+    As of PR 7 (close-out), ``parse_proposed_actions`` returns structured
+    dicts ``{"description": str, "target_path": str | None}`` extracted
+    from backticked path-like tokens in the description.  When the parser
+    finds a target path the dispatch loop in
+    :func:`handle_dispatch_actions` calls this predicate per-action, so
+    the tier and category arms now fire reliably.  Actions without an
+    extractable path fall back to the taint-only behavior (preserved for
+    backwards compatibility).
     """
     # Taint arm — preserved from the legacy check.
     if reflected_arc_id is not None:
@@ -268,10 +267,9 @@ def _is_reflection_restricted(
             )
             # Fall through to the path/category arms — defensive.
 
-    # Path/category arms — only fire if the parser surfaces a target.
-    # Today the parser produces plain strings (see TODO above), so this
-    # block is dead code; it is wired so PR 5 only has to extend the
-    # parser, not re-touch this function.
+    # Path/category arms — fire when the parsed action surfaces a target
+    # path.  As of PR 7 the parser extracts target_path from backticked
+    # path-like tokens in the description, so this path is now live.
     if proposed_action is not None and isinstance(proposed_action, dict):
         target = proposed_action.get("target_path")
         if isinstance(target, str) and target:
@@ -416,20 +414,34 @@ async def handle_dispatch_actions(arc_id: int, arc_info: dict) -> None:
     truncated_count = max(0, total_proposed - cap)
     actions = actions[:cap]
 
-    # PR 4 platform-integrity: use the broader predicate.  Today the
-    # parsed actions are plain strings (no target_path), so passing
-    # ``proposed_action=None`` here matches the legacy taint-only
-    # behavior.  TODO(PR 5): once
-    # ``parse_proposed_actions`` returns structured actions with a
-    # ``target_path`` field, loop here and OR the per-action result
-    # into ``is_tainted`` (or compute review_mode per spawned arc).
-    is_tainted = _is_reflection_restricted(reflected_arc_id, None)
-    review_mode = "human" if is_tainted else "auto"
-
+    # PR 7 platform-integrity close-out: ``parse_proposed_actions`` now
+    # returns structured ``{"description": ..., "target_path": ...}``
+    # dicts.  Compute per-action review_mode so a single tier-T1 action
+    # in a batch routes to the gated template even when its siblings are
+    # clean.  ``any_restricted`` is recorded on this dispatch arc for
+    # observability.
     spawned_arcs: list[int] = []
     action_types: list[str] = []
+    any_restricted = False
 
-    for i, action_desc in enumerate(actions):
+    for i, action in enumerate(actions):
+        if not isinstance(action, dict):
+            # Defensive: skip malformed entries rather than crash.
+            logger.warning(
+                "dispatch-actions arc %d: action %d is not a dict (%r); skipping",
+                arc_id, i, type(action).__name__,
+            )
+            continue
+        action_desc = action.get("description", "") or ""
+        action_target = action.get("target_path")
+        if not action_desc:
+            continue
+
+        restricted = _is_reflection_restricted(reflected_arc_id, action)
+        if restricted:
+            any_restricted = True
+        review_mode = "human" if restricted else "auto"
+
         action_type = classify_action(action_desc)
         template_name, prompt_name = _ACTION_TYPE_TO_TEMPLATE.get(
             (action_type, review_mode),
@@ -444,10 +456,13 @@ async def handle_dispatch_actions(arc_id: int, arc_info: dict) -> None:
             )
             continue
 
+        prompt_context = {"description": action_desc}
+        if action_target:
+            prompt_context["target_path"] = action_target
         try:
             rendered_goal = load_prompt_template(
                 prompt_name,
-                context={"description": action_desc},
+                context=prompt_context,
                 subdirectory="reflections",
             )
         except FileNotFoundError:
@@ -474,11 +489,18 @@ async def handle_dispatch_actions(arc_id: int, arc_info: dict) -> None:
         # the spawned arc so tooling / follow-up gating can inspect.
         set_arc_state(child_arc_id, "action_type", action_type)
         set_arc_state(child_arc_id, "action_description", action_desc)
-        if is_tainted:
+        if action_target:
+            set_arc_state(child_arc_id, "action_target_path", action_target)
+        if restricted:
             set_arc_state(child_arc_id, "_review_mode", "human")
 
         spawned_arcs.append(child_arc_id)
         action_types.append(action_type)
+
+    # ``is_tainted`` is preserved as the recorded field name for callers
+    # that already query it; the value now means "at least one spawned
+    # action was restricted by the broadened predicate".
+    is_tainted = any_restricted
 
     # Record dispatch outcome on this arc for queryability.
     set_arc_state(arc_id, "_agent_response", {
