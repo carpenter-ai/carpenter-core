@@ -117,6 +117,11 @@ def _make_repo(tmp_path: Path) -> Path:
 @pytest.mark.parametrize("relpath", [
     "carpenter/foo.py",
     "carpenter/subpkg/bar.py",
+    "carpenter_tools/declarations.py",
+    "carpenter_tools/tool_meta.py",
+    "carpenter_tools/act/github_gist.py",
+    "carpenter_tools/read/files.py",
+    "carpenter_tools/policy/types.py",
     "config_seed/something.yaml",
     "pyproject.toml",
     "setup.py",

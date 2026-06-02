@@ -66,6 +66,7 @@ _HARDCODED_T0_PATTERNS: tuple[str, ...] = (
 # platform-protected — changes here always require human review.
 _HARDCODED_T1_REL_PREFIXES: tuple[str, ...] = (
     "carpenter/",
+    "carpenter_tools/",
     "config_seed/",
     "pyproject.toml",
     "setup.py",
