@@ -71,10 +71,9 @@ class RegisteredPackage:
 def default_install_paths() -> list[Path]:
     """Return the install destination(s) — primary D24 stage 3a path.
 
-    ``~/carpenter/packages/`` is the install destination per SD2.  In
-    practice ``~/carpenter`` is a symlink to ``/media/jabenta/carpenter/data``
-    on the production Pi.  Returned paths directly contain
-    ``<name>/manifest.yaml`` children (no ``packages/`` subdir).
+    ``~/carpenter/packages/`` is the install destination per SD2.
+    Returned paths directly contain ``<name>/manifest.yaml`` children
+    (no ``packages/`` subdir).
     """
     out: list[Path] = []
     try:
@@ -86,10 +85,8 @@ def default_install_paths() -> list[Path]:
     except Exception:  # pragma: no cover — defensive
         base_dir = ""
     if base_dir:
-        # ``base_dir`` on the daemon is the repo dir
-        # (``/media/jabenta/carpenter/repo``); the data dir
-        # (``/media/jabenta/carpenter/data``) is its sibling.  Try
-        # both data-sibling and same-dir layouts.
+        # ``base_dir`` is the repo dir; the data dir is conventionally
+        # its sibling.  Try both data-sibling and same-dir layouts.
         base_dir_path = Path(base_dir)
         out.append(base_dir_path.parent / "data" / "packages")
         out.append(base_dir_path / "packages")

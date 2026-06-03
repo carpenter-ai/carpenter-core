@@ -14,7 +14,7 @@ Example config::
     inference_chain:
       - name: desktop-ollama
         provider: ollama
-        url: "http://192.168.2.243:11434"
+        url: "http://localhost:11434"
         model: "qwen3.5:9b"
         context_window: 16384
         timeout: 300

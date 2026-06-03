@@ -80,9 +80,9 @@ def test_extracts_relative_kb_path_from_backticks(tmp_path):
 def test_extracts_absolute_python_path_from_backticks(tmp_path):
     parser = _load_parser(tmp_path)
     actions = parser.parse_proposed_actions(
-        "- Refactor `/home/pi/repos/carpenter/security/judge.py` for clarity\n"
+        "- Refactor `/repo/carpenter/security/judge.py` for clarity\n"
     )
-    assert actions[0]["target_path"] == "/home/pi/repos/carpenter/security/judge.py"
+    assert actions[0]["target_path"] == "/repo/carpenter/security/judge.py"
 
 
 def test_no_backtick_path_yields_none(tmp_path):

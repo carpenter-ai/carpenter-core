@@ -31,7 +31,7 @@ def _resolve_ollama_settings() -> tuple[str, str, int]:
         kb_cfg = {}
 
     url = ollama_cfg.get("url") or kb_cfg.get(
-        "embedding_url", "http://192.168.2.243:11434",
+        "embedding_url", "http://localhost:11434",
     )
     model = ollama_cfg.get("model") or kb_cfg.get(
         "embedding_model", "nomic-embed-text",
