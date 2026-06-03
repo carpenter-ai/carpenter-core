@@ -47,7 +47,7 @@ DEFAULTS = {
         # NOTE: ``kb.embedding_*`` keys are kept as one-release fallbacks
         # for the new top-level ``embedding`` block below.  New deployments
         # should configure embedding via ``embedding:`` in config.yaml.
-        "embedding_url": "http://192.168.2.243:11434",
+        "embedding_url": "http://localhost:11434",
         "embedding_model": "nomic-embed-text",
         "embedding_dim": 384,
         "onnx_model_path": "",              # auto-resolved: {base_dir}/models/all-MiniLM-L6-v2.onnx
@@ -64,7 +64,7 @@ DEFAULTS = {
             "model_path": "",         # default: {base_dir}/models/all-MiniLM-L6-v2.onnx
         },
         "ollama": {
-            "url": "http://192.168.2.243:11434",
+            "url": "http://localhost:11434",
             "model": "nomic-embed-text",
             "dim": 768,
         },

@@ -21,7 +21,7 @@ Clone a repository. All three positional args required:
 from carpenter_tools.act import git
 from carpenter_tools.read import config
 server_url = config.get_value('git_url')['value']
-workspace = '/home/pi/carpenter/data/workspaces/my-task'
+workspace = '~/carpenter/data/workspaces/my-task'
 git.setup_repo(
     repo_url=f'{server_url}/owner/repo.git',
     workspace=workspace,
@@ -80,7 +80,7 @@ For simple file additions, do everything in ONE submit_code call:
 from carpenter_tools.act import git, files
 from carpenter_tools.read import config
 server_url = config.get_value('git_url')['value']
-workspace = '/home/pi/carpenter/data/workspaces/my-task'
+workspace = '~/carpenter/data/workspaces/my-task'
 git.setup_repo(
     repo_url=f'{server_url}/owner/repo.git',
     workspace=workspace,
