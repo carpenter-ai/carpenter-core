@@ -470,119 +470,6 @@ def _load_yaml(path: str) -> dict:
         return {}
 
 
-# Map of deprecated config keys → canonical names.  The carpenter codebase
-# moved off Forgejo-flavored names; this one-shot migration rewrites any
-# lingering occurrences in the on-disk config.yaml so the runtime never has
-# to dual-read.  ``git_server_url`` was a short-lived intermediate name and
-# is also migrated to the final ``git_url``.
-_LEGACY_CONFIG_KEY_MAP = {
-    "forgejo_url": "git_url",
-    "git_server_url": "git_url",
-    "forgejo_token": "git_token",
-    "forgejo_api_timeout": "git_api_timeout",
-    "forgejo_api_long_timeout": "git_api_long_timeout",
-}
-
-# Map of deprecated env-var / dot-env keys → canonical names.
-_LEGACY_DOT_ENV_KEY_MAP = {
-    "FORGEJO_TOKEN": "GIT_TOKEN",
-}
-
-
-def _migrate_legacy_config_keys(yaml_path: str) -> None:
-    """Rewrite deprecated config keys in-place in ``yaml_path`` and {base_dir}/.env.
-
-    Idempotent: if no legacy keys are present the files are left untouched.
-    If a canonical key is already set, the legacy key is dropped (canonical wins,
-    matching the precedence the old dual-read layer used).
-    """
-    if yaml is None:
-        return
-
-    # ── config.yaml ──────────────────────────────────────────────────
-    try:
-        with open(yaml_path) as f:
-            data = yaml.safe_load(f)
-    except (OSError, yaml.YAMLError):
-        data = None
-
-    if isinstance(data, dict):
-        changed = False
-        for old_key, new_key in _LEGACY_CONFIG_KEY_MAP.items():
-            if old_key not in data:
-                continue
-            old_val = data.pop(old_key)
-            if new_key not in data:
-                data[new_key] = old_val
-            changed = True
-        if changed:
-            try:
-                with open(yaml_path, "w") as f:
-                    yaml.dump(
-                        data,
-                        f,
-                        default_flow_style=False,
-                        allow_unicode=True,
-                        sort_keys=False,
-                    )
-            except OSError:
-                # Best-effort: a read-only filesystem shouldn't break server
-                # startup; the in-process config still has the canonical
-                # values because the dict was mutated above.
-                pass
-
-    # ── {base_dir}/.env ──────────────────────────────────────────────
-    # We don't know base_dir until after YAML load, but the .env file lives
-    # alongside config.yaml in deployment.  Walk up one directory and look
-    # for a sibling .env at the conventional path.
-    try:
-        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(yaml_path)))
-        dot_env_path = os.path.join(base_dir, ".env")
-        if not os.path.isfile(dot_env_path):
-            return
-        with open(dot_env_path) as f:
-            lines = f.readlines()
-        new_lines: list[str] = []
-        seen: dict[str, bool] = {}
-        env_changed = False
-        # Track which canonical keys already exist so legacy lines are dropped
-        # if the canonical key is also present.
-        existing_keys = set()
-        for line in lines:
-            stripped = line.strip()
-            if not stripped or stripped.startswith("#") or "=" not in stripped:
-                continue
-            existing_keys.add(stripped.split("=", 1)[0].strip())
-        for line in lines:
-            stripped = line.strip()
-            if not stripped or stripped.startswith("#") or "=" not in stripped:
-                new_lines.append(line)
-                continue
-            k, _, rest = line.partition("=")
-            k_clean = k.strip()
-            if k_clean in _LEGACY_DOT_ENV_KEY_MAP:
-                new_key = _LEGACY_DOT_ENV_KEY_MAP[k_clean]
-                env_changed = True
-                if new_key in existing_keys:
-                    # Canonical already present elsewhere — drop the legacy line.
-                    continue
-                if seen.get(new_key):
-                    continue
-                seen[new_key] = True
-                # Preserve original line ending
-                new_lines.append(f"{new_key}={rest}" if rest else f"{new_key}=\n")
-            else:
-                new_lines.append(line)
-        if env_changed:
-            try:
-                with open(dot_env_path, "w") as f:
-                    f.writelines(new_lines)
-            except OSError:
-                pass
-    except OSError:
-        pass
-
-
 def _load_credential_registry(base_dir: str) -> dict:
     """Load credential_registry.yaml from base_dir. Returns {} if absent."""
     path = os.path.join(base_dir, "config", "credential_registry.yaml")
@@ -756,11 +643,6 @@ def load_config(yaml_path: str | None = None) -> dict:
     # Record which file is authoritative so config_tool (and anyone else) can
     # write back to the same path without re-deriving it from env vars.
     _loaded_yaml_path = yaml_path
-    # One-shot migration: rewrite deprecated forgejo_*/git_server_url keys to
-    # their canonical git_* names in the on-disk YAML (and dot-env) before we
-    # load it.  Done in-place so subsequent loads see the new names directly —
-    # no dual-read backward-compat layer.
-    _migrate_legacy_config_keys(yaml_path)
     yaml_overrides = _load_yaml(yaml_path)
     config.update(yaml_overrides)
 
