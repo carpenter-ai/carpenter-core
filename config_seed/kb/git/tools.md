@@ -47,7 +47,7 @@ git.commit_and_push(
 All four positional args required:
 ```python
 git.create_pr(
-    repo_owner='ben-harack',
+    repo_owner='your-username',
     repo_name='my-repo',
     branch_name='feature-branch',
     pr_title='Add new file',
