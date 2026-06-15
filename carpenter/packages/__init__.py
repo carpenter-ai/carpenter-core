@@ -79,8 +79,10 @@ Trust-model invariants enforced at load and dispatch time:
 
 from .manifest import (
     ArcTemplateRef,
+    EnvCredentialRef,
     JudgeHandlerRef,
     KbArticleRef,
+    OAuthCredentialRef,
     PackageManifest,
     ManifestError,
     SubscriptionRef,
@@ -118,8 +120,10 @@ from .handler_registry import (
 
 __all__ = [
     "ArcTemplateRef",
+    "EnvCredentialRef",
     "JudgeHandlerRef",
     "KbArticleRef",
+    "OAuthCredentialRef",
     "PackageManifest",
     "ManifestError",
     "SubscriptionRef",

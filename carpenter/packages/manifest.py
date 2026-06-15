@@ -55,12 +55,14 @@ allowlist_proposals:             # optional list of allowlist entries
                                  #   install (after operator confirm);
                                  #   uninstall does NOT remove (SD5).
 
-# Phase 0 (OAuth-callback): packages declaring OAuth credentials.
-# Field is named ``credential_requirements`` (NOT ``credentials``)
-# because the security gate forbids the bare word ``credentials`` as a
-# top-level key — that historically meant bundled credential *bytes*.
-credential_requirements:         # optional list of OAuth credential reqs
-  - kind: oauth                  #   only "oauth" supported today
+# Packages may declare credential requirements.  Field is named
+# ``credential_requirements`` (NOT ``credentials``) because the security
+# gate forbids the bare word ``credentials`` as a top-level key — that
+# historically meant bundled credential *bytes*.  Two kinds are
+# supported: ``oauth`` (OAuth 2.0 authorization-code) and ``env`` (plain
+# env-var credentials, e.g. an IMAP/SMTP app password).
+credential_requirements:         # optional list of credential reqs
+  - kind: oauth                  #   OAuth 2.0 authorization-code
     provider: google             #   human-readable provider tag
     env_key_prefix: GMAIL_OAUTH  #   UPPER_SNAKE; produces _ACCESS_TOKEN,
                                  #   _REFRESH_TOKEN, _TOKEN_EXPIRES_AT,
@@ -69,6 +71,17 @@ credential_requirements:         # optional list of OAuth credential reqs
     token_url: https://oauth2.googleapis.com/token
     scopes:
       - https://www.googleapis.com/auth/gmail.readonly
+  - kind: env                    #   plain env-var credentials
+    provider: imap_smtp          #   human-readable provider tag
+    env_key_prefix: IMAP_EMAIL   #   UPPER_SNAKE; full var is
+                                 #   f"{env_key_prefix}_{suffix}"
+    required_keys:               #   non-empty, UPPER_SNAKE suffixes
+      - IMAP_HOST
+      - IMAP_PORT
+      - SMTP_HOST
+      - SMTP_PORT
+      - USERNAME
+      - PASSWORD
 ```
 
 Stage 3a behaviour for the new fields:
@@ -242,6 +255,39 @@ class OAuthCredentialRef:
 
 
 @dataclass(frozen=True)
+class EnvCredentialRef:
+    """A package-declared environment-variable credential requirement.
+
+    Unlike :class:`OAuthCredentialRef`, this describes a credential set
+    supplied directly as environment variables (e.g. an IMAP/SMTP
+    mailbox accessed with a plain app password — host, port, username,
+    password).  There is no authorization flow; the operator provides
+    the values at install time (a future PR wires up ``.env`` writing
+    and runtime loading — this PR only declares and validates the
+    schema).
+
+    Attributes:
+        kind: Always ``"env"``.
+        provider: Human-readable provider tag (e.g. ``"imap_smtp"``).
+            Used only in logs and operator-facing prompts.
+        env_key_prefix: ``UPPER_SNAKE`` prefix under which the platform
+            stores the credential values.  Must match
+            ``[A-Z][A-Z0-9_]{0,63}``.  The full variable name for a
+            given suffix is conceptually ``f"{env_key_prefix}_{suffix}"``.
+        required_keys: Tuple of ``UPPER_SNAKE`` env-var suffixes the
+            package needs (e.g. ``("IMAP_HOST", "IMAP_PORT",
+            "USERNAME", "PASSWORD")``).  Each must match
+            ``[A-Z][A-Z0-9_]*`` and the set must be non-empty with no
+            duplicates.
+    """
+
+    kind: str
+    provider: str
+    env_key_prefix: str
+    required_keys: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class SubscriptionRef:
     """A reference to a trigger subscription the package contributes.
 
@@ -310,6 +356,13 @@ class PackageManifest:
         trigger_subscriptions: D24 stage 3a — trigger subscriptions
             the package contributes.  Wired into the trigger pipeline
             in stage 3b.
+        credential_requirements: Declared credential requirements.  Each
+            entry is either an :class:`OAuthCredentialRef`
+            (``kind: oauth``) or an :class:`EnvCredentialRef`
+            (``kind: env``, plain env-var credentials such as an
+            IMAP/SMTP app password).  Declaration/validation only at
+            this layer; install-time ``.env`` writing and runtime
+            loading are handled elsewhere.
         source_path: Absolute path to the package directory on disk.
             Set by :func:`load_manifest`; not part of the on-disk
             manifest itself.
@@ -328,7 +381,9 @@ class PackageManifest:
     trigger_subscriptions: tuple[SubscriptionRef, ...] = ()
     triggers: tuple[TriggerRef, ...] = ()
     allowlist_proposals: tuple[AllowlistProposal, ...] = ()
-    credential_requirements: tuple[OAuthCredentialRef, ...] = ()
+    credential_requirements: tuple[
+        OAuthCredentialRef | EnvCredentialRef, ...
+    ] = ()
     source_path: Path = field(default_factory=Path)
 
 
@@ -841,15 +896,154 @@ def _parse_allowlist_proposals(
 
 
 _ENV_PREFIX_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
+# Env-var suffixes (``required_keys`` for ``kind: env``).  UPPER_SNAKE,
+# must start with a letter.  No length cap here — the prefix is the
+# length-bounded part; suffixes mirror conventional env-var naming.
+_ENV_SUFFIX_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 
 
-def _parse_credentials(raw_value: Any) -> tuple[OAuthCredentialRef, ...]:
+def _parse_oauth_credential(
+    i: int, item: dict[str, Any],
+) -> OAuthCredentialRef:
+    """Parse a single ``kind: oauth`` credential entry.
+
+    Matches the generic OAuth-callback flow in
+    :mod:`carpenter.api.oauth`.  The ``env_key_prefix`` is validated by
+    the caller (so the cross-kind uniqueness check can be hoisted); this
+    helper validates the OAuth-specific keys.
+    """
+    allowed_keys = {
+        "kind", "provider", "env_key_prefix", "authorize_url",
+        "token_url", "scopes",
+    }
+    unknown = set(item.keys()) - allowed_keys
+    if unknown:
+        raise ManifestError(
+            f"credential_requirements[{i}] (kind=oauth) has unknown keys: "
+            f"{sorted(unknown)}; allowed: {sorted(allowed_keys)}",
+        )
+    missing = allowed_keys - set(item.keys())
+    if missing:
+        raise ManifestError(
+            f"credential_requirements[{i}] (kind=oauth) missing required "
+            f"keys: {sorted(missing)}",
+        )
+    provider = item.get("provider")
+    if not isinstance(provider, str) or not provider.strip():
+        raise ManifestError(
+            f"credential_requirements[{i}].provider must be a non-empty string, "
+            f"got {provider!r}",
+        )
+    for url_key in ("authorize_url", "token_url"):
+        url = item.get(url_key)
+        if not isinstance(url, str) or not url.startswith("https://"):
+            raise ManifestError(
+                f"credential_requirements[{i}].{url_key} must be an absolute "
+                f"https:// URL, got {url!r}",
+            )
+    scopes = item.get("scopes")
+    if not isinstance(scopes, list) or not scopes:
+        raise ManifestError(
+            f"credential_requirements[{i}].scopes must be a non-empty list of "
+            f"strings, got {scopes!r}",
+        )
+    scope_tuple: list[str] = []
+    for j, scope in enumerate(scopes):
+        if not isinstance(scope, str) or not scope.strip():
+            raise ManifestError(
+                f"credential_requirements[{i}].scopes[{j}] must be a non-empty "
+                f"string, got {scope!r}",
+            )
+        scope_tuple.append(scope.strip())
+    return OAuthCredentialRef(
+        kind="oauth",
+        provider=provider.strip(),
+        env_key_prefix=item["env_key_prefix"],
+        authorize_url=item["authorize_url"],
+        token_url=item["token_url"],
+        scopes=tuple(scope_tuple),
+    )
+
+
+def _parse_env_credential(
+    i: int, item: dict[str, Any],
+) -> EnvCredentialRef:
+    """Parse a single ``kind: env`` credential entry.
+
+    Describes plain env-var credentials (e.g. an IMAP/SMTP app
+    password) with no authorization flow.  The ``env_key_prefix`` is
+    validated by the caller; this helper validates the env-specific
+    keys.
+    """
+    allowed_keys = {"kind", "provider", "env_key_prefix", "required_keys"}
+    unknown = set(item.keys()) - allowed_keys
+    if unknown:
+        raise ManifestError(
+            f"credential_requirements[{i}] (kind=env) has unknown keys: "
+            f"{sorted(unknown)}; allowed: {sorted(allowed_keys)}",
+        )
+    missing = allowed_keys - set(item.keys())
+    if missing:
+        raise ManifestError(
+            f"credential_requirements[{i}] (kind=env) missing required "
+            f"keys: {sorted(missing)}",
+        )
+    provider = item.get("provider")
+    if not isinstance(provider, str) or not provider.strip():
+        raise ManifestError(
+            f"credential_requirements[{i}].provider must be a non-empty string, "
+            f"got {provider!r}",
+        )
+    required_keys = item.get("required_keys")
+    if not isinstance(required_keys, list) or not required_keys:
+        raise ManifestError(
+            f"credential_requirements[{i}].required_keys must be a non-empty "
+            f"list of strings, got {required_keys!r}",
+        )
+    seen_suffixes: set[str] = set()
+    key_tuple: list[str] = []
+    for j, key in enumerate(required_keys):
+        if not isinstance(key, str) or not _ENV_SUFFIX_RE.match(key):
+            raise ManifestError(
+                f"credential_requirements[{i}].required_keys[{j}] must match "
+                f"{_ENV_SUFFIX_RE.pattern!r}, got {key!r}",
+            )
+        if key in seen_suffixes:
+            raise ManifestError(
+                f"credential_requirements[{i}].required_keys has duplicate "
+                f"entry {key!r}",
+            )
+        seen_suffixes.add(key)
+        key_tuple.append(key)
+    return EnvCredentialRef(
+        kind="env",
+        provider=provider.strip(),
+        env_key_prefix=item["env_key_prefix"],
+        required_keys=tuple(key_tuple),
+    )
+
+
+def _parse_credentials(
+    raw_value: Any,
+) -> tuple[OAuthCredentialRef | EnvCredentialRef, ...]:
     """Parse the ``credential_requirements`` field.
 
-    Phase 0 supports a single ``kind: oauth`` flavour matching the
-    generic OAuth-callback flow in :mod:`carpenter.api.oauth`.  Future
-    PRs may extend with ``api_key`` (just an env-key reference) or
-    ``basic_auth``; until then, unknown kinds are rejected.
+    Two ``kind`` flavours are accepted:
+
+    * ``oauth`` — an OAuth 2.0 authorization-code credential matching the
+      generic OAuth-callback flow in :mod:`carpenter.api.oauth`.  Yields
+      an :class:`OAuthCredentialRef`.
+    * ``env`` — plain environment-variable credentials (e.g. an
+      IMAP/SMTP mailbox accessed with an app password): a provider tag,
+      an ``env_key_prefix``, and a list of ``required_keys`` suffixes.
+      Yields an :class:`EnvCredentialRef`.  Install-time ``.env``
+      writing and runtime loading are intentionally out of scope here
+      (separate future PR); this layer only declares and validates.
+
+    Other kinds are reserved for future PRs and are rejected.
+
+    ``env_key_prefix`` must be unique across ALL entries regardless of
+    kind, so mixed manifests cannot collide on the same env namespace.
 
     The field is named ``credential_requirements`` (NOT
     ``credentials``) because the security validator in
@@ -860,36 +1054,17 @@ def _parse_credentials(raw_value: Any) -> tuple[OAuthCredentialRef, ...]:
     items = _ensure_list_of_dict(raw_value, "credential_requirements")
     if not items:
         return ()
-    out: list[OAuthCredentialRef] = []
+    out: list[OAuthCredentialRef | EnvCredentialRef] = []
     seen_prefixes: set[str] = set()
-    allowed_keys = {
-        "kind", "provider", "env_key_prefix", "authorize_url",
-        "token_url", "scopes",
-    }
     for i, item in enumerate(items):
-        unknown = set(item.keys()) - allowed_keys
-        if unknown:
-            raise ManifestError(
-                f"credential_requirements[{i}] has unknown keys: {sorted(unknown)}; "
-                f"allowed: {sorted(allowed_keys)}",
-            )
-        missing = allowed_keys - set(item.keys())
-        if missing:
-            raise ManifestError(
-                f"credential_requirements[{i}] missing required keys: {sorted(missing)}",
-            )
         kind = item.get("kind")
-        if kind != "oauth":
+        if kind not in ("oauth", "env"):
             raise ManifestError(
-                f"credential_requirements[{i}].kind must be 'oauth' (got {kind!r}); "
-                f"other kinds are reserved for future PRs",
+                f"credential_requirements[{i}].kind must be 'oauth' or 'env' "
+                f"(got {kind!r}); other kinds are reserved for future PRs",
             )
-        provider = item.get("provider")
-        if not isinstance(provider, str) or not provider.strip():
-            raise ManifestError(
-                f"credential_requirements[{i}].provider must be a non-empty string, "
-                f"got {provider!r}",
-            )
+        # Validate env_key_prefix and its cross-kind uniqueness here so
+        # that mixed (oauth + env) manifests are checked together.
         prefix = item.get("env_key_prefix")
         if not isinstance(prefix, str) or not _ENV_PREFIX_RE.match(prefix):
             raise ManifestError(
@@ -901,35 +1076,10 @@ def _parse_credentials(raw_value: Any) -> tuple[OAuthCredentialRef, ...]:
                 f"credential_requirements: duplicate env_key_prefix {prefix!r}",
             )
         seen_prefixes.add(prefix)
-        for url_key in ("authorize_url", "token_url"):
-            url = item.get(url_key)
-            if not isinstance(url, str) or not url.startswith("https://"):
-                raise ManifestError(
-                    f"credential_requirements[{i}].{url_key} must be an absolute "
-                    f"https:// URL, got {url!r}",
-                )
-        scopes = item.get("scopes")
-        if not isinstance(scopes, list) or not scopes:
-            raise ManifestError(
-                f"credential_requirements[{i}].scopes must be a non-empty list of "
-                f"strings, got {scopes!r}",
-            )
-        scope_tuple: list[str] = []
-        for j, scope in enumerate(scopes):
-            if not isinstance(scope, str) or not scope.strip():
-                raise ManifestError(
-                    f"credential_requirements[{i}].scopes[{j}] must be a non-empty "
-                    f"string, got {scope!r}",
-                )
-            scope_tuple.append(scope.strip())
-        out.append(OAuthCredentialRef(
-            kind=kind,
-            provider=provider.strip(),
-            env_key_prefix=prefix,
-            authorize_url=item["authorize_url"],
-            token_url=item["token_url"],
-            scopes=tuple(scope_tuple),
-        ))
+        if kind == "oauth":
+            out.append(_parse_oauth_credential(i, item))
+        else:
+            out.append(_parse_env_credential(i, item))
     return tuple(out)
 
 

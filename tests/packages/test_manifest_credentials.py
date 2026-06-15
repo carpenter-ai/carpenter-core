@@ -1,10 +1,15 @@
-"""Tests for the ``credentials`` manifest field (Phase 0 OAuth-callback)."""
+"""Tests for the ``credential_requirements`` manifest field.
+
+Covers both ``kind: oauth`` (OAuth-callback) and ``kind: env`` (plain
+env-var credentials such as an IMAP/SMTP app password).
+"""
 
 from __future__ import annotations
 
 import pytest
 
 from carpenter.packages.manifest import (
+    EnvCredentialRef,
     ManifestError,
     OAuthCredentialRef,
     load_manifest,
@@ -23,6 +28,24 @@ _MIN_OAUTH = """
                 token_url: https://oauth2.googleapis.com/token
                 scopes:
                   - https://www.googleapis.com/auth/gmail.readonly
+            """
+
+
+_MIN_ENV = """
+            name: pkg
+            version: "0.1"
+            description: x
+            credential_requirements:
+              - kind: env
+                provider: imap_smtp
+                env_key_prefix: IMAP_EMAIL
+                required_keys:
+                  - IMAP_HOST
+                  - IMAP_PORT
+                  - SMTP_HOST
+                  - SMTP_PORT
+                  - USERNAME
+                  - PASSWORD
             """
 
 
@@ -185,6 +208,214 @@ class TestCredentialsField:
                 authorize_url: https://b.example/auth
                 token_url: https://b.example/token
                 scopes: [write]
+            """,
+        )
+        with pytest.raises(ManifestError, match="duplicate env_key_prefix"):
+            load_manifest(pkg_dir / "manifest.yaml")
+
+
+class TestEnvCredentialsField:
+    def test_env_credential_parsed(self, make_package):
+        pkg_dir = make_package("p", _MIN_ENV)
+        m = load_manifest(pkg_dir / "manifest.yaml")
+        assert len(m.credential_requirements) == 1
+        cred = m.credential_requirements[0]
+        assert isinstance(cred, EnvCredentialRef)
+        assert cred.kind == "env"
+        assert cred.provider == "imap_smtp"
+        assert cred.env_key_prefix == "IMAP_EMAIL"
+        assert cred.required_keys == (
+            "IMAP_HOST",
+            "IMAP_PORT",
+            "SMTP_HOST",
+            "SMTP_PORT",
+            "USERNAME",
+            "PASSWORD",
+        )
+
+    def test_unknown_keys_rejected(self, make_package):
+        pkg_dir = make_package(
+            "p",
+            """
+            name: p
+            version: "0.1"
+            description: x
+            credential_requirements:
+              - kind: env
+                provider: imap_smtp
+                env_key_prefix: IMAP_EMAIL
+                required_keys: [USERNAME, PASSWORD]
+                bogus: yes
+            """,
+        )
+        with pytest.raises(ManifestError, match="unknown keys"):
+            load_manifest(pkg_dir / "manifest.yaml")
+
+    def test_missing_required_keys_rejected(self, make_package):
+        # Missing the ``required_keys`` manifest key entirely.
+        pkg_dir = make_package(
+            "p",
+            """
+            name: p
+            version: "0.1"
+            description: x
+            credential_requirements:
+              - kind: env
+                provider: imap_smtp
+                env_key_prefix: IMAP_EMAIL
+            """,
+        )
+        with pytest.raises(ManifestError, match="missing required"):
+            load_manifest(pkg_dir / "manifest.yaml")
+
+    def test_bad_env_prefix_rejected(self, make_package):
+        pkg_dir = make_package(
+            "p",
+            _MIN_ENV.replace("IMAP_EMAIL", "lowercase-bad"),
+        )
+        with pytest.raises(ManifestError, match="env_key_prefix"):
+            load_manifest(pkg_dir / "manifest.yaml")
+
+    def test_empty_required_keys_rejected(self, make_package):
+        pkg_dir = make_package(
+            "p",
+            """
+            name: p
+            version: "0.1"
+            description: x
+            credential_requirements:
+              - kind: env
+                provider: imap_smtp
+                env_key_prefix: IMAP_EMAIL
+                required_keys: []
+            """,
+        )
+        with pytest.raises(ManifestError, match="required_keys"):
+            load_manifest(pkg_dir / "manifest.yaml")
+
+    def test_non_uppercase_required_key_rejected(self, make_package):
+        pkg_dir = make_package(
+            "p",
+            """
+            name: p
+            version: "0.1"
+            description: x
+            credential_requirements:
+              - kind: env
+                provider: imap_smtp
+                env_key_prefix: IMAP_EMAIL
+                required_keys: [username, PASSWORD]
+            """,
+        )
+        with pytest.raises(ManifestError, match="required_keys"):
+            load_manifest(pkg_dir / "manifest.yaml")
+
+    def test_duplicate_required_key_rejected(self, make_package):
+        pkg_dir = make_package(
+            "p",
+            """
+            name: p
+            version: "0.1"
+            description: x
+            credential_requirements:
+              - kind: env
+                provider: imap_smtp
+                env_key_prefix: IMAP_EMAIL
+                required_keys: [USERNAME, USERNAME]
+            """,
+        )
+        with pytest.raises(ManifestError, match="duplicate"):
+            load_manifest(pkg_dir / "manifest.yaml")
+
+    def test_empty_provider_rejected(self, make_package):
+        pkg_dir = make_package(
+            "p",
+            """
+            name: p
+            version: "0.1"
+            description: x
+            credential_requirements:
+              - kind: env
+                provider: ""
+                env_key_prefix: IMAP_EMAIL
+                required_keys: [USERNAME, PASSWORD]
+            """,
+        )
+        with pytest.raises(ManifestError, match="provider"):
+            load_manifest(pkg_dir / "manifest.yaml")
+
+    def test_duplicate_env_prefix_across_entries_rejected(self, make_package):
+        pkg_dir = make_package(
+            "p",
+            """
+            name: p
+            version: "0.1"
+            description: x
+            credential_requirements:
+              - kind: env
+                provider: imap_smtp
+                env_key_prefix: SAME
+                required_keys: [USERNAME]
+              - kind: env
+                provider: other
+                env_key_prefix: SAME
+                required_keys: [TOKEN]
+            """,
+        )
+        with pytest.raises(ManifestError, match="duplicate env_key_prefix"):
+            load_manifest(pkg_dir / "manifest.yaml")
+
+
+class TestMixedCredentials:
+    def test_mixed_oauth_and_env_parses_both(self, make_package):
+        pkg_dir = make_package(
+            "p",
+            """
+            name: p
+            version: "0.1"
+            description: x
+            credential_requirements:
+              - kind: oauth
+                provider: google
+                env_key_prefix: GMAIL_OAUTH
+                authorize_url: https://a.example/auth
+                token_url: https://a.example/token
+                scopes: [read]
+              - kind: env
+                provider: imap_smtp
+                env_key_prefix: IMAP_EMAIL
+                required_keys: [USERNAME, PASSWORD]
+            """,
+        )
+        m = load_manifest(pkg_dir / "manifest.yaml")
+        assert len(m.credential_requirements) == 2
+        oauth, env = m.credential_requirements
+        assert isinstance(oauth, OAuthCredentialRef)
+        assert oauth.env_key_prefix == "GMAIL_OAUTH"
+        assert isinstance(env, EnvCredentialRef)
+        assert env.env_key_prefix == "IMAP_EMAIL"
+        assert env.required_keys == ("USERNAME", "PASSWORD")
+
+    def test_mixed_duplicate_env_prefix_across_kinds_rejected(
+        self, make_package,
+    ):
+        pkg_dir = make_package(
+            "p",
+            """
+            name: p
+            version: "0.1"
+            description: x
+            credential_requirements:
+              - kind: oauth
+                provider: google
+                env_key_prefix: SHARED
+                authorize_url: https://a.example/auth
+                token_url: https://a.example/token
+                scopes: [read]
+              - kind: env
+                provider: imap_smtp
+                env_key_prefix: SHARED
+                required_keys: [USERNAME, PASSWORD]
             """,
         )
         with pytest.raises(ManifestError, match="duplicate env_key_prefix"):
