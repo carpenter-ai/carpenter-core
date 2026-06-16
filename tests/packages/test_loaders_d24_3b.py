@@ -300,6 +300,7 @@ class TestTemplateLoader:
                 required_for_json TEXT,
                 steps_json TEXT,
                 version INTEGER NOT NULL DEFAULT 1,
+                owner_package TEXT,
                 updated_at TEXT NOT NULL
             );
         """)

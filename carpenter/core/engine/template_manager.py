@@ -44,12 +44,21 @@ def _parse_steps_json(raw_json: str) -> tuple[list, list, list]:
     )
 
 
-def load_template(yaml_path: str) -> int:
+def load_template(yaml_path: str, *, owner_package: str | None = None) -> int:
     """Load a workflow template from a YAML file.
 
     Parses the YAML, stores or updates the template in the
     workflow_templates table. If a template with the same name already
     exists, updates it and increments the version.
+
+    Args:
+        yaml_path: Path to the template YAML file.
+        owner_package: When the template is shipped by a capability
+            package, the package's name. Recorded on the template so
+            that instantiation can stamp the package's per-arc grant
+            (``pkg.<owner>``) onto every step arc (see
+            :func:`instantiate_template`). Platform-shipped templates
+            leave this NULL and receive no grant.
 
     Returns the template ID.
     """
@@ -84,11 +93,11 @@ def load_template(yaml_path: str) -> int:
             db.execute(
                 "UPDATE workflow_templates SET "
                 "description = ?, yaml_path = ?, required_for_json = ?, "
-                "steps_json = ?, version = ?, updated_at = ? "
+                "steps_json = ?, version = ?, owner_package = ?, updated_at = ? "
                 "WHERE id = ?",
                 (
                     description, yaml_path, required_for_json,
-                    steps_json, new_version, now, existing["id"],
+                    steps_json, new_version, owner_package, now, existing["id"],
                 ),
             )
             template_id = existing["id"]
@@ -96,11 +105,11 @@ def load_template(yaml_path: str) -> int:
             cursor = db.execute(
                 "INSERT INTO workflow_templates "
                 "(name, description, yaml_path, required_for_json, "
-                " steps_json, version, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                " steps_json, version, owner_package, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     name, description, yaml_path, required_for_json,
-                    steps_json, 1, now,
+                    steps_json, 1, owner_package, now,
                 ),
             )
             template_id = cursor.lastrowid
@@ -228,6 +237,19 @@ def instantiate_template(template_id: int, parent_arc_id: int) -> list[int]:
 
     steps = template["steps"]
     template_capabilities = template.get("capabilities", [])
+    # Capability-package grant stamping: a template shipped by a
+    # capability package carries that package's name in ``owner_package``.
+    # Every step arc it instantiates is stamped with the package's per-arc
+    # grant (``pkg.<owner>``) so the arcs in this pipeline — including the
+    # EXECUTOR child that calls ``dispatch(<verb>)`` — pass the per-package
+    # dispatch gate (carpenter/executor/dispatch_bridge.py). The grant is
+    # scoped to this package's own templates: platform-shipped templates
+    # (owner_package NULL) and other packages' arcs never receive it.
+    owner_package = template.get("owner_package")
+    owner_grant_caps: list[str] = []
+    if owner_package:
+        from ...packages.capabilities import capability_grant_for_package
+        owner_grant_caps = [capability_grant_for_package(owner_package)]
     arc_ids = []
 
     for step in steps:
@@ -281,9 +303,16 @@ def instantiate_template(template_id: int, parent_arc_id: int) -> list[int]:
         )
         arc_ids.append(arc_id)
 
-        # Merge template-level + step-level capabilities and persist
+        # Merge template-level + step-level capabilities and persist.
+        # Capability-package grant (``pkg.<owner>``) is added for every
+        # step arc when the template is package-owned, so the EXECUTOR
+        # child can invoke the package's registered capability verbs.
         step_capabilities = step.get("capabilities", [])
-        merged_caps = sorted(set(template_capabilities) | set(step_capabilities))
+        merged_caps = sorted(
+            set(template_capabilities)
+            | set(step_capabilities)
+            | set(owner_grant_caps)
+        )
         if merged_caps:
             with db_transaction() as db:
                 db.execute(
