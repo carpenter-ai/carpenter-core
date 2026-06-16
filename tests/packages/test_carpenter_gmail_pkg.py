@@ -636,22 +636,24 @@ class TestKbArticles:
 class TestChatTools:
     def test_tools_module_imports(self, email_pkg: Path, monkeypatch):
         """Importing the package's tools.py succeeds and registers
-        @chat_tool-decorated functions."""
-        import importlib.util
-        import sys
+        @chat_tool-decorated functions.
 
-        tools_path = email_pkg / "tools.py"
-        spec = importlib.util.spec_from_file_location(
-            "_test_pkg_gmail_tools", tools_path,
+        Uses the platform's ``_import_package_module`` so the relative
+        imports inside tools.py (``from .arc_builders import ...`` and
+        ``from .scripts import ...``) resolve via the synthetic
+        ``_carpenter_pkg_`` parent package — the same package-aware path
+        the registry now takes when registering chat tools.
+        """
+        from carpenter.packages.loaders import _import_package_module
+
+        # Load the sibling modules tools.py relatively imports first so
+        # they're cached under the right namespaced names.
+        _import_package_module("carpenter-gmail", "data_models", email_pkg)
+        _import_package_module("carpenter-gmail", "scripts", email_pkg)
+        _import_package_module("carpenter-gmail", "arc_builders", email_pkg)
+        module = _import_package_module(
+            "carpenter-gmail", "tools", email_pkg,
         )
-        assert spec is not None
-        module = importlib.util.module_from_spec(spec)
-        # Ensure 'scripts' relative import works from this dir.
-        sys.path.insert(0, str(email_pkg))
-        try:
-            spec.loader.exec_module(module)
-        finally:
-            sys.path.pop(0)
 
         # @chat_tool decorator attaches _chat_tool_meta to each function.
         names = {
@@ -668,19 +670,14 @@ class TestChatTools:
 
     def test_send_email_requires_user_confirm(self, email_pkg: Path):
         """The send tool MUST set requires_user_confirm=True."""
-        import importlib.util
-        import sys
+        from carpenter.packages.loaders import _import_package_module
 
-        tools_path = email_pkg / "tools.py"
-        spec = importlib.util.spec_from_file_location(
-            "_test_pkg_gmail_tools_confirm", tools_path,
+        _import_package_module("carpenter-gmail", "data_models", email_pkg)
+        _import_package_module("carpenter-gmail", "scripts", email_pkg)
+        _import_package_module("carpenter-gmail", "arc_builders", email_pkg)
+        module = _import_package_module(
+            "carpenter-gmail", "tools", email_pkg,
         )
-        module = importlib.util.module_from_spec(spec)
-        sys.path.insert(0, str(email_pkg))
-        try:
-            spec.loader.exec_module(module)
-        finally:
-            sys.path.pop(0)
 
         meta = module.pkg_gmail_send_email._chat_tool_meta
         assert meta["requires_user_confirm"] is True
@@ -691,19 +688,14 @@ class TestChatTools:
 
     def test_trust_sender_requires_user_confirm(self, email_pkg: Path):
         """Allowlist-mutation tools MUST set requires_user_confirm=True."""
-        import importlib.util
-        import sys
+        from carpenter.packages.loaders import _import_package_module
 
-        tools_path = email_pkg / "tools.py"
-        spec = importlib.util.spec_from_file_location(
-            "_test_pkg_gmail_tools_trust", tools_path,
+        _import_package_module("carpenter-gmail", "data_models", email_pkg)
+        _import_package_module("carpenter-gmail", "scripts", email_pkg)
+        _import_package_module("carpenter-gmail", "arc_builders", email_pkg)
+        module = _import_package_module(
+            "carpenter-gmail", "tools", email_pkg,
         )
-        module = importlib.util.module_from_spec(spec)
-        sys.path.insert(0, str(email_pkg))
-        try:
-            spec.loader.exec_module(module)
-        finally:
-            sys.path.pop(0)
 
         for name in ("pkg_gmail_trust_sender", "pkg_gmail_untrust_sender"):
             meta = getattr(module, name)._chat_tool_meta
@@ -2442,13 +2434,14 @@ def phase_4_pkg(tmp_path: Path, phase_4_pkg_src: Path) -> Path:
 class TestPhase4ManifestShape:
     """Manifest-level invariants introduced by Phase 4."""
 
-    def test_manifest_version_is_0_6_x(self, phase_4_pkg: Path):
+    def test_manifest_version_is_0_7_x(self, phase_4_pkg: Path):
         from carpenter.packages.manifest import load_manifest
 
         m = load_manifest(phase_4_pkg / "manifest.yaml")
         # 0.6.0 shipped Phase 4; 0.6.1 fixed the PackageStateHandle
-        # import bug in tools.py.  Anything in the 0.6.x line is fine.
-        assert m.version.startswith("0.6.")
+        # import bug in tools.py; 0.7.0 renamed carpenter-email ->
+        # carpenter-gmail.  Anything in the 0.7.x line is fine.
+        assert m.version.startswith("0.7.")
 
     def test_manifest_declares_three_index_data_models(
         self, phase_4_pkg: Path,

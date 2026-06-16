@@ -104,6 +104,64 @@ class TestDiscoverAndRegister:
         loaded = registry.discover_and_register(search_paths=[package_root])
         assert len(loaded) == 1
 
+    def test_chat_tools_module_relative_import_resolves(
+        self, package_root, make_package,
+    ):
+        """A package whose ``tools.py`` uses an intra-package relative
+        import (``from .arc_builders import ...``) registers its chat
+        tools through the real registry path.
+
+        This is the regression guard for the chat-tool loader: the prior
+        bare ``spec_from_file_location`` load left ``__package__`` unset,
+        so any relative import in ``tools.py`` raised ``ImportError:
+        attempted relative import with no known parent package``.  The
+        loader is now package-aware (mirroring ``loaders.py``'s
+        ``_import_package_module``), so the relative import resolves and
+        the tool registers.
+        """
+        arc_builders_py = """\
+            # A sibling helper module that tools.py imports relatively.
+            SHARED_CONSTANT = "from-arc-builders"
+
+
+            def build_thing():
+                return SHARED_CONSTANT
+            """
+        tools_py = """\
+            from carpenter.chat_tool_loader import chat_tool
+
+            from .arc_builders import SHARED_CONSTANT, build_thing
+
+
+            @chat_tool(
+                description="Tool relying on a relative sibling import.",
+                input_schema={"type": "object", "properties": {}, "required": []},
+                capabilities=["pure"],
+            )
+            def pkg_rel_import_tool(tool_input, **kwargs):
+                return build_thing()
+            """
+        make_package(
+            "relimport",
+            HELLO_MANIFEST.replace("name: hello", "name: relimport"),
+            files={
+                "tools.py": tools_py,
+                "arc_builders.py": arc_builders_py,
+            },
+        )
+        registry = PackageRegistry()
+        loaded = registry.discover_and_register(
+            search_paths=[package_root.parent],
+        )
+        assert len(loaded) == 1
+        pkg = loaded[0]
+        assert pkg.manifest.name == "relimport"
+        # The relative import resolved: the tool registered cleanly with
+        # no load errors.
+        assert pkg.chat_tool_names == ("pkg_rel_import_tool",)
+        assert pkg.load_errors == ()
+        assert "pkg_rel_import_tool" in chat_tool_loader.get_loaded_tools()
+
 
 class TestPlatformBoundaryRejection:
     """A package whose chat-tool module declares trust_boundary='platform'
