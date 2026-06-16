@@ -42,13 +42,21 @@ def list_packages(tool_input, **kwargs):
             if pkg.chat_tool_names
             else " [no tools]"
         )
+        gated_summary = (
+            f" [{len(pkg.gated_chat_tool_names)} write tool(s) GATED — "
+            f"operator opt-in required: "
+            f"{', '.join(pkg.gated_chat_tool_names)}]"
+            if getattr(pkg, "gated_chat_tool_names", ())
+            else ""
+        )
         err_summary = (
             f" ({len(pkg.load_errors)} load error(s))"
             if pkg.load_errors
             else ""
         )
         lines.append(
-            f"- {m.name} v{m.version}: {m.description}{tool_summary}{err_summary}"
+            f"- {m.name} v{m.version}: {m.description}"
+            f"{tool_summary}{gated_summary}{err_summary}"
         )
 
     return "Loaded capability packages:\n" + "\n".join(lines)

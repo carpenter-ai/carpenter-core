@@ -469,6 +469,7 @@ def register_extension_tool(
     capabilities: list[str] | None = None,
     always_available: bool = False,
     requires_user_confirm: bool = False,
+    allow_write_caps: bool = False,
 ) -> None:
     """Register a platform extension tool at runtime.
 
@@ -478,6 +479,16 @@ def register_extension_tool(
     be in the hardcoded PLATFORM_TOOLS allowlist.
 
     Skips silently if a tool with the same name is already registered.
+
+    Args:
+        allow_write_caps: When ``True``, permit this chat-boundary tool
+            to declare write capabilities (``arc_create``,
+            ``external_effect``, etc.).  Default ``False`` — the chat
+            agent is read-only by default.  Set ``True`` only when the
+            operator explicitly opted the contributing capability package
+            in at install time; the caller (registry) is responsible for
+            proving that consent.  This never relaxes the
+            platform-boundary refusal.
     """
     from .chat_tool_registry import PLATFORM_TOOLS
 
@@ -500,7 +511,9 @@ def register_extension_tool(
 
     # Validate the single tool
     from .chat_tool_registry import validate_tool_defs
-    errors = validate_tool_defs([tool])
+    errors = validate_tool_defs(
+        [tool], write_chat_tools_allowed=allow_write_caps,
+    )
     if errors:
         raise ValueError(
             f"Extension tool {name!r} failed validation: {errors}"

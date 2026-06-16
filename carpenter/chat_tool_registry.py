@@ -57,7 +57,11 @@ WRITE_CAPABILITIES = frozenset({
 VALID_CAPABILITIES = READ_CAPABILITIES | WRITE_CAPABILITIES
 
 
-def validate_tool_defs(tools: list[LoadedTool]) -> list[str]:
+def validate_tool_defs(
+    tools: list[LoadedTool],
+    *,
+    write_chat_tools_allowed: bool = False,
+) -> list[str]:
     """Validate loaded tool definitions.  Returns list of error strings (empty = OK).
 
     Checks:
@@ -68,6 +72,21 @@ def validate_tool_defs(tools: list[LoadedTool]) -> list[str]:
     - No empty descriptions or schemas
     - Unknown capability strings are rejected
     - ``pure`` mixed with other capabilities is flagged
+
+    Args:
+        tools: Loaded tool definitions to validate.
+        write_chat_tools_allowed: Operator-gated relaxation of the
+            "chat-boundary tools may not declare write capabilities"
+            rule (invariant I10).  Defaults to ``False`` (the chat agent
+            is read-only by default).  When ``True`` — set only when an
+            operator explicitly opted a capability package in at install
+            time — a chat-boundary tool MAY declare write capabilities.
+            This NEVER relaxes the platform-boundary refusal: a package
+            tool declaring ``trust_boundary='platform'`` is always
+            rejected.  Callers that validate a mix of packages (e.g. the
+            cross-package consistency check) must validate each package's
+            tools separately with that package's flag — passing ``True``
+            here only makes sense for a single package's tools.
     """
     errors: list[str] = []
 
@@ -109,14 +128,17 @@ def validate_tool_defs(tools: list[LoadedTool]) -> list[str]:
                 f"{tool.capabilities}"
             )
 
-        # Chat-boundary tools cannot have write capabilities
-        if tool.trust_boundary == "chat":
+        # Chat-boundary tools cannot have write capabilities — UNLESS an
+        # operator explicitly opted this package in at install time
+        # (write_chat_tools_allowed=True).  The default is read-only.
+        if tool.trust_boundary == "chat" and not write_chat_tools_allowed:
             write_caps = [c for c in tool.capabilities if c in WRITE_CAPABILITIES]
             if write_caps:
                 errors.append(
                     f"Tool {tool.name!r} has chat trust_boundary but declares "
                     f"write capabilities: {write_caps}. Only platform tools "
-                    f"may declare write capabilities."
+                    f"may declare write capabilities (or a capability package "
+                    f"the operator opted in via write_chat_tools_allowed)."
                 )
 
         # Description / schema check

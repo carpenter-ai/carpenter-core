@@ -65,6 +65,12 @@ class RegisteredPackage:
     template_names: tuple[str, ...] = ()
     artifact_counts: dict = field(default_factory=dict)
     load_errors: tuple[str, ...] = ()
+    # Write-capable chat tools that were SKIPPED because the operator did
+    # not opt this package in (``write_chat_tools_allowed=False``).  These
+    # are surfaced for observability — NOT errors.  Empty when the package
+    # ships no write chat tools or the operator opted in (then they appear
+    # in ``chat_tool_names`` instead).
+    gated_chat_tool_names: tuple[str, ...] = ()
 
 
 def default_install_paths() -> list[Path]:
@@ -237,12 +243,26 @@ class PackageRegistry:
     def _register_chat_tools(
         self,
         manifest: PackageManifest,
-    ) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        *,
+        write_chat_tools_allowed: bool = False,
+    ) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
         """Import the package's chat-tool modules and register decorated funcs.
 
-        Returns ``(registered_names, errors)``.  ``errors`` is non-fatal —
-        the package still counts as loaded (so ``list_packages`` shows
-        partial load), but missing tools are logged.
+        Returns ``(registered_names, gated_names, errors)``.  ``errors`` is
+        non-fatal — the package still counts as loaded (so ``list_packages``
+        shows partial load), but missing tools are logged.  ``gated_names``
+        are write-capable chat tools that were SKIPPED because the operator
+        did not opt the package in (``write_chat_tools_allowed=False``); they
+        are surfaced in the package's load summary, NOT as fatal errors.
+
+        Args:
+            write_chat_tools_allowed: When ``True`` (operator opted this
+                package in at install time), the package's write-capable
+                chat-boundary tools ARE registered.  When ``False`` (the
+                default — chat agent is read-only), those tools are
+                gracefully SKIPPED (logged + surfaced as gated), while the
+                package's read-only chat tools still register normally.
+                Platform-boundary tools are hard-refused regardless.
 
         Trust-model invariants enforced here (in addition to the
         manifest-level checks done in ``security.py``):
@@ -269,10 +289,11 @@ class PackageRegistry:
           shadow ``escalate`` and the operator would never know.
         """
         from ..chat_tool_loader import register_extension_tool, _loaded_tools
-        from ..chat_tool_registry import PLATFORM_TOOLS
+        from ..chat_tool_registry import PLATFORM_TOOLS, WRITE_CAPABILITIES
         from .loaders import _import_package_module
 
         registered: list[str] = []
+        gated: list[str] = []
         errors: list[str] = []
 
         for rel in manifest.chat_tools:
@@ -378,6 +399,28 @@ class PackageRegistry:
                     )
                     continue
 
+                # Operator-gated WRITE chat tools (I10 relaxation): the
+                # chat agent is read-only BY DEFAULT.  A package's chat-
+                # boundary tool that declares write capabilities is only
+                # registered when the operator explicitly opted this
+                # package in at install time.  Otherwise it is GRACEFULLY
+                # SKIPPED (logged + surfaced as gated in the load summary),
+                # NOT a fatal error that floods load_errors.
+                tool_write_caps = [
+                    c for c in meta["capabilities"]
+                    if c in WRITE_CAPABILITIES
+                ]
+                if tool_write_caps and not write_chat_tools_allowed:
+                    gated.append(tool_name)
+                    logger.info(
+                        "Package %r: gated chat tool %r (write caps: %s) "
+                        "not registered; operator did not opt in "
+                        "(write_chat_tools_allowed=false)",
+                        manifest.name, tool_name,
+                        ", ".join(sorted(tool_write_caps)),
+                    )
+                    continue
+
                 # IMPORTANT: ``always_available`` and ``requires_user_confirm``
                 # are platform-side decisions.  We deliberately ignore
                 # whatever the package's @chat_tool decorator declared
@@ -391,6 +434,7 @@ class PackageRegistry:
                         capabilities=meta["capabilities"],
                         always_available=False,
                         requires_user_confirm=False,
+                        allow_write_caps=write_chat_tools_allowed,
                     )
                 except ValueError as exc:
                     errors.append(
@@ -405,7 +449,7 @@ class PackageRegistry:
 
                 registered.append(tool_name)
 
-        return tuple(registered), tuple(errors)
+        return tuple(registered), tuple(gated), tuple(errors)
 
     def discover_and_register(
         self,
@@ -571,10 +615,35 @@ class PackageRegistry:
                             template_names=existing.template_names,
                             artifact_counts=existing.artifact_counts,
                             load_errors=existing.load_errors + (err_msg,),
+                            gated_chat_tool_names=existing.gated_chat_tool_names,
                         )
                 continue
 
-            registered_names, errors = self._register_chat_tools(manifest)
+            # Per-package operator opt-in for WRITE chat tools.  Read the
+            # install record's ``write_chat_tools_allowed`` flag — the
+            # authoritative record of operator consent.  Without a DB
+            # connection we cannot prove consent, so we fail-closed
+            # (treat as not-opted-in; write chat tools are gated off).
+            write_allowed = False
+            if db_conn is not None:
+                try:
+                    from .installer import (
+                        write_chat_tools_allowed_for_package,
+                    )
+                    write_allowed = write_chat_tools_allowed_for_package(
+                        db_conn, manifest.name,
+                    )
+                except Exception:  # pragma: no cover — defensive
+                    logger.exception(
+                        "Package %r: could not read write_chat_tools_allowed "
+                        "flag; defaulting to gated-off (read-only)",
+                        manifest.name,
+                    )
+                    write_allowed = False
+
+            registered_names, gated_names, errors = self._register_chat_tools(
+                manifest, write_chat_tools_allowed=write_allowed,
+            )
 
             # D24 stage 3b: load arc templates, JUDGE handlers, data
             # models, and step handlers from the package.  Each loader
@@ -641,6 +710,7 @@ class PackageRegistry:
                 template_names=template_names,
                 artifact_counts=artifact_counts,
                 load_errors=errors,
+                gated_chat_tool_names=gated_names,
             )
             with self._lock:
                 self._packages[manifest.name] = entry
@@ -651,13 +721,22 @@ class PackageRegistry:
                 )
                 or "no D24 artifacts"
             )
+            if gated_names:
+                logger.warning(
+                    "Package %r: %d write-capable chat tool(s) GATED "
+                    "(requires operator opt-in; not registered): %s",
+                    manifest.name, len(gated_names),
+                    ", ".join(gated_names),
+                )
             logger.info(
                 "Loaded capability package %r v%s from %s "
-                "(%d chat tool(s); %s%s)",
+                "(%d chat tool(s)%s; %s%s)",
                 manifest.name,
                 manifest.version,
                 manifest.source_path,
                 len(registered_names),
+                f", {len(gated_names)} gated (operator opt-in required)"
+                if gated_names else "",
                 artifact_summary,
                 f"; {len(errors)} non-fatal error(s)" if errors else "",
             )
@@ -675,7 +754,18 @@ class PackageRegistry:
             from ..chat_tool_registry import validate_tool_defs
 
             all_tools = list(_loaded_tools.values())
-            validation_errors = validate_tool_defs(all_tools)
+            # The per-package write-gate was already enforced at
+            # registration time (write-cap chat tools only reach
+            # ``_loaded_tools`` for an opted-in package; gated ones are
+            # skipped).  This cross-package pass exists to catch
+            # collisions / duplicates / platform-boundary / unknown-cap
+            # issues across the merged set, NOT to re-litigate the write
+            # gate — so we pass ``write_chat_tools_allowed=True`` to avoid
+            # falsely flagging a legitimately opted-in package's write
+            # chat tools.
+            validation_errors = validate_tool_defs(
+                all_tools, write_chat_tools_allowed=True,
+            )
             if validation_errors:
                 for verr in validation_errors:
                     logger.error(
@@ -701,6 +791,7 @@ class PackageRegistry:
                                 template_names=pkg.template_names,
                                 artifact_counts=pkg.artifact_counts,
                                 load_errors=pkg.load_errors + tuple(relevant),
+                                gated_chat_tool_names=pkg.gated_chat_tool_names,
                             )
         except Exception:  # pragma: no cover — defensive
             logger.exception(
