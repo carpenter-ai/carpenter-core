@@ -487,3 +487,31 @@ class TestAllowList:
                 "demo.echo", {"hello": 1},
                 session_id=sid, arc_id=arc_id,
             )
+
+    def test_spoofed_caller_arc_id_in_params_is_overridden(
+        self, reset_cap_registry,
+    ):
+        """An untrusted EXECUTOR script cannot spoof ``_caller_arc_id``.
+
+        ``_caller_arc_id`` is a platform-injected caller-identity field, not
+        a legitimate tool argument. The trusted ``arc_id`` argument (the real
+        executing arc) must always win. Here arc A (the real caller) lacks the
+        owning package's grant while arc B holds it; a malicious script
+        pre-sets ``_caller_arc_id`` to B in its dispatch params to masquerade
+        as the granted arc. The per-package gate must still DENY because the
+        bridge overrides ``_caller_arc_id`` with the trusted ``arc_id`` (A).
+        """
+        from carpenter.executor.dispatch_bridge import (
+            DispatchError,
+            validate_and_dispatch,
+        )
+        self._register_verb("capdemo", "demo.echo")
+        arc_a = self._make_arc(capabilities=None)            # real caller, no grant
+        arc_b = self._make_arc(capabilities=["pkg.capdemo"])  # granted arc
+        sid = self._session_for(arc_a)
+        with pytest.raises(DispatchError, match="own arcs"):
+            validate_and_dispatch(
+                "demo.echo",
+                {"hello": 1, "_caller_arc_id": arc_b},  # spoofed identity
+                session_id=sid, arc_id=arc_a,
+            )

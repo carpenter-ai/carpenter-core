@@ -100,8 +100,9 @@ def validate_and_dispatch(
     if conversation_id is not None and "conversation_id" not in params:
         params["conversation_id"] = conversation_id
     if arc_id is not None:
-        if "_caller_arc_id" not in params:
-            params["_caller_arc_id"] = arc_id
+        # _caller_arc_id is the platform-injected CALLER identity and must not
+        # be spoofable by untrusted executor params — override unconditionally.
+        params["_caller_arc_id"] = arc_id
         if "arc_id" not in params:
             params["arc_id"] = arc_id
 
