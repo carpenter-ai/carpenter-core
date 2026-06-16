@@ -200,6 +200,12 @@ class PackageRegistry:
             get_handler_registry().reset()
         except Exception:  # pragma: no cover — defensive
             logger.exception("PackageRegistry.reset: handler reset failed")
+        # Package-capability framework: drop registered trusted verbs too.
+        try:
+            from .capabilities import get_capability_registry
+            get_capability_registry().reset()
+        except Exception:  # pragma: no cover — defensive
+            logger.exception("PackageRegistry.reset: capability reset failed")
 
     def _discover_manifests(
         self,
@@ -588,6 +594,44 @@ class PackageRegistry:
                 errors = errors + (
                     f"artifact loader raised: {type(exc).__name__}: {exc}",
                 )
+
+            # Package-capability framework: register the package's GRANTED
+            # trusted dispatch verbs.  Only verbs recorded as granted in
+            # the install record (operator-confirmed at install time) are
+            # registered; declared-but-not-confirmed verbs are skipped.
+            # Requires the DB to read the grant record — without it we
+            # cannot prove the operator consented, so we register nothing
+            # (fail-closed).
+            if manifest.platform_capabilities:
+                if db_conn is None:
+                    logger.warning(
+                        "Package %r declares platform capabilities but no "
+                        "DB connection was provided; cannot verify grants, "
+                        "registering none",
+                        manifest.name,
+                    )
+                else:
+                    try:
+                        from .installer import granted_verbs_for_package
+                        from .loaders import load_platform_capabilities
+                        granted = granted_verbs_for_package(
+                            db_conn, manifest.name,
+                        )
+                        cap_n, cap_errs = load_platform_capabilities(
+                            manifest, granted_verbs=granted,
+                        )
+                        errors = errors + tuple(cap_errs)
+                        if cap_n:
+                            artifact_counts["platform_capabilities"] = cap_n
+                    except Exception as exc:  # pragma: no cover — defensive
+                        logger.exception(
+                            "Package %r: capability loader raised: %s",
+                            manifest.name, exc,
+                        )
+                        errors = errors + (
+                            f"capability loader raised: "
+                            f"{type(exc).__name__}: {exc}",
+                        )
 
             entry = RegisteredPackage(
                 manifest=manifest,

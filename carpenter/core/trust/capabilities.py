@@ -67,7 +67,17 @@ def get_arc_capabilities(arc_id: int) -> set[str]:
 
 
 def resolve_capability_tools(capabilities: set[str]) -> frozenset[str]:
-    """Resolve a set of capabilities to the union of their granted tools."""
+    """Resolve a set of capabilities to the union of their granted tools.
+
+    Static capability → tool grants come from :data:`CAPABILITY_TOOL_GRANTS`.
+    In addition, a per-package capability grant (``pkg.<name>``, issued to
+    a package's own arcs by the package-capability framework) resolves to
+    that package's registered trusted dispatch verbs — so an arc carrying
+    the grant may invoke its package's verbs through the agent-type
+    whitelist path.  The verbs themselves are still gated per-package in
+    the dispatch bridge (fail-closed); this only widens the agent-type
+    allow-list for arcs that legitimately hold the grant.
+    """
     if not capabilities:
         return frozenset()
     granted: set[str] = set()
@@ -75,4 +85,15 @@ def resolve_capability_tools(capabilities: set[str]) -> frozenset[str]:
         tools = CAPABILITY_TOOL_GRANTS.get(cap)
         if tools:
             granted |= tools
+        # Per-package capability grant → that package's registered verbs.
+        if cap.startswith("pkg."):
+            package_name = cap[len("pkg."):]
+            if package_name:
+                try:
+                    from ...packages.capabilities import get_capability_registry
+                    granted |= set(
+                        get_capability_registry().verbs_for_package(package_name)
+                    )
+                except ImportError:  # pragma: no cover — defensive
+                    pass
     return frozenset(granted)

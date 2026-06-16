@@ -397,6 +397,123 @@ def load_judge_handlers(
     return registered, errors
 
 
+# ── Platform capabilities (TRUSTED dispatch verbs) ─────────────────
+
+
+def load_platform_capabilities(
+    manifest: PackageManifest,
+    *,
+    granted_verbs: frozenset[str],
+) -> tuple[int, list[str]]:
+    """Register the package's GRANTED trusted capability verbs.
+
+    Mirrors :func:`load_judge_handlers`: at startup, AFTER SD6 verify,
+    for each ``platform_capabilities`` entry whose ``verb`` is in
+    ``granted_verbs`` (i.e. the operator confirmed it at install time and
+    the install record recorded the grant), import the handler module via
+    :func:`_import_package_module` (hash-pinned tree, synthetic
+    ``_carpenter_pkg_`` namespace) and register the verb on the process-
+    wide capability registry as a wrapped ``handler(params, ctx)``.
+
+    Capabilities NOT in ``granted_verbs`` are deliberately skipped — a
+    declared-but-not-confirmed capability is never registered, so its verb
+    is not dispatchable.  This is the trust boundary: registration is
+    gated on the recorded grant, not merely on declaration.
+
+    The egress host is resolved PLATFORM-SIDE here (from the package's
+    declared credential, ``grant.host_from``) and baked into the
+    registration so the handler's :class:`CapabilityContext` carries the
+    confirmed host; the untrusted executor can never influence it.
+
+    Returns ``(registered_count, errors)``.  Errors do not abort the rest
+    of the package load (stage-3a's pattern).
+    """
+    if not manifest.platform_capabilities:
+        return 0, []
+    from .capabilities import (
+        CapabilityError,
+        _resolve_platform_secret,
+        get_capability_registry,
+    )
+
+    pkg_root = manifest.source_path
+    registry = get_capability_registry()
+    registered = 0
+    errors: list[str] = []
+
+    for cap in manifest.platform_capabilities:
+        if cap.verb not in granted_verbs:
+            # Declared but not granted/confirmed — never register.
+            logger.info(
+                "platform_capabilities: verb %r (package %r) declared but "
+                "not granted; skipping registration",
+                cap.verb, manifest.name,
+            )
+            continue
+        # Resolve the confirmed egress host platform-side from the
+        # package's credential.  The full env var is
+        # f"{credential_ref}_{host_from}".
+        host_key = f"{cap.grant.credential_ref}_{cap.grant.host_from}"
+        host = _resolve_platform_secret(host_key)
+        if not host:
+            errors.append(
+                f"platform_capabilities: verb {cap.verb!r}: egress host "
+                f"credential {host_key!r} is not set platform-side; "
+                f"capability not registered (provide the credential and "
+                f"restart)",
+            )
+            continue
+        try:
+            module = _import_package_module(
+                manifest.name, cap.module, pkg_root,
+            )
+        except ImportError as exc:
+            errors.append(
+                f"platform_capabilities: verb {cap.verb!r}: could not "
+                f"import {cap.module!r}: {exc}",
+            )
+            continue
+        handler = getattr(module, cap.handler, None)
+        if handler is None or not callable(handler):
+            errors.append(
+                f"platform_capabilities: verb {cap.verb!r}: handler "
+                f"{cap.module}:{cap.handler} is not callable",
+            )
+            continue
+        try:
+            registry.register(
+                package_name=manifest.name,
+                verb=cap.verb,
+                kind=cap.kind,
+                handler=handler,
+                grant=cap.grant,
+                host=host,
+            )
+        except CapabilityError as exc:
+            errors.append(f"platform_capabilities: {exc}")
+            continue
+        # Platform-integrity tier: classify the handler module path as T1
+        # (trusted/platform-protected) so edits to it get careful-review
+        # treatment, even though it lives under the (otherwise T2) package
+        # install dir.  Best-effort — a failure here must not strand the
+        # verb registration.
+        try:
+            from ..security.platform_paths import (
+                register_trusted_capability_path,
+            )
+            rel = Path(*cap.module.split("."))
+            module_path = (pkg_root / rel).with_suffix(".py")
+            register_trusted_capability_path(str(module_path))
+        except Exception:  # noqa: BLE001 — defensive
+            logger.warning(
+                "Could not classify capability handler %r as T1; edits to "
+                "it may not get platform-review treatment",
+                cap.module, exc_info=True,
+            )
+        registered += 1
+    return registered, errors
+
+
 # ── Step handlers ───────────────────────────────────────────────────
 
 

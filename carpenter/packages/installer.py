@@ -45,6 +45,7 @@ from .manifest import (
     EnvCredentialRef,
     PackageManifest,
     ManifestError,
+    PlatformCapabilityRef,
     load_manifest,
 )
 from .security import PackageSecurityError, validate_manifest_security
@@ -102,6 +103,14 @@ class InstallResult:
     # out-of-band; install does NOT hard-fail on missing env creds
     # (mirrors the OAuth posture — creds are provided after install).
     env_credential_requests: tuple[dict, ...] = ()
+    # Package-capability framework: the TRUSTED platform-side dispatch
+    # verbs the operator confirmed (granted PLATFORM-LEVEL TRUST) at
+    # install time.  Each entry is a dict with ``verb``, ``kind``,
+    # ``module``, ``handler``, and a ``grant`` sub-dict (protocol, host
+    # env-var suffix, port, credential_ref).  Empty when the package
+    # declares no platform capabilities.  Only granted capabilities are
+    # later registered at load time.
+    platform_capabilities_granted: tuple[dict, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -226,7 +235,15 @@ CREATE TABLE IF NOT EXISTS installed_packages (
     -- entries themselves live in ``security_policies``; this column
     -- is provenance bookkeeping for the diff, NOT enforcement state
     -- (SD5: flat-global, no source_package column on the policy table).
-    allowlist_proposals_json TEXT
+    allowlist_proposals_json TEXT,
+    -- Package-capability framework: JSON array of the TRUSTED platform-
+    -- side dispatch verbs the operator confirmed (granted PLATFORM-LEVEL
+    -- TRUST) at install time.  This is ENFORCEMENT state: the load-time
+    -- registrar (``loaders.load_platform_capabilities``) registers ONLY
+    -- the verbs recorded here, so a declared-but-not-confirmed capability
+    -- is never dispatchable.  Each element is {verb, kind, module,
+    -- handler, grant{protocol, host_from, port, credential_ref}}.
+    platform_capabilities_json TEXT
 );
 """
 
@@ -261,7 +278,30 @@ def ensure_installer_tables(conn: sqlite3.Connection) -> None:
             "ALTER TABLE installed_packages "
             "ADD COLUMN allowlist_proposals_json TEXT",
         )
+    # Package-capability framework migration: older DBs lack the
+    # platform_capabilities_json column.
+    if "platform_capabilities_json" not in cols:
+        conn.execute(
+            "ALTER TABLE installed_packages "
+            "ADD COLUMN platform_capabilities_json TEXT",
+        )
     conn.commit()
+
+
+def _capability_to_dict(cap: PlatformCapabilityRef) -> dict:
+    """Serialise a granted capability ref for the install record / result."""
+    return {
+        "verb": cap.verb,
+        "kind": cap.kind,
+        "module": cap.module,
+        "handler": cap.handler,
+        "grant": {
+            "protocol": cap.grant.protocol,
+            "host_from": cap.grant.host_from,
+            "port": cap.grant.port,
+            "credential_ref": cap.grant.credential_ref,
+        },
+    }
 
 
 def _record_install(
@@ -272,6 +312,7 @@ def _record_install(
     install_path: Path,
     pkg_hash: str,
     installed_at: str,
+    granted_capabilities: tuple[PlatformCapabilityRef, ...] = (),
 ) -> None:
     """Write the install row + templates rows.
 
@@ -288,11 +329,14 @@ def _record_install(
         {"type": p.policy_type, "value": p.value}
         for p in manifest.allowlist_proposals
     ])
+    capabilities_payload = _json.dumps([
+        _capability_to_dict(c) for c in granted_capabilities
+    ])
     conn.execute(
         "INSERT OR REPLACE INTO installed_packages "
         "(name, version, hash, source_path, install_path, installed_at, "
-        "allowlist_proposals_json) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "allowlist_proposals_json, platform_capabilities_json) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         (
             manifest.name,
             manifest.version,
@@ -301,6 +345,7 @@ def _record_install(
             str(install_path),
             installed_at,
             proposals_payload,
+            capabilities_payload,
         ),
     )
     # Refresh the templates join table for this package.
@@ -398,7 +443,7 @@ def get_install_record(
 ) -> dict | None:
     row = conn.execute(
         "SELECT name, version, hash, source_path, install_path, "
-        "installed_at, allowlist_proposals_json "
+        "installed_at, allowlist_proposals_json, platform_capabilities_json "
         "FROM installed_packages WHERE name = ?",
         (name,),
     ).fetchone()
@@ -412,13 +457,14 @@ def get_install_record(
         "install_path": row[4],
         "installed_at": row[5],
         "allowlist_proposals_json": row[6],
+        "platform_capabilities_json": row[7],
     }
 
 
 def list_install_records(conn: sqlite3.Connection) -> list[dict]:
     rows = conn.execute(
         "SELECT name, version, hash, source_path, install_path, "
-        "installed_at, allowlist_proposals_json "
+        "installed_at, allowlist_proposals_json, platform_capabilities_json "
         "FROM installed_packages ORDER BY name"
     ).fetchall()
     return [
@@ -427,9 +473,50 @@ def list_install_records(conn: sqlite3.Connection) -> list[dict]:
             "source_path": r[3], "install_path": r[4],
             "installed_at": r[5],
             "allowlist_proposals_json": r[6],
+            "platform_capabilities_json": r[7],
         }
         for r in rows
     ]
+
+
+def list_granted_capabilities(
+    conn: sqlite3.Connection, name: str,
+) -> list[dict]:
+    """Return the granted platform-capability records for an installed package.
+
+    Reads the ``platform_capabilities_json`` column written at install
+    time.  Each element is ``{verb, kind, module, handler, grant{...}}``.
+    Returns ``[]`` if the package is not installed, granted no
+    capabilities, or the column is NULL / malformed.
+
+    This is the authoritative source of which verbs the loader may
+    register — it reflects the operator's confirmation, not the manifest
+    declaration.
+    """
+    record = get_install_record(conn, name)
+    if record is None:
+        return []
+    raw = record.get("platform_capabilities_json")
+    if not raw:
+        return []
+    import json as _json
+    try:
+        items = _json.loads(raw)
+    except (ValueError, TypeError):
+        return []
+    if not isinstance(items, list):
+        return []
+    return [it for it in items if isinstance(it, dict) and it.get("verb")]
+
+
+def granted_verbs_for_package(
+    conn: sqlite3.Connection, name: str,
+) -> frozenset[str]:
+    """Return the set of granted capability verbs for an installed package."""
+    return frozenset(
+        c["verb"] for c in list_granted_capabilities(conn, name)
+        if isinstance(c.get("verb"), str)
+    )
 
 
 # ── Atomic copy ─────────────────────────────────────────────────────
@@ -1052,6 +1139,125 @@ def _request_env_credentials(manifest: PackageManifest) -> tuple[dict, ...]:
     return tuple(requests)
 
 
+# ── Platform-capability trust acknowledgment ───────────────────────
+
+
+def _describe_capability(cap: PlatformCapabilityRef) -> str:
+    """One-line operator-facing description of a capability + its scope."""
+    g = cap.grant
+    host_var = f"{g.credential_ref}_{g.host_from}"
+    return (
+        f"  • verb {cap.verb!r} (kind={cap.kind}) — TRUSTED handler "
+        f"{cap.module}:{cap.handler}\n"
+        f"      egress: {g.protocol}://<{host_var}>:{g.port}  "
+        f"credential: {g.credential_ref}_*"
+    )
+
+
+def confirm_platform_capabilities(
+    manifest: PackageManifest,
+    *,
+    prompt_stream=None,
+    input_fn=None,
+) -> tuple[PlatformCapabilityRef, ...]:
+    """Obtain INTERACTIVE operator consent to grant platform-level trust.
+
+    If the manifest declares no ``platform_capabilities`` this is a no-op
+    returning ``()``.  Otherwise:
+
+    * If not running interactively (no tty on stdin), raise
+      :class:`InstallError` with a nonzero-exit-worthy message — a
+      non-interactive install MUST NOT auto-grant platform-level trust.
+    * Otherwise print a clear notice that installing GRANTS PLATFORM-LEVEL
+      TRUST, list each capability + its scope (verb, egress host:port,
+      credential), and require an explicit affirmative (``yes``).  Any
+      other response declines and returns ``()`` (nothing granted).
+
+    Args:
+        manifest: The package manifest.
+        prompt_stream: Stream to print the prompt to (default stderr).
+        input_fn: Callable returning the operator's typed response
+            (default :func:`input`).  Both are injectable for tests.
+
+    Returns:
+        The tuple of confirmed capabilities (all-or-nothing: an
+        affirmative grants every declared capability; a decline grants
+        none).
+    """
+    caps = manifest.platform_capabilities
+    if not caps:
+        return ()
+
+    import sys as _sys
+    stream = prompt_stream if prompt_stream is not None else _sys.stderr
+
+    # Non-interactive guard: refuse to auto-grant platform-level trust.
+    # We treat "interactive" as stdin being a tty.  A test injects
+    # ``input_fn`` AND treats that as explicitly interactive.
+    interactive = input_fn is not None or (
+        hasattr(_sys.stdin, "isatty") and _sys.stdin.isatty()
+    )
+    if not interactive:
+        raise InstallError(
+            f"Package {manifest.name!r} declares {len(caps)} platform "
+            f"capability(ies) which would grant PLATFORM-LEVEL TRUST "
+            f"(trusted parent-side handlers with egress + credentials). "
+            f"This requires an interactive confirmation and cannot be "
+            f"auto-granted in a non-interactive install. Re-run "
+            f"interactively to confirm, or remove the platform_capabilities "
+            f"from the manifest.",
+        )
+
+    ask = input_fn if input_fn is not None else input
+    lines = [
+        "",
+        "=" * 72,
+        f"  SECURITY: package {manifest.name!r} requests PLATFORM-LEVEL TRUST",
+        "=" * 72,
+        "",
+        "  Installing this package will register TRUSTED, platform-side",
+        "  dispatch-verb handlers. These run with the platform's egress and",
+        "  credentials — a DIFFERENT trust class than the package's sandboxed",
+        "  executor scripts. Trusted handler code CANNOT be sandboxed.",
+        "",
+        "  Capabilities requested:",
+    ]
+    for cap in caps:
+        lines.append(_describe_capability(cap))
+    lines += [
+        "",
+        "  Granting trust means you have reviewed this package's handler",
+        "  code and accept that it runs with platform privileges.",
+        "",
+    ]
+    print("\n".join(lines), file=stream)
+
+    try:
+        response = ask(
+            f"Grant platform-level trust to {manifest.name!r}? Type 'yes' "
+            f"to confirm: ",
+        )
+    except EOFError:
+        # stdin closed mid-prompt — treat as decline (fail-closed).
+        response = ""
+
+    if isinstance(response, str) and response.strip().lower() == "yes":
+        logger.warning(
+            "Operator GRANTED platform-level trust to package %r "
+            "(%d capability(ies): %s)",
+            manifest.name, len(caps),
+            ", ".join(c.verb for c in caps),
+        )
+        return tuple(caps)
+
+    logger.info(
+        "Operator DECLINED platform-level trust for package %r; "
+        "no capabilities granted",
+        manifest.name,
+    )
+    return ()
+
+
 # ── Install / uninstall / verify ────────────────────────────────────
 
 
@@ -1060,6 +1266,8 @@ def install_package(
     dest_path: Path | str,
     *,
     conn: sqlite3.Connection,
+    capability_input_fn=None,
+    capability_prompt_stream=None,
 ) -> InstallResult:
     """Validate, hash, and install a capability package.
 
@@ -1113,6 +1321,19 @@ def install_package(
             f"manifest name {manifest.name!r}",
         )
 
+    # Package-capability framework: obtain INTERACTIVE operator consent to
+    # grant PLATFORM-LEVEL TRUST *before* we touch the dest.  This raises
+    # InstallError on a non-interactive install that would grant trust
+    # (never auto-grant); a decline returns () so nothing is recorded as
+    # granted (the package still installs, but its capability verbs are
+    # never registered).  Done before materialization so a refusal leaves
+    # the destination untouched.
+    granted_capabilities = confirm_platform_capabilities(
+        manifest,
+        prompt_stream=capability_prompt_stream,
+        input_fn=capability_input_fn,
+    )
+
     pkg_hash = compute_package_hash(source_path)
 
     # Capture the prior install record (if any) BEFORE we mutate the DB,
@@ -1135,6 +1356,17 @@ def install_package(
             f"not match staged manifest {manifest.name!r}",
         )
 
+    # Re-bind the granted capabilities to the *installed* manifest objects
+    # so the recorded refs match the on-disk copy (the staged and
+    # installed manifests are byte-identical, but this keeps provenance
+    # consistent).  Match by verb; only verbs the operator confirmed are
+    # carried forward.
+    granted_verbs = {c.verb for c in granted_capabilities}
+    granted_installed_caps = tuple(
+        c for c in installed_manifest.platform_capabilities
+        if c.verb in granted_verbs
+    )
+
     installed_at = datetime.now(timezone.utc).isoformat()
     _record_install(
         conn,
@@ -1143,6 +1375,7 @@ def install_package(
         install_path=dest_path,
         pkg_hash=pkg_hash,
         installed_at=installed_at,
+        granted_capabilities=granted_installed_caps,
     )
 
     # B-full: merge the proposed allowlist additions into the platform's
@@ -1196,6 +1429,9 @@ def install_package(
         trigger_subscriptions_registered=subs_n,
         triggers_installed=triggers_n,
         env_credential_requests=env_cred_requests,
+        platform_capabilities_granted=tuple(
+            _capability_to_dict(c) for c in granted_installed_caps
+        ),
     )
 
 
@@ -1383,6 +1619,28 @@ def uninstall_package(
         )
     else:
         get_handler_registry().unregister_package(name)
+
+    # Package-capability framework: drop the package's registered trusted
+    # dispatch verbs so the dispatch path stops routing to handler code
+    # that no longer exists.
+    try:
+        from .capabilities import get_capability_registry
+    except ImportError:
+        logger.warning(
+            "capabilities registry unavailable; skipping capability "
+            "cleanup on uninstall of %r", name,
+        )
+    else:
+        get_capability_registry().unregister_package(name)
+
+    # Drop the package's T1 trusted-capability-handler path classifications.
+    try:
+        from ..security.platform_paths import (
+            unregister_trusted_capability_paths_under,
+        )
+        unregister_trusted_capability_paths_under(str(install_path))
+    except ImportError:
+        pass
 
     logger.info(
         "Uninstalled capability package %r (path %s)", name, install_path,

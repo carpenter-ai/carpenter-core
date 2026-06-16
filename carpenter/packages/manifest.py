@@ -138,6 +138,12 @@ _OPTIONAL_FIELDS = frozenset({
     # (currently only OAuth 2.0 authorization-code).  See
     # _parse_credentials below.
     "credential_requirements",
+    # Package-capability framework: packages may contribute TRUSTED,
+    # platform-side dispatch-verb handlers (e.g. IMAP/SMTP egress).
+    # Installing such a package grants PLATFORM-LEVEL TRUST and requires
+    # an interactive operator confirmation at install time.  See
+    # _parse_platform_capabilities below.
+    "platform_capabilities",
 })
 _ALLOWED_FIELDS = _REQUIRED_FIELDS | _OPTIONAL_FIELDS
 
@@ -288,6 +294,74 @@ class EnvCredentialRef:
 
 
 @dataclass(frozen=True)
+class EgressGrant:
+    """The egress scope an operator confirms for an ``egress`` capability.
+
+    Describes exactly which network endpoint a trusted capability handler
+    is permitted to reach, and which credential it resolves.  Every field
+    is bound at install time and surfaced in the operator confirmation
+    prompt; the handler is given these values via its
+    :class:`CapabilityContext` and may NOT widen them at runtime.
+
+    Attributes:
+        protocol: Free-form protocol tag (e.g. ``"imap"``, ``"smtp"``).
+            Lowercase ``[a-z][a-z0-9_.\\-]*``.
+        host_from: The env-var suffix (NOT the value) that supplies the
+            egress host.  The full env var is
+            ``f"{credential_ref}'s prefix}_{host_from}"`` — i.e. the host
+            is bound from the package's own ``kind: env`` credential so
+            the operator confirms a concrete host:port at install time and
+            the handler can never point egress somewhere else.  An
+            ``UPPER_SNAKE`` suffix.
+        port: TCP port (1..65535).
+        credential_ref: ``env_key_prefix`` of the package's declared
+            ``kind: env`` credential.  Used by
+            :meth:`CapabilityContext.secret` to resolve credential values
+            platform-side; the value is NEVER exposed to the executor.
+    """
+
+    protocol: str
+    host_from: str
+    port: int
+    credential_ref: str
+
+
+@dataclass(frozen=True)
+class PlatformCapabilityRef:
+    """A package-declared TRUSTED platform-side dispatch-verb handler.
+
+    Installing a package that declares any platform capability grants
+    PLATFORM-LEVEL TRUST: the named handler runs parent-side with
+    egress/credentials, in a different trust class than the package's
+    untrusted EXECUTOR scripts.  The framework's job is declaration +
+    consent + scoping + registration + integrity-gating — NOT sandboxing
+    the handler (trusted code cannot be sandboxed).
+
+    Attributes:
+        verb: The dispatch verb to register (e.g. ``"imap.fetch"``).
+            Shape ``[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)+`` — at least one
+            dotted segment, matching the ``namespace.verb`` convention of
+            the built-in dispatch verbs.  Must not collide with a built-in
+            ``PLATFORM_TOOLS`` name or with another entry.
+        kind: Capability kind.  ``"egress"`` today; the schema is designed
+            so other kinds (``"db"``, ...) slot in later with their own
+            grant shape.
+        module: Python import path within the package (``handlers.imap``)
+            resolved like ``judge_handlers`` via ``_import_package_module``.
+        handler: Name of the callable on that module providing the trusted
+            handler.  Invoked as ``handler(params: dict, ctx) -> dict``.
+        grant: The :class:`EgressGrant` (for ``kind: egress``) the operator
+            confirms.  Future kinds carry their own grant dataclass.
+    """
+
+    verb: str
+    kind: str
+    module: str
+    handler: str
+    grant: EgressGrant
+
+
+@dataclass(frozen=True)
 class SubscriptionRef:
     """A reference to a trigger subscription the package contributes.
 
@@ -384,6 +458,7 @@ class PackageManifest:
     credential_requirements: tuple[
         OAuthCredentialRef | EnvCredentialRef, ...
     ] = ()
+    platform_capabilities: tuple[PlatformCapabilityRef, ...] = ()
     source_path: Path = field(default_factory=Path)
 
 
@@ -895,6 +970,13 @@ def _parse_allowlist_proposals(
     return tuple(out)
 
 
+# Dispatch verb shape: dotted ``namespace.verb`` form (at least one dot),
+# each segment a lowercase identifier.  Matches the built-in verbs
+# (``web.get``, ``state.set``, ...) so package verbs read identically.
+_VERB_RE = re.compile(r"^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+$")
+# Protocol tag for egress grants — lowercase, dots/dashes/underscores ok.
+_PROTOCOL_RE = re.compile(r"^[a-z][a-z0-9_.\-]{0,31}$")
+
 _ENV_PREFIX_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
 # Env-var suffixes (``required_keys`` for ``kind: env``).  UPPER_SNAKE,
 # must start with a letter.  No length cap here — the prefix is the
@@ -1083,6 +1165,190 @@ def _parse_credentials(
     return tuple(out)
 
 
+def _parse_egress_grant(i: int, raw: Any) -> EgressGrant:
+    """Parse + validate the ``grant`` block of a ``kind: egress`` capability."""
+    if not isinstance(raw, dict):
+        raise ManifestError(
+            f"platform_capabilities[{i}].grant must be a mapping, got "
+            f"{type(raw).__name__}",
+        )
+    allowed_keys = {"protocol", "host_from", "port", "credential_ref"}
+    unknown = set(raw.keys()) - allowed_keys
+    if unknown:
+        raise ManifestError(
+            f"platform_capabilities[{i}].grant has unknown keys: "
+            f"{sorted(unknown)}; allowed: {sorted(allowed_keys)}",
+        )
+    missing = allowed_keys - set(raw.keys())
+    if missing:
+        raise ManifestError(
+            f"platform_capabilities[{i}].grant missing required keys: "
+            f"{sorted(missing)}",
+        )
+    protocol = raw.get("protocol")
+    if not isinstance(protocol, str) or not _PROTOCOL_RE.match(protocol):
+        raise ManifestError(
+            f"platform_capabilities[{i}].grant.protocol must match "
+            f"{_PROTOCOL_RE.pattern!r}, got {protocol!r}",
+        )
+    host_from = raw.get("host_from")
+    if not isinstance(host_from, str) or not _ENV_SUFFIX_RE.match(host_from):
+        raise ManifestError(
+            f"platform_capabilities[{i}].grant.host_from must be an "
+            f"UPPER_SNAKE env-var suffix matching {_ENV_SUFFIX_RE.pattern!r}, "
+            f"got {host_from!r}",
+        )
+    port = raw.get("port")
+    # bool is an int subclass — reject it explicitly so ``port: true``
+    # doesn't slip through as 1.
+    if not isinstance(port, int) or isinstance(port, bool) or not (
+        1 <= port <= 65535
+    ):
+        raise ManifestError(
+            f"platform_capabilities[{i}].grant.port must be an integer "
+            f"in 1..65535, got {port!r}",
+        )
+    credential_ref = raw.get("credential_ref")
+    if (
+        not isinstance(credential_ref, str)
+        or not _ENV_PREFIX_RE.match(credential_ref)
+    ):
+        raise ManifestError(
+            f"platform_capabilities[{i}].grant.credential_ref must match "
+            f"{_ENV_PREFIX_RE.pattern!r} (a kind:env env_key_prefix), got "
+            f"{credential_ref!r}",
+        )
+    return EgressGrant(
+        protocol=protocol,
+        host_from=host_from,
+        port=port,
+        credential_ref=credential_ref,
+    )
+
+
+def _parse_platform_capabilities(
+    raw_value: Any, *, source_path: Path,
+) -> tuple[PlatformCapabilityRef, ...]:
+    """Parse + validate the ``platform_capabilities`` manifest section.
+
+    Each entry declares one TRUSTED dispatch-verb handler the package
+    contributes.  Validation:
+
+    * ``verb`` matches the dotted ``namespace.verb`` shape, does NOT
+      collide with a built-in ``PLATFORM_TOOLS`` name, and is unique
+      within this manifest.
+    * ``kind`` is a recognised capability kind (only ``egress`` today).
+    * ``module``/``handler`` are present and well-formed; the module
+      resolves to a ``.py`` file under the package root (mirrors
+      ``judge_handlers``).
+    * ``grant`` is well-formed for the declared kind.
+
+    Reject unknown top-level keys (consistent with other sections).
+
+    The cross-field check that every ``egress`` grant's ``credential_ref``
+    names a declared ``kind: env`` credential is done in
+    :func:`_parse_manifest_dict` once both sections are parsed.
+    """
+    items = _ensure_list_of_dict(raw_value, "platform_capabilities")
+    if not items:
+        return ()
+    # Lazy import keeps the manifest module's import surface minimal and
+    # lets tests stub the registry if needed.
+    try:
+        from ..chat_tool_registry import PLATFORM_TOOLS
+    except ImportError:  # pragma: no cover — defensive
+        PLATFORM_TOOLS = frozenset()  # type: ignore[assignment]
+    # Also reject collisions with the built-in dispatch verbs (``web.get``,
+    # ``state.set``, ...) — those ARE dotted and are the realistic
+    # shadowing target.  Soft-import so the manifest layer stays usable in
+    # stripped/test builds without the full API stack.
+    try:
+        from ..api.callbacks import _DISPATCH as _BUILTIN_DISPATCH
+        builtin_verbs = frozenset(_BUILTIN_DISPATCH.keys())
+    except Exception:  # noqa: BLE001 — defensive
+        builtin_verbs = frozenset()
+    reserved_verbs = PLATFORM_TOOLS | builtin_verbs
+
+    allowed_keys = {"verb", "kind", "module", "handler", "grant"}
+    known_kinds = {"egress"}
+    out: list[PlatformCapabilityRef] = []
+    seen_verbs: set[str] = set()
+    for i, item in enumerate(items):
+        unknown = set(item.keys()) - allowed_keys
+        if unknown:
+            raise ManifestError(
+                f"platform_capabilities[{i}] has unknown keys: "
+                f"{sorted(unknown)}; allowed: {sorted(allowed_keys)}",
+            )
+        missing = allowed_keys - set(item.keys())
+        if missing:
+            raise ManifestError(
+                f"platform_capabilities[{i}] missing required keys: "
+                f"{sorted(missing)}",
+            )
+        verb = item.get("verb")
+        if not isinstance(verb, str) or not _VERB_RE.match(verb):
+            raise ManifestError(
+                f"platform_capabilities[{i}].verb must match "
+                f"{_VERB_RE.pattern!r} (dotted namespace.verb), got {verb!r}",
+            )
+        if verb in reserved_verbs:
+            raise ManifestError(
+                f"platform_capabilities[{i}].verb {verb!r} collides with a "
+                f"built-in platform tool; capability verbs may not shadow "
+                f"platform tools",
+            )
+        if verb in seen_verbs:
+            raise ManifestError(
+                f"platform_capabilities: duplicate verb {verb!r}",
+            )
+        seen_verbs.add(verb)
+        kind = item.get("kind")
+        if kind not in known_kinds:
+            raise ManifestError(
+                f"platform_capabilities[{i}].kind must be one of "
+                f"{sorted(known_kinds)} (got {kind!r}); other kinds are "
+                f"reserved for future PRs",
+            )
+        module = _check_module_path(
+            "platform_capabilities", item.get("module"), i, key="module",
+        )
+        # The module must exist as a .py file under the package root
+        # (same existence guard as judge_handlers).
+        rel = Path(*module.split("."))
+        candidate = (source_path / rel).with_suffix(".py").resolve()
+        try:
+            candidate.relative_to(source_path.resolve())
+        except ValueError:
+            raise ManifestError(
+                f"platform_capabilities[{i}].module {module!r} resolves "
+                f"outside package root",
+            ) from None
+        if not candidate.is_file():
+            raise ManifestError(
+                f"platform_capabilities[{i}].module {module!r}: source file "
+                f"{candidate} not found",
+            )
+        handler = item.get("handler")
+        if not isinstance(handler, str) or not re.match(
+            r"^[A-Za-z_][A-Za-z0-9_]*$", handler,
+        ):
+            raise ManifestError(
+                f"platform_capabilities[{i}].handler must be a valid Python "
+                f"identifier, got {handler!r}",
+            )
+        # kind == "egress" — only kind today.
+        grant = _parse_egress_grant(i, item.get("grant"))
+        out.append(PlatformCapabilityRef(
+            verb=verb,
+            kind=kind,
+            module=module,
+            handler=handler,
+            grant=grant,
+        ))
+    return tuple(out)
+
+
 def _parse_manifest_dict(
     data: dict[str, Any], *, source_path: Path,
 ) -> PackageManifest:
@@ -1175,6 +1441,36 @@ def _parse_manifest_dict(
         data.get("allowlist_proposals"),
     )
     credentials = _parse_credentials(data.get("credential_requirements"))
+    platform_capabilities = _parse_platform_capabilities(
+        data.get("platform_capabilities"), source_path=source_path,
+    )
+
+    # Every egress capability's grant.credential_ref must name a declared
+    # ``kind: env`` credential, and grant.host_from must be one of that
+    # credential's required_keys — the host is bound from the package's own
+    # credential so the operator confirms a concrete host:port at install.
+    env_cred_prefixes = {
+        c.env_key_prefix: c
+        for c in credentials
+        if isinstance(c, EnvCredentialRef)
+    }
+    for i, cap in enumerate(platform_capabilities):
+        if cap.kind != "egress":
+            continue
+        ref = cap.grant.credential_ref
+        cred = env_cred_prefixes.get(ref)
+        if cred is None:
+            raise ManifestError(
+                f"platform_capabilities[{i}].grant.credential_ref {ref!r} "
+                f"does not name a declared kind:env credential "
+                f"(declared env prefixes: {sorted(env_cred_prefixes)})",
+            )
+        if cap.grant.host_from not in cred.required_keys:
+            raise ManifestError(
+                f"platform_capabilities[{i}].grant.host_from "
+                f"{cap.grant.host_from!r} is not one of credential "
+                f"{ref!r}'s required_keys {sorted(cred.required_keys)}",
+            )
 
     # Cross-field consistency checks for the new D24 fields.
     declared_kinds = set(data_models)
@@ -1222,6 +1518,7 @@ def _parse_manifest_dict(
         triggers=triggers,
         allowlist_proposals=allowlist_proposals,
         credential_requirements=credentials,
+        platform_capabilities=platform_capabilities,
         source_path=source_path,
     )
 

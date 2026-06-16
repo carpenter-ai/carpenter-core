@@ -1,0 +1,31 @@
+name: example_capability
+version: "0.1.0"
+description: |
+  Example capability package exercising the platform-capability framework.
+  Declares a trivial TRUSTED egress verb (example.echo) whose handler echoes
+  its params plus the operator-confirmed grant scope.  Used by the framework
+  test-suite; NOT a real IMAP/SMTP implementation.
+
+# A kind:env credential supplies the egress host (and a fake password) so the
+# capability's grant can bind host_from to a real declared key.
+credential_requirements:
+  - kind: env
+    provider: example
+    env_key_prefix: EXAMPLE_MAIL
+    required_keys:
+      - HOST
+      - PORT
+      - USERNAME
+      - PASSWORD
+
+# The TRUSTED platform-side dispatch verb this package contributes.
+platform_capabilities:
+  - verb: example.echo
+    kind: egress
+    module: handlers.echo
+    handler: handle_echo
+    grant:
+      protocol: example
+      host_from: HOST
+      port: 1234
+      credential_ref: EXAMPLE_MAIL
