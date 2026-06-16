@@ -278,7 +278,16 @@ def load_arc_templates(
             )
             continue
         try:
-            template_manager.load_template(str(yaml_path))
+            # Record the owning package on the template so instantiation
+            # can stamp the package's per-arc grant (``pkg.<name>``) onto
+            # every step arc — this is what lets the package's EXECUTOR
+            # arc invoke the package's registered trusted capability verbs
+            # through the per-package dispatch gate. Scoped to this
+            # package's own templates; platform/other-package arcs never
+            # receive the grant.
+            template_manager.load_template(
+                str(yaml_path), owner_package=manifest.name,
+            )
         except Exception as exc:  # noqa: BLE001 — surface to load_errors
             errors.append(
                 f"arc_templates: {tref.name!r}: load_template raised: {exc}",

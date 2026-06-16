@@ -182,6 +182,12 @@ CREATE TABLE IF NOT EXISTS workflow_templates (
     required_for_json TEXT,
     steps_json TEXT NOT NULL,
     version INTEGER DEFAULT 1,
+    -- Capability package that shipped this template, or NULL for
+    -- platform-shipped templates. When set, instantiating the template
+    -- stamps the owning package's per-arc grant (``pkg.<owner>``) onto
+    -- every step arc so the package's EXECUTOR can invoke the package's
+    -- registered trusted capability verbs (carpenter/packages/capabilities.py).
+    owner_package TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP
 );

@@ -1025,6 +1025,34 @@ def _migrate_arc_step_role(conn: sqlite3.Connection, tables: set[str]) -> None:
         conn.commit()
 
 
+def _migrate_template_owner_package(
+    conn: sqlite3.Connection, tables: set[str]
+) -> None:
+    """Add ``owner_package`` column on workflow_templates.
+
+    Records which capability package shipped a template. When set, the
+    template's instantiation stamps the owning package's per-arc grant
+    (``pkg.<owner>``) onto every step arc so the package's EXECUTOR can
+    invoke the package's registered trusted capability verbs. Platform-
+    shipped templates leave it NULL and receive no grant.
+
+    Idempotent: only adds the column when absent.
+    """
+    if "workflow_templates" not in tables:
+        return
+    cols = {
+        row[1]
+        for row in conn.execute(
+            "PRAGMA table_info(workflow_templates)"
+        ).fetchall()
+    }
+    if "owner_package" not in cols:
+        conn.execute(
+            "ALTER TABLE workflow_templates ADD COLUMN owner_package TEXT"
+        )
+        conn.commit()
+
+
 def run_migrations(conn: sqlite3.Connection) -> None:
     """Run all data migrations for existing databases.
 
@@ -1051,6 +1079,7 @@ def run_migrations(conn: sqlite3.Connection) -> None:
     _migrate_arc_retry_system(conn, tables)
     _migrate_model_selection(conn, tables)
     _migrate_templates_and_sentinel(conn, tables)
+    _migrate_template_owner_package(conn, tables)
     _drop_deprecated_skills_tables(conn, tables)
     _drop_reflection_tables(conn, tables)
     _migrate_trigger_event_pipeline(conn, tables)
