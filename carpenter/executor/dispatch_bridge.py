@@ -74,6 +74,25 @@ def validate_and_dispatch(
     """
     # Look up handler
     handler = _DISPATCH.get(tool_name)
+
+    # Package-contributed TRUSTED capability verb?  These are registered
+    # at load time from a package's ``platform_capabilities`` manifest
+    # section.  They are NOT in ``_DISPATCH``; they route through the
+    # capability registry, which builds the scoped CapabilityContext and
+    # binds host/creds to the operator-confirmed grant.  Permission to
+    # invoke is gated per-package below (the verb is allowed ONLY for arcs
+    # belonging to the package that registered it).
+    capability_verb = False
+    if handler is None:
+        from ..packages.capabilities import get_capability_registry
+        cap_registry = get_capability_registry()
+        if cap_registry.is_capability_verb(tool_name):
+            capability_verb = True
+            # Bind a per-call closure so the existing handler-invoke path
+            # (which calls ``handler(params)``) works unchanged.
+            def handler(p, _verb=tool_name, _reg=cap_registry):  # noqa: E731
+                return _reg.dispatch(_verb, p)
+
     if handler is None:
         raise DispatchError(f"Unknown tool: {tool_name}", status_code=404)
 
@@ -85,6 +104,42 @@ def validate_and_dispatch(
             params["_caller_arc_id"] = arc_id
         if "arc_id" not in params:
             params["arc_id"] = arc_id
+
+    # ── Package-capability gate (per-package, fail-closed) ──────────
+    # A package's registered capability verb is permitted ONLY for that
+    # package's own arcs.  An arc "belongs to" a package when it carries
+    # the package's grant capability (``pkg.<name>``) in its
+    # ``_capabilities`` arc_state.  This is enforced for EVERY caller
+    # regardless of agent type (EXECUTOR has ``allowed_tools=None`` and
+    # would otherwise be permitted any tool in the dispatch table) — the
+    # capability registry is the authoritative gate, fail-closed: no
+    # caller arc, or an arc lacking the owning package's grant, is denied.
+    if capability_verb:
+        from ..packages.capabilities import (
+            capability_grant_for_package,
+            get_capability_registry,
+        )
+        owner_pkg = get_capability_registry().package_for_verb(tool_name)
+        caller_arc_id = params.get("_caller_arc_id")
+        if caller_arc_id is None:
+            raise DispatchError(
+                f"Capability verb {tool_name!r} requires an arc context; "
+                f"it cannot be invoked from chat context",
+            )
+        required_cap = capability_grant_for_package(owner_pkg)
+        arc_caps = get_arc_capabilities(caller_arc_id)
+        if required_cap not in arc_caps:
+            log_trust_event(caller_arc_id, "access_denied", {
+                "tool": tool_name,
+                "reason": (
+                    f"capability verb permitted only for package "
+                    f"{owner_pkg!r} arcs (missing grant {required_cap!r})"
+                ),
+            })
+            raise DispatchError(
+                f"Capability verb {tool_name!r} is permitted only for "
+                f"package {owner_pkg!r}'s own arcs"
+            )
 
     # ── Session-gated tools (default-deny) ──────────────────────────
     if tool_name not in get_session_exempt_tools():

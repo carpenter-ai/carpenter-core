@@ -29,11 +29,61 @@ from __future__ import annotations
 import fnmatch
 import logging
 import os
+import threading
 from typing import Optional
 
 from .. import config as _config_module
 
 logger = logging.getLogger(__name__)
+
+
+# ── Package-capability trusted handler paths ─────────────────────────
+# The package-capability framework registers TRUSTED, platform-side
+# dispatch-verb handlers (e.g. IMAP/SMTP egress).  Those handler modules
+# run with platform privileges, so their on-disk paths must be classified
+# T1 (platform-protected) — edits get the same careful-review treatment as
+# the platform source tree, even though they live under the (otherwise T2)
+# package install dir.  The loader populates this set at registration time
+# via :func:`register_trusted_capability_path`; ``path_tier`` consults it
+# as an additional T1 source.  Process-local (re-registered at startup).
+_TRUSTED_CAPABILITY_PATHS: set[str] = set()
+_TRUSTED_CAPABILITY_LOCK = threading.Lock()
+
+
+def register_trusted_capability_path(path: str) -> None:
+    """Mark a package capability-handler module path as T1 (trusted).
+
+    Called by :func:`carpenter.packages.loaders.load_platform_capabilities`
+    when it registers a GRANTED capability verb.  The realpath is stored so
+    that subsequent :func:`path_tier` calls classify the handler module
+    (and edits to it) as platform-protected.
+    """
+    try:
+        real = os.path.realpath(os.path.expanduser(str(path)))
+    except Exception:  # noqa: BLE001
+        return
+    with _TRUSTED_CAPABILITY_LOCK:
+        _TRUSTED_CAPABILITY_PATHS.add(real)
+
+
+def unregister_trusted_capability_paths_under(install_dir: str) -> None:
+    """Drop any trusted-capability paths under ``install_dir`` (uninstall)."""
+    try:
+        real_dir = os.path.realpath(os.path.expanduser(str(install_dir)))
+    except Exception:  # noqa: BLE001
+        return
+    with _TRUSTED_CAPABILITY_LOCK:
+        to_drop = {
+            p for p in _TRUSTED_CAPABILITY_PATHS
+            if p == real_dir or p.startswith(real_dir + os.sep)
+        }
+        _TRUSTED_CAPABILITY_PATHS.difference_update(to_drop)
+
+
+def _match_trusted_capability(real: str) -> bool:
+    """Return True if *real* is a registered trusted-capability handler path."""
+    with _TRUSTED_CAPABILITY_LOCK:
+        return real in _TRUSTED_CAPABILITY_PATHS
 
 
 # ── Public tier constants ────────────────────────────────────────────────
@@ -255,6 +305,12 @@ def path_tier(path: str) -> str:
         )
         if t0_override is not None:
             return PATH_TIER_T0
+
+        # Package-capability framework: registered TRUSTED handler module
+        # paths are T1 (platform-protected), even though they live under
+        # the otherwise-T2 package install dir.
+        if _match_trusted_capability(real):
+            return PATH_TIER_T1
 
         # Hardcoded T1 prefixes (repo source tree).
         repo_root = _resolve_repo_root()
