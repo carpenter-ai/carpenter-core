@@ -624,7 +624,7 @@ class TestKbArticles:
             "index.md",
             "search.md",
         ):
-            path = email_pkg / "kb" / name
+            path = email_pkg / "kb" / "email" / name
             assert path.is_file(), f"missing {path}"
 
 
