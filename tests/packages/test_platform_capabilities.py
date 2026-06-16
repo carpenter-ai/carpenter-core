@@ -385,6 +385,130 @@ class TestCapabilityContext:
         with pytest.raises(CapabilityError, match="not set platform-side"):
             ctx.secret("NOPE")
 
+    def _imap_ctx(self, package_name="carpenter-imap-email"):
+        from carpenter.packages.capabilities import CapabilityContext
+        return CapabilityContext(
+            package_name=package_name, verb="imap.fetch", kind="egress",
+            protocol="imap", host="mail.example.com", port=993,
+            credential_ref="IMAP_EMAIL",
+        )
+
+    def _write_package_env(self, base_dir, package_name, body):
+        """Write a chmod-600 per-package .env under a tmp base_dir."""
+        pkg_dir = base_dir / "config" / "packages" / package_name
+        pkg_dir.mkdir(parents=True, exist_ok=True)
+        env_path = pkg_dir / ".env"
+        env_path.write_text(body, encoding="utf-8")
+        env_path.chmod(0o600)
+        return env_path
+
+    def test_secret_resolves_from_per_package_env(self, tmp_path, monkeypatch):
+        # The real-world case: env-credentialed package mailbox creds live
+        # in the per-package .env, NOT os.environ or the main config.
+        monkeypatch.delenv("IMAP_EMAIL_IMAP_USERNAME", raising=False)
+        monkeypatch.delenv("IMAP_EMAIL_IMAP_PASSWORD", raising=False)
+        monkeypatch.setattr(
+            "carpenter.config.CONFIG", {"base_dir": str(tmp_path)},
+        )
+        self._write_package_env(
+            tmp_path, "carpenter-imap-email",
+            "IMAP_EMAIL_IMAP_USERNAME=alice@example.com\n"
+            "IMAP_EMAIL_IMAP_PASSWORD=s3cr3t\n",
+        )
+        ctx = self._imap_ctx()
+        assert ctx.secret("IMAP_USERNAME") == "alice@example.com"
+        assert ctx.secret("IMAP_PASSWORD") == "s3cr3t"
+
+    def test_per_package_env_parses_comments_and_blanks(
+        self, tmp_path, monkeypatch,
+    ):
+        monkeypatch.delenv("IMAP_EMAIL_IMAP_USERNAME", raising=False)
+        monkeypatch.setattr(
+            "carpenter.config.CONFIG", {"base_dir": str(tmp_path)},
+        )
+        self._write_package_env(
+            tmp_path, "carpenter-imap-email",
+            "# mailbox credentials\n"
+            "\n"
+            "  IMAP_EMAIL_IMAP_USERNAME = bob@example.com  \n",
+        )
+        ctx = self._imap_ctx()
+        assert ctx.secret("IMAP_USERNAME") == "bob@example.com"
+
+    def test_per_package_env_isolation_across_packages(
+        self, tmp_path, monkeypatch,
+    ):
+        # A context for a DIFFERENT package must NOT read another package's
+        # per-package .env, even with the same credential_ref/key.
+        monkeypatch.delenv("IMAP_EMAIL_IMAP_USERNAME", raising=False)
+        monkeypatch.setattr(
+            "carpenter.config.CONFIG", {"base_dir": str(tmp_path)},
+        )
+        self._write_package_env(
+            tmp_path, "carpenter-imap-email",
+            "IMAP_EMAIL_IMAP_USERNAME=alice@example.com\n",
+        )
+        from carpenter.packages.capabilities import CapabilityError
+        other = self._imap_ctx(package_name="some-other-package")
+        with pytest.raises(CapabilityError, match="not set platform-side"):
+            other.secret("IMAP_USERNAME")
+
+    def test_os_environ_takes_precedence_over_per_package_env(
+        self, tmp_path, monkeypatch,
+    ):
+        # Existing behavior preserved: live process env wins.
+        monkeypatch.setattr(
+            "carpenter.config.CONFIG", {"base_dir": str(tmp_path)},
+        )
+        self._write_package_env(
+            tmp_path, "carpenter-imap-email",
+            "IMAP_EMAIL_IMAP_USERNAME=from-file@example.com\n",
+        )
+        monkeypatch.setenv("IMAP_EMAIL_IMAP_USERNAME", "from-env@example.com")
+        ctx = self._imap_ctx()
+        assert ctx.secret("IMAP_USERNAME") == "from-env@example.com"
+
+    def test_per_package_env_missing_key_raises(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("IMAP_EMAIL_IMAP_PASSWORD", raising=False)
+        monkeypatch.setattr(
+            "carpenter.config.CONFIG", {"base_dir": str(tmp_path)},
+        )
+        self._write_package_env(
+            tmp_path, "carpenter-imap-email",
+            "IMAP_EMAIL_IMAP_USERNAME=alice@example.com\n",
+        )
+        from carpenter.packages.capabilities import CapabilityError
+        ctx = self._imap_ctx()
+        with pytest.raises(CapabilityError, match="not set platform-side"):
+            ctx.secret("IMAP_PASSWORD")
+
+    def test_package_name_traversal_rejected(self, tmp_path, monkeypatch):
+        # A package_name containing path-traversal must never be used to
+        # build a path that escapes the per-package directory.  Plant a
+        # secret at a sibling location the traversal would reach and prove
+        # it is NOT read.
+        monkeypatch.delenv("IMAP_EMAIL_IMAP_USERNAME", raising=False)
+        monkeypatch.setattr(
+            "carpenter.config.CONFIG", {"base_dir": str(tmp_path)},
+        )
+        # Where "../victim/.env" from config/packages/ would land:
+        victim_dir = tmp_path / "config" / "victim"
+        victim_dir.mkdir(parents=True, exist_ok=True)
+        (victim_dir / ".env").write_text(
+            "IMAP_EMAIL_IMAP_USERNAME=leaked@example.com\n",
+        )
+        from carpenter.packages.capabilities import (
+            CapabilityError,
+            _package_env_path,
+        )
+        # The path builder rejects unsafe names outright.
+        assert _package_env_path("../victim") is None
+        assert _package_env_path("a/b") is None
+        assert _package_env_path("..") is None
+        ctx = self._imap_ctx(package_name="../victim")
+        with pytest.raises(CapabilityError, match="not set platform-side"):
+            ctx.secret("IMAP_USERNAME")
+
 
 # ── Allow-list: per-package arc scoping via dispatch bridge ─────────
 

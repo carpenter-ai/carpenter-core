@@ -12,8 +12,10 @@ Pieces that live here:
 
 * :class:`CapabilityContext` — the small, typed object handed to every
   trusted handler.  It exposes :meth:`CapabilityContext.secret` (resolve
-  the package's declared credential value *platform-side*, never from the
-  executor env) plus the confirmed grant fields (host/port/protocol).  It
+  the package's declared credential value *platform-side* — from the
+  process env, the package's OWN per-package ``.env``, or platform config,
+  never from the executor env) plus the confirmed grant fields
+  (host/port/protocol).  It
   binds the handler to its GRANTED scope: host and credentials come from
   here, never from handler ``params`` / the untrusted script.
 * :class:`CapabilityRegistry` — process-wide map of registered verbs
@@ -40,6 +42,7 @@ import os
 import re
 import threading
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable
 
 from .manifest import EgressGrant
@@ -49,6 +52,14 @@ logger = logging.getLogger(__name__)
 # UPPER_SNAKE credential-suffix shape — same convention as a kind:env
 # credential's ``required_keys`` (carpenter.packages.manifest._ENV_SUFFIX_RE).
 _SECRET_SUFFIX_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
+
+# A package name is used as a single path component to locate that
+# package's per-package ``.env``; it must be a safe path component (no
+# separators, no traversal, not a dot-dir).  This mirrors the package-name
+# shape enforced by the manifest loader, but we re-validate here because
+# the resolved path holds secrets and must never escape the per-package
+# directory.
+_PACKAGE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
 # A trusted capability handler is invoked as ``handler(params, ctx)`` and
@@ -114,10 +125,18 @@ class CapabilityContext:
 
         ``ref`` is an ``UPPER_SNAKE`` suffix of the package's declared
         ``kind: env`` credential (e.g. ``"PASSWORD"``); the full env var
-        is ``f"{self.credential_ref}_{ref}"``.  The value is read from the
-        platform process environment and the loaded platform config (which
-        layers in ``{base_dir}/.env`` for known credential keys) — NEVER
-        from the untrusted executor's environment.
+        is ``f"{self.credential_ref}_{ref}"``.  The value is resolved,
+        in order, from: the live platform process environment; the
+        package's OWN per-package ``.env`` at
+        ``{base_dir}/config/packages/{package_name}/.env`` (where
+        env-credentialed package secrets actually live, chmod 600); then
+        the loaded platform config (which layers in the MAIN
+        ``{base_dir}/.env`` for known credential keys).  Values are NEVER
+        read from the untrusted executor's environment.
+
+        The per-package ``.env`` is keyed strictly on ``self.package_name``
+        (set by the trusted loader from the manifest, never the executor),
+        so a handler can only ever read ITS OWN package's credentials.
 
         Raises:
             CapabilityError: if ``ref`` is malformed or the credential is
@@ -128,7 +147,7 @@ class CapabilityContext:
                 f"secret(): ref must be an UPPER_SNAKE suffix, got {ref!r}",
             )
         key = f"{self.credential_ref}_{ref}"
-        value = _resolve_platform_secret(key)
+        value = _resolve_platform_secret(key, package_name=self.package_name)
         if value is None:
             raise CapabilityError(
                 f"secret({ref!r}): credential {key!r} is not set "
@@ -137,19 +156,87 @@ class CapabilityContext:
         return value
 
 
-def _resolve_platform_secret(key: str) -> str | None:
-    """Resolve ``key`` from the platform process env / config, or None.
+def _package_env_path(package_name: str) -> Path | None:
+    """Return the per-package ``.env`` path, or None if unavailable.
 
-    Mirrors :func:`carpenter.packages.installer._env_key_is_set`'s
-    resolution order: live process environment first (the daemon mirrors
-    ``.env`` writes into ``os.environ``), then the loaded platform config
-    (which layers ``{base_dir}/.env`` for known credential keys).  This is
-    deliberately the PLATFORM environment, not anything the untrusted
-    executor can influence.
+    The path is ``{base_dir}/config/packages/{package_name}/.env`` where
+    ``base_dir`` comes from :data:`carpenter.config.CONFIG`.  ``package_name``
+    is validated as a single safe path component (no separators, no ``..``
+    traversal) BEFORE it is joined onto the base path, so a malformed or
+    hostile package name can never escape the per-package directory.
+    """
+    if not package_name or not _PACKAGE_NAME_RE.match(package_name):
+        # Reject names that are not a single safe path component
+        # (covers ``..``, ``/``, ``\``, leading dots, empty, etc.).
+        return None
+    try:
+        from .. import config
+    except ImportError:  # pragma: no cover — config always present in prod
+        return None
+    base_dir = config.CONFIG.get("base_dir")
+    if not base_dir:
+        return None
+    return Path(base_dir) / "config" / "packages" / package_name / ".env"
+
+
+def _read_package_env_value(package_name: str, key: str) -> str | None:
+    """Read ``key`` from a package's own per-package ``.env``, or None.
+
+    Parses the file as simple ``KEY=VALUE`` lines (strip whitespace, skip
+    blank lines and ``#`` comments, split on the first ``=``).  Never logs
+    secret values; on any read error returns None (the caller treats a
+    missing value as "not set platform-side").
+    """
+    env_path = _package_env_path(package_name)
+    if env_path is None:
+        return None
+    try:
+        if not env_path.is_file():
+            return None
+        text = env_path.read_text(encoding="utf-8")
+    except OSError as exc:  # pragma: no cover — permissions / IO edge
+        logger.warning(
+            "could not read per-package .env for package %r: %s",
+            package_name, exc,
+        )
+        return None
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        name, _, value = line.partition("=")
+        if name.strip() == key:
+            return value.strip()
+    return None
+
+
+def _resolve_platform_secret(
+    key: str, *, package_name: str | None = None,
+) -> str | None:
+    """Resolve ``key`` from the platform env / per-package ``.env`` / config.
+
+    Resolution order (highest precedence first):
+
+    1. The live platform process environment (the daemon mirrors ``.env``
+       writes into ``os.environ``; preserves the existing behavior).
+    2. The package's OWN per-package ``.env`` at
+       ``{base_dir}/config/packages/{package_name}/.env`` — this is where
+       env-credentialed package secrets actually live, and is loaded by
+       neither ``os.environ`` nor ``config.CONFIG``.  Keyed strictly on
+       ``package_name`` so a handler can only read its own package's file.
+    3. The loaded platform config (which layers the MAIN ``{base_dir}/.env``
+       for known credential keys).
+
+    This is deliberately the PLATFORM environment, not anything the
+    untrusted executor can influence.
     """
     val = os.environ.get(key)
     if val:
         return val
+    if package_name:
+        pkg_val = _read_package_env_value(package_name, key)
+        if pkg_val:
+            return pkg_val
     try:
         from .. import config
     except ImportError:  # pragma: no cover — config always present in prod
