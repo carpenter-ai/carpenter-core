@@ -7,6 +7,7 @@ keeps a SQLite index (kb_entries, kb_links, kb_embeddings) in sync.
 import hashlib
 import logging
 import os
+import sqlite3
 from datetime import datetime, timezone
 
 from .. import config
@@ -332,10 +333,22 @@ class KBStore:
                 for row in rows
             ]
 
-    def sync_from_filesystem(self) -> dict:
+    def sync_from_filesystem(
+        self, *, conn: sqlite3.Connection | None = None,
+    ) -> dict:
         """Scan filesystem, update index for any changes.
 
         Used ONLY on initial install. Returns change summary.
+
+        Args:
+            conn: When the caller is already inside a ``db_transaction()``
+                (e.g. the package installer), pass its connection so every
+                read/write here reuses it.  Opening a fresh ``get_db()`` on
+                the same thread while a write transaction is active trips
+                ``carpenter.db.get_db``'s deadlock guard and prints a
+                non-fatal traceback on every capability-package install.
+                When ``None`` (the default, e.g. the coordinator's startup
+                sync) each operation owns its own connection as before.
         """
         if not os.path.isdir(self.kb_dir):
             return {"added": 0, "updated": 0, "removed": 0}
@@ -364,12 +377,19 @@ class KBStore:
                 content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
                 byte_count = len(content.encode("utf-8"))
 
-                # Check if already in DB
-                with db_connection() as db:
-                    existing = db.execute(
+                # Check if already in DB.  Reuse the caller's connection
+                # when threaded; otherwise open a short-lived read conn.
+                if conn is not None:
+                    existing = conn.execute(
                         "SELECT content_hash FROM kb_entries WHERE path = ?",
                         (kb_path,),
                     ).fetchone()
+                else:
+                    with db_connection() as db:
+                        existing = db.execute(
+                            "SELECT content_hash FROM kb_entries WHERE path = ?",
+                            (kb_path,),
+                        ).fetchone()
 
                 if existing is None:
                     self._upsert_entry(
@@ -380,6 +400,7 @@ class KBStore:
                         entry_type="knowledge",
                         trust_level="trusted",
                         byte_count=byte_count,
+                        conn=conn,
                     )
                     added += 1
                 elif existing["content_hash"] != content_hash:
@@ -391,17 +412,19 @@ class KBStore:
                         entry_type="knowledge",
                         trust_level="trusted",
                         byte_count=byte_count,
+                        conn=conn,
                     )
                     updated += 1
 
                 # Update links
                 links = parse.extract_links(content)
-                self._update_links(kb_path, links)
+                self._update_links(kb_path, links, conn=conn)
 
                 # Update search index only for new or changed entries
                 if existing is None or existing["content_hash"] != content_hash:
                     self._search.update_entry(
                         kb_path, title or kb_path, description, content,
+                        conn=conn,
                     )
 
         return {"added": added, "updated": updated, "removed": 0}
@@ -461,27 +484,44 @@ class KBStore:
         self, *, path: str, title: str, description: str,
         content_hash: str, entry_type: str, trust_level: str,
         byte_count: int, auto_source: str | None = None,
+        conn: sqlite3.Connection | None = None,
     ) -> None:
-        """Insert or update a kb_entries row."""
-        now = datetime.now(timezone.utc).isoformat()
-        with db_transaction() as db:
-            db.execute(
-                "INSERT INTO kb_entries "
-                "(path, title, description, content_hash, trust_level, entry_type, "
-                " auto_source, byte_count, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
-                "ON CONFLICT(path) DO UPDATE SET "
-                "title=excluded.title, description=excluded.description, "
-                "content_hash=excluded.content_hash, trust_level=excluded.trust_level, "
-                "entry_type=excluded.entry_type, auto_source=excluded.auto_source, "
-                "byte_count=excluded.byte_count, updated_at=excluded.updated_at",
-                (path, title, description, content_hash, trust_level, entry_type,
-                 auto_source, byte_count, now, now),
-            )
+        """Insert or update a kb_entries row.
 
-    def _update_links(self, source_path: str, links: list[tuple[str, str | None]]) -> None:
-        """Replace all outbound links for a source path."""
+        When ``conn`` is provided the write joins that caller-owned
+        transaction (no nested ``db_transaction()``); otherwise the method
+        opens and commits its own.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        sql = (
+            "INSERT INTO kb_entries "
+            "(path, title, description, content_hash, trust_level, entry_type, "
+            " auto_source, byte_count, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(path) DO UPDATE SET "
+            "title=excluded.title, description=excluded.description, "
+            "content_hash=excluded.content_hash, trust_level=excluded.trust_level, "
+            "entry_type=excluded.entry_type, auto_source=excluded.auto_source, "
+            "byte_count=excluded.byte_count, updated_at=excluded.updated_at"
+        )
+        params = (path, title, description, content_hash, trust_level, entry_type,
+                  auto_source, byte_count, now, now)
+        if conn is not None:
+            conn.execute(sql, params)
+            return
         with db_transaction() as db:
+            db.execute(sql, params)
+
+    def _update_links(
+        self, source_path: str, links: list[tuple[str, str | None]],
+        *, conn: sqlite3.Connection | None = None,
+    ) -> None:
+        """Replace all outbound links for a source path.
+
+        When ``conn`` is provided the writes join that caller-owned
+        transaction instead of opening a nested ``db_transaction()``.
+        """
+        def _do(db: sqlite3.Connection) -> None:
             db.execute(
                 "DELETE FROM kb_links WHERE source_path = ?", (source_path,)
             )
@@ -491,6 +531,11 @@ class KBStore:
                     "VALUES (?, ?, ?)",
                     (source_path, target, text),
                 )
+        if conn is not None:
+            _do(conn)
+            return
+        with db_transaction() as db:
+            _do(db)
 
     def _update_linked_byte_counts(self, path: str) -> None:
         """Recompute linked_byte_count for entries that link to/from this path."""

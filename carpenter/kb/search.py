@@ -18,6 +18,7 @@ that patch ``carpenter.kb.search._local_embed`` /
 """
 
 import logging
+import sqlite3
 from typing import Protocol
 
 from ..config import CONFIG
@@ -47,8 +48,15 @@ class SearchBackend(Protocol):
         """Full reindex from kb_entries table."""
         ...
 
-    def update_entry(self, path: str, title: str, description: str, body: str) -> None:
-        """Incremental update for a single entry."""
+    def update_entry(
+        self, path: str, title: str, description: str, body: str,
+        *, conn: "sqlite3.Connection | None" = None,
+    ) -> None:
+        """Incremental update for a single entry.
+
+        When ``conn`` is provided the index writes join that caller-owned
+        transaction instead of opening their own.
+        """
         ...
 
     def remove_entry(self, path: str) -> None:
@@ -191,14 +199,29 @@ class EmbeddingBackend:
                         (row["path"], _serialize_embedding(vec), self._MODEL_NAME),
                     )
 
-    def update_entry(self, path: str, title: str, description: str, body: str) -> None:
-        """Store body text, embed entry, and upsert into kb_embeddings."""
-        with db_transaction() as db:
-            # Cache body text for future reindex
-            db.execute(
+    def update_entry(
+        self, path: str, title: str, description: str, body: str,
+        *, conn: "sqlite3.Connection | None" = None,
+    ) -> None:
+        """Store body text, embed entry, and upsert into kb_embeddings.
+
+        When ``conn`` is provided (e.g. a package install threading its
+        active ``db_transaction()`` connection) the index writes use that
+        connection directly instead of opening nested transactions, which
+        would trip ``carpenter.db.get_db``'s same-thread deadlock guard.
+        """
+        # Cache body text for future reindex.
+        if conn is not None:
+            conn.execute(
                 "INSERT OR REPLACE INTO kb_text_content(path, body) VALUES (?, ?)",
                 (path, body),
             )
+        else:
+            with db_transaction() as db:
+                db.execute(
+                    "INSERT OR REPLACE INTO kb_text_content(path, body) VALUES (?, ?)",
+                    (path, body),
+                )
 
         text = _embed_text(title, description, body)
         try:
@@ -207,6 +230,14 @@ class EmbeddingBackend:
             # Intentionally swallow: embedding is best-effort; entry still
             # exists in kb_text_content even if vector update fails.
             logger.warning("Embedding failed for %s; skipping", path, exc_info=True)
+            return
+        if conn is not None:
+            conn.execute(
+                "INSERT OR REPLACE INTO kb_embeddings"
+                "(path, embedding, model, updated_at) "
+                "VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
+                (path, _serialize_embedding(vectors[0]), self._MODEL_NAME),
+            )
             return
         with db_transaction() as db:
             db.execute(
@@ -314,13 +345,26 @@ class VectorBackend:
                         (row["path"], _serialize_embedding(vec), model),
                     )
 
-    def update_entry(self, path: str, title: str, description: str, body: str) -> None:
-        """Store body, embed via Ollama, upsert into kb_embeddings."""
-        with db_transaction() as db:
-            db.execute(
+    def update_entry(
+        self, path: str, title: str, description: str, body: str,
+        *, conn: "sqlite3.Connection | None" = None,
+    ) -> None:
+        """Store body, embed via Ollama, upsert into kb_embeddings.
+
+        When ``conn`` is provided the writes join that caller-owned
+        transaction instead of opening nested ``db_transaction()`` blocks.
+        """
+        if conn is not None:
+            conn.execute(
                 "INSERT OR REPLACE INTO kb_text_content(path, body) VALUES (?, ?)",
                 (path, body),
             )
+        else:
+            with db_transaction() as db:
+                db.execute(
+                    "INSERT OR REPLACE INTO kb_text_content(path, body) VALUES (?, ?)",
+                    (path, body),
+                )
 
         text = _embed_text(title, description, body)
         try:
@@ -335,6 +379,14 @@ class VectorBackend:
             return
         kb_cfg = CONFIG.get("kb", {})
         model = kb_cfg.get("embedding_model", "nomic-embed-text")
+        if conn is not None:
+            conn.execute(
+                "INSERT OR REPLACE INTO kb_embeddings"
+                "(path, embedding, model, updated_at) "
+                "VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
+                (path, _serialize_embedding(vectors[0]), model),
+            )
+            return
         with db_transaction() as db:
             db.execute(
                 "INSERT OR REPLACE INTO kb_embeddings"
