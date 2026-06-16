@@ -117,6 +117,15 @@ from .handler_registry import (
     PackageHandlerRegistry,
     get_handler_registry,
 )
+from .archive_cache import (
+    ArchiveCacheError,
+    ArchiveFetcher,
+    ArchiveVerificationError,
+    archive_tree,
+    cache_dir,
+    load_pristine_tree,
+    store_archive,
+)
 
 __all__ = [
     "ArcTemplateRef",
@@ -149,4 +158,11 @@ __all__ = [
     "verify_install",
     "PackageHandlerRegistry",
     "get_handler_registry",
+    "ArchiveCacheError",
+    "ArchiveFetcher",
+    "ArchiveVerificationError",
+    "archive_tree",
+    "cache_dir",
+    "load_pristine_tree",
+    "store_archive",
 ]
