@@ -706,6 +706,40 @@ class PackageRegistry:
                             f"{type(exc).__name__}: {exc}",
                         )
 
+            # Phase 3a PR-B follow-up: instantiate + start the package's
+            # in-process Trigger instances at STARTUP.  install_package
+            # does this once at install time, but a daemon restart never
+            # re-ran it, so a package's poll triggers silently vanished
+            # after a restart (they were never re-added to the pollable-
+            # trigger registry and never ticked).  We reuse
+            # ``_install_triggers`` — it is load-not-copy (imports the
+            # trigger modules, instantiates via ``load_package_triggers``,
+            # and calls ``start()``); it does NOT copy files or write the
+            # install record, so it is safe to call on a load.  It is
+            # idempotent: it drops any prior registrations for the package
+            # via ``unregister_for_package`` before re-loading, so a second
+            # ``discover_and_register`` in the same process replaces rather
+            # than duplicates the package's trigger instances.  The active
+            # ``db_conn`` is threaded so a trigger's start-time
+            # package_state reads/writes do not open a nested transaction
+            # (mirrors #47).  Trigger-load failures are surfaced as
+            # non-fatal load_errors rather than crashing startup.
+            try:
+                from .installer import _install_triggers
+                triggers_n = _install_triggers(
+                    manifest, Path(manifest.source_path), conn=db_conn,
+                )
+                if triggers_n:
+                    artifact_counts["triggers"] = triggers_n
+            except Exception as exc:  # pragma: no cover — defensive
+                logger.exception(
+                    "Package %r: trigger loader raised: %s",
+                    manifest.name, exc,
+                )
+                errors = errors + (
+                    f"trigger loader raised: {type(exc).__name__}: {exc}",
+                )
+
             entry = RegisteredPackage(
                 manifest=manifest,
                 chat_tool_names=registered_names,
