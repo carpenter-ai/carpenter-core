@@ -117,6 +117,18 @@ class TestComputePackageHash:
         })
         assert compute_package_hash(a) == compute_package_hash(b)
 
+    def test_hash_ignores_subscriptions_json(self, tmp_path):
+        # The subscription pipeline writes _subscriptions.json beside an
+        # installed package; it is generated runtime state, not shipped
+        # content, so it must not change the SD6 integrity hash (else the
+        # package is refused on the load after its first subscription run).
+        a = make_source_pkg(tmp_path / "a-tree", "p", extra_files={"f.py": "x"})
+        b = make_source_pkg(tmp_path / "b-tree", "p", extra_files={
+            "f.py": "x",
+            "_subscriptions.json": '[{"event": "email.received"}]',
+        })
+        assert compute_package_hash(a) == compute_package_hash(b)
+
     def test_symlink_hashes_target_text(self, tmp_path):
         a = make_source_pkg(tmp_path / "a-tree", "p", extra_files={"f.py": "x"})
         b = make_source_pkg(tmp_path / "b-tree", "p", extra_files={"f.py": "x"})
