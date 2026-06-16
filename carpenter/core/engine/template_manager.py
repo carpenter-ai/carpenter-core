@@ -17,6 +17,7 @@ Key invariants:
 import json
 import logging
 import os
+import sqlite3
 from datetime import datetime, timezone
 
 import yaml
@@ -44,7 +45,12 @@ def _parse_steps_json(raw_json: str) -> tuple[list, list, list]:
     )
 
 
-def load_template(yaml_path: str, *, owner_package: str | None = None) -> int:
+def load_template(
+    yaml_path: str,
+    *,
+    owner_package: str | None = None,
+    db_conn: sqlite3.Connection | None = None,
+) -> int:
     """Load a workflow template from a YAML file.
 
     Parses the YAML, stores or updates the template in the
@@ -59,6 +65,13 @@ def load_template(yaml_path: str, *, owner_package: str | None = None) -> int:
             (``pkg.<owner>``) onto every step arc (see
             :func:`instantiate_template`). Platform-shipped templates
             leave this NULL and receive no grant.
+        db_conn: Optional existing DB connection. Callers that are
+            already inside a ``db_transaction()`` on the same thread
+            (e.g. the daemon's startup package discovery, which wraps
+            ``discover_and_register`` in a transaction) MUST pass their
+            connection so this function reuses it rather than opening a
+            nested ``db_transaction()`` -- which trips the same-thread
+            deadlock guard in ``carpenter.db`` and strands the template.
 
     Returns the template ID.
     """
@@ -80,7 +93,7 @@ def load_template(yaml_path: str, *, owner_package: str | None = None) -> int:
         "triggers": triggers,
     })
 
-    with db_transaction() as db:
+    def _do(db: sqlite3.Connection) -> int:
         existing = db.execute(
             "SELECT id, version FROM workflow_templates WHERE name = ?",
             (name,),
@@ -100,21 +113,24 @@ def load_template(yaml_path: str, *, owner_package: str | None = None) -> int:
                     steps_json, new_version, owner_package, now, existing["id"],
                 ),
             )
-            template_id = existing["id"]
-        else:
-            cursor = db.execute(
-                "INSERT INTO workflow_templates "
-                "(name, description, yaml_path, required_for_json, "
-                " steps_json, version, owner_package, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    name, description, yaml_path, required_for_json,
-                    steps_json, 1, owner_package, now,
-                ),
-            )
-            template_id = cursor.lastrowid
+            return existing["id"]
+        cursor = db.execute(
+            "INSERT INTO workflow_templates "
+            "(name, description, yaml_path, required_for_json, "
+            " steps_json, version, owner_package, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                name, description, yaml_path, required_for_json,
+                steps_json, 1, owner_package, now,
+            ),
+        )
+        return cursor.lastrowid
 
-        return template_id
+    if db_conn is not None:
+        # Reuse the caller's active transaction; the caller owns commit.
+        return _do(db_conn)
+    with db_transaction() as db:
+        return _do(db)
 
 
 def get_template(

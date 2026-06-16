@@ -350,6 +350,7 @@ class TestFullPackageLoad:
                 required_for_json TEXT,
                 steps_json TEXT,
                 version INTEGER NOT NULL DEFAULT 1,
+                owner_package TEXT,
                 updated_at TEXT NOT NULL
             );
         """)
@@ -384,6 +385,51 @@ class TestFullPackageLoad:
         assert pkg.template_names == ("widget-triage",)
         # Judge actually present in registry.
         assert fresh_registry.lookup_judge("widget-triage") is not None
+
+    def test_discover_inside_db_transaction_loads_templates(
+        self, tmp_path, fresh_registry,
+    ):
+        """Regression: the daemon wraps ``discover_and_register`` in a
+        real ``db_transaction()`` (coordinator startup).  Arc-template
+        loading must reuse that connection rather than opening a nested
+        ``db_transaction()`` -- which trips the same-thread deadlock guard
+        and strands every package template as a "non-fatal" load error.
+
+        This reproduces the daemon's exact path (no monkeypatching of the
+        DB layer) against the real test DB, and asserts the package's
+        arc_templates load with ZERO load errors.
+        """
+        from carpenter.db import db_transaction, get_db
+
+        # Real test DB (autouse ``test_db`` fixture) already has the
+        # workflow_templates table; install records its own tables.
+        conn0 = get_db()
+        try:
+            ensure_installer_tables(conn0)
+            conn0.commit()
+        finally:
+            conn0.close()
+
+        # Install the widget package into the real DB.
+        src = _write_widget_pkg(tmp_path / "src")
+        dest_root = tmp_path / "installed"
+        dest = dest_root / "widget"
+        with db_transaction() as db:
+            install_package(src, dest, conn=db)
+
+        registry = PackageRegistry()
+        # The daemon's exact pattern: discover INSIDE a db_transaction.
+        with db_transaction() as db:
+            loaded = registry.discover_and_register(
+                search_paths=[dest_root], db_conn=db,
+            )
+        assert len(loaded) == 1
+        pkg = loaded[0]
+        # Before the fix, this asserted because load_arc_templates opened
+        # a nested db_transaction() and every template raised.
+        assert pkg.load_errors == (), pkg.load_errors
+        assert pkg.artifact_counts.get("arc_templates", 0) == 1
+        assert pkg.template_names == ("widget-triage",)
         # Kind lookup goes via combined registry.
         assert fresh_registry.lookup_kind("WidgetExtract") is not None
 

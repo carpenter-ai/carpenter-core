@@ -653,7 +653,9 @@ class PackageRegistry:
             template_names: tuple[str, ...] = ()
             try:
                 from .loaders import load_package_artifacts
-                counts, art_errors, tnames = load_package_artifacts(manifest)
+                counts, art_errors, tnames = load_package_artifacts(
+                    manifest, db_conn=db_conn,
+                )
                 artifact_counts = counts
                 errors = errors + tuple(art_errors)
                 template_names = tuple(tnames)
@@ -727,6 +729,17 @@ class PackageRegistry:
                     "(requires operator opt-in; not registered): %s",
                     manifest.name, len(gated_names),
                     ", ".join(gated_names),
+                )
+            # Surface each non-fatal load error individually at WARNING.
+            # Previously only the COUNT was logged in the summary below,
+            # which made the "N non-fatal error(s)" message opaque -- an
+            # operator could see "7 errors" with no way to tell what they
+            # were without instrumenting the code.  Logging them here keeps
+            # them observable in the daemon journal.
+            for _err in errors:
+                logger.warning(
+                    "Package %r: non-fatal load error: %s",
+                    manifest.name, _err,
                 )
             logger.info(
                 "Loaded capability package %r v%s from %s "
