@@ -59,6 +59,36 @@ TRIGGER_BODY = dedent("""\
 """)
 
 
+# A trigger whose start() reads + writes package_state via its handle --
+# this mirrors the real GmailPollTrigger / imap_poll watermark CAS that
+# fires during install_package's outer db_transaction().  Before the fix
+# the state ops opened a SECOND connection on the install thread and
+# tripped carpenter.db's nested-transaction deadlock guard.
+STATEFUL_TRIGGER_BODY = dedent("""\
+    from carpenter.core.engine.triggers.base import PollableTrigger
+
+
+    class _StatefulProbe(PollableTrigger):
+        '''Trigger that touches package_state in start().'''
+
+        @classmethod
+        def trigger_type(cls) -> str:
+            return 'stateful_probe'
+
+        def start(self) -> None:
+            # Read-with-version then CAS-insert -- exactly the watermark
+            # pattern that produced the install-time tracebacks.
+            existing = self.package_state.get_with_version('watermark')
+            if existing is None:
+                self.package_state.cas('watermark', 0, {'id': 1})
+            else:
+                self.package_state.set('watermark', {'id': 2})
+
+        def check(self) -> None:
+            pass
+""")
+
+
 @pytest.fixture
 def db_conn():
     conn = sqlite3.connect(":memory:")
@@ -296,3 +326,80 @@ class TestInstallerTriggers:
         assert trigger_registry.instances_for_package("pkg-a") == []
         assert trigger_registry.get_trigger_type("probe_b_type") is not None
         assert len(trigger_registry.instances_for_package("pkg-b")) == 1
+
+
+class TestInstallInsideDbTransaction:
+    """Regression: a trigger whose ``start()`` touches package_state must
+    not trip the same-thread deadlock guard when the package is installed
+    inside a real ``db_transaction()`` (the way the CLI does it).
+
+    Mirrors ``test_merge_inside_db_transaction_no_nested_connection`` in
+    ``test_bfull_install.py`` -- before the fix, the trigger's start-time
+    state ops called ``get_db()`` on the install thread while the outer
+    write transaction was active, raising ``RuntimeError`` and printing a
+    traceback on every install of a stateful-trigger package.
+    """
+
+    def _write_stateful_pkg(self, tmp_path: Path, name: str) -> Path:
+        triggers_yaml = dedent("""\
+            triggers:
+              - name: wm
+                type: stateful_probe
+                module: triggers/probe.py
+        """)
+        src = tmp_path / "src" / name
+        src.mkdir(parents=True, exist_ok=True)
+        (src / "manifest.yaml").write_text(
+            f"name: {name}\n"
+            f"version: \"0.1.0\"\n"
+            f"description: Stateful trigger test package.\n"
+            f"{triggers_yaml}"
+        )
+        (src / "triggers").mkdir()
+        (src / "triggers" / "__init__.py").write_text("")
+        (src / "triggers" / "probe.py").write_text(STATEFUL_TRIGGER_BODY)
+        return src
+
+    def test_stateful_trigger_start_no_nested_connection(
+        self, tmp_path, test_db, caplog,
+    ):
+        """No RuntimeError escapes/logs, and the trigger's start-time
+        state write is persisted by the install transaction."""
+        from carpenter.db import db_transaction, get_db
+
+        # Ensure the installer tables exist in the real test DB.
+        conn0 = get_db()
+        try:
+            ensure_installer_tables(conn0)
+            conn0.commit()
+        finally:
+            conn0.close()
+
+        src = self._write_stateful_pkg(tmp_path, "wmpkg")
+        dest = tmp_path / "installed" / "wmpkg"
+
+        with caplog.at_level("ERROR"):
+            with db_transaction() as db:
+                result = install_package(src, dest, conn=db)
+        assert result.triggers_installed == 1
+
+        # No deadlock-guard RuntimeError surfaced via logging.exception.
+        guard_msgs = [
+            r.getMessage() + (r.exc_text or "")
+            for r in caplog.records
+            if "db_transaction() is active" in (
+                r.getMessage() + (r.exc_text or "")
+            )
+        ]
+        assert guard_msgs == [], guard_msgs
+
+        # The watermark written inside start() committed with the install.
+        from carpenter.packages import state as pkg_state
+        conn = get_db()
+        try:
+            row = pkg_state.get_with_version("wmpkg", "watermark", conn=conn)
+        finally:
+            conn.close()
+        assert row is not None
+        value, _version = row
+        assert value == {"id": 1}

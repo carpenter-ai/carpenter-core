@@ -45,6 +45,7 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any
 
@@ -422,7 +423,7 @@ class PackageStateHandle:
         ok = handle.cas("poll_in_progress", expected_version=0, new_value=True)
     """
 
-    __slots__ = ("_package_name",)
+    __slots__ = ("_package_name", "_bound_conn")
 
     def __init__(self, package_name: str) -> None:
         if not isinstance(package_name, str) or not package_name.strip():
@@ -432,6 +433,33 @@ class PackageStateHandle:
             )
         # Bound at construction; methods only ever use this value.
         self._package_name = package_name
+        # Optional connection threaded into every state operation while a
+        # ``bind_conn()`` scope is active.  This exists so a trigger's
+        # ``start()`` invoked DURING install (inside the installer's outer
+        # ``db_transaction()``) reuses the install connection instead of
+        # calling ``get_db()`` on the same thread and tripping the nested-
+        # transaction deadlock guard.  Outside such a scope it is ``None``
+        # and every method opens/owns its own connection as before.
+        self._bound_conn: "sqlite3.Connection | None" = None
+
+    @contextmanager
+    def bind_conn(self, conn: "sqlite3.Connection"):
+        """Temporarily route all state ops through ``conn``.
+
+        Used by the installer to run a trigger's ``start()`` inside the
+        active install transaction without opening a second connection on
+        the same thread (which would trip ``carpenter.db.get_db``'s
+        deadlock guard and print a non-fatal traceback).  The previous
+        binding (normally ``None``) is restored on exit, so a handle that
+        outlives the install scope reverts to owning its own connection at
+        runtime.
+        """
+        prev = self._bound_conn
+        self._bound_conn = conn
+        try:
+            yield self
+        finally:
+            self._bound_conn = prev
 
     @property
     def package_name(self) -> str:
@@ -444,22 +472,29 @@ class PackageStateHandle:
         return self._package_name
 
     def get(self, key: str, default: Any = None) -> Any:
-        return get(self._package_name, key, default=default)
+        return get(
+            self._package_name, key, default=default, conn=self._bound_conn,
+        )
 
     def get_with_version(self, key: str) -> tuple[Any, int] | None:
-        return get_with_version(self._package_name, key)
+        return get_with_version(
+            self._package_name, key, conn=self._bound_conn,
+        )
 
     def set(self, key: str, value: Any) -> int:
-        return set(self._package_name, key, value)
+        return set(self._package_name, key, value, conn=self._bound_conn)
 
     def cas(self, key: str, expected_version: int, new_value: Any) -> bool:
-        return cas(self._package_name, key, expected_version, new_value)
+        return cas(
+            self._package_name, key, expected_version, new_value,
+            conn=self._bound_conn,
+        )
 
     def delete(self, key: str) -> bool:
-        return delete(self._package_name, key)
+        return delete(self._package_name, key, conn=self._bound_conn)
 
     def list_keys(self) -> list[str]:
-        return list_keys(self._package_name)
+        return list_keys(self._package_name, conn=self._bound_conn)
 
     def __repr__(self) -> str:
         return f"PackageStateHandle(package_name={self._package_name!r})"

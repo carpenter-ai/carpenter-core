@@ -454,6 +454,71 @@ class TestKBArticleInstall:
             == "from-b"
         )
 
+    def test_kb_install_inside_db_transaction_no_nested_connection(
+        self, tmp_path, test_db, caplog,
+    ):
+        """Regression: installing a package WITH kb_articles inside a real
+        ``db_transaction()`` must not trip the same-thread deadlock guard.
+
+        Before the fix, ``_install_kb_articles`` called
+        ``KBStore.sync_from_filesystem()`` without threading the active
+        install connection; the re-index opened a SECOND connection on the
+        install thread (read + ``_upsert_entry`` + ``_search.update_entry``)
+        inside the install transaction, tripping ``carpenter.db.get_db``'s
+        deadlock guard and printing a traceback on every package that ships
+        KB articles.  We assert no RuntimeError escapes/logs and the entry
+        is indexed into ``kb_entries`` (committed with the install).
+        """
+        from carpenter.db import db_transaction, get_db
+
+        # Ensure the installer tables exist in the real test DB.
+        conn0 = get_db()
+        try:
+            ensure_installer_tables(conn0)
+            conn0.commit()
+        finally:
+            conn0.close()
+
+        src = _write_pkg(
+            tmp_path / "src", "kbpkg", """
+                name: kbpkg
+                version: "0.1.0"
+                description: x
+                kb_namespace: kbpkg
+                kb_articles:
+                  - {path: kb/kbpkg/overview.md, slug: overview}
+            """,
+            files={"kb/kbpkg/overview.md": "# Overview\n\nHello kbpkg."},
+        )
+        dest = tmp_path / "installed" / "kbpkg"
+
+        with caplog.at_level("ERROR"):
+            with db_transaction() as db:
+                result = install_package(src, dest, conn=db)
+        assert result.kb_articles_installed == 1
+
+        # No deadlock-guard RuntimeError surfaced via logging.exception.
+        guard_msgs = [
+            r.getMessage() + (r.exc_text or "")
+            for r in caplog.records
+            if "db_transaction() is active" in (
+                r.getMessage() + (r.exc_text or "")
+            )
+        ]
+        assert guard_msgs == [], guard_msgs
+
+        # The article was indexed into kb_entries by the threaded sync,
+        # committed atomically with the install transaction.
+        conn = get_db()
+        try:
+            row = conn.execute(
+                "SELECT path FROM kb_entries WHERE path = ?",
+                ("packages/kbpkg/overview",),
+            ).fetchone()
+        finally:
+            conn.close()
+        assert row is not None
+
 
 # ── Trigger subscription registration ──────────────────────────────
 

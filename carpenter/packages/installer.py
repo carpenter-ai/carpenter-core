@@ -819,6 +819,7 @@ def _package_kb_dir(kb_root: Path, package_name: str) -> Path:
 
 def _install_kb_articles(
     manifest: PackageManifest, install_path: Path,
+    *, conn: sqlite3.Connection | None = None,
 ) -> int:
     """Copy declared KB articles into ``<kb_root>/packages/<pkg>/``.
 
@@ -915,7 +916,11 @@ def _install_kb_articles(
     # tree — fine to call after every package install.
     try:
         from ..kb.store import KBStore
-        KBStore(str(kb_root)).sync_from_filesystem()
+        # Thread the active install transaction's connection so the
+        # re-index doesn't open a SECOND connection on this thread (which
+        # trips carpenter.db's deadlock guard and prints a traceback on
+        # every capability-package install that ships KB articles).
+        KBStore(str(kb_root)).sync_from_filesystem(conn=conn)
     except Exception:  # noqa: BLE001 — best-effort
         logger.exception(
             "kb_articles: sync_from_filesystem after install of %r failed",
@@ -925,8 +930,15 @@ def _install_kb_articles(
     return copied
 
 
-def _uninstall_kb_articles(package_name: str) -> None:
-    """Remove the package's KB folder and re-index.  Idempotent."""
+def _uninstall_kb_articles(
+    package_name: str, *, conn: sqlite3.Connection | None = None,
+) -> None:
+    """Remove the package's KB folder and re-index.  Idempotent.
+
+    ``conn`` threads the active uninstall transaction into the re-index so
+    the sync reuses it instead of opening a nested connection on the same
+    thread (mirrors the install path).
+    """
     kb_root = _kb_root_dir()
     if kb_root is None:
         return
@@ -935,7 +947,7 @@ def _uninstall_kb_articles(package_name: str) -> None:
         shutil.rmtree(pkg_kb_dir)
         try:
             from ..kb.store import KBStore
-            KBStore(str(kb_root)).sync_from_filesystem()
+            KBStore(str(kb_root)).sync_from_filesystem(conn=conn)
         except Exception:  # noqa: BLE001 — best-effort
             logger.exception(
                 "kb_articles: sync_from_filesystem after uninstall of %r failed",
@@ -1015,6 +1027,7 @@ def _install_trigger_subscriptions(
 
 def _install_triggers(
     manifest: PackageManifest, install_path: Path,
+    *, conn: sqlite3.Connection | None = None,
 ) -> int:
     """Register in-process Trigger instances declared in ``manifest.triggers``.
 
@@ -1131,10 +1144,29 @@ def _install_triggers(
     # Best-effort start() — if a trigger's start() fails we still
     # register it (load_triggers already added it to _instances) so that
     # uninstall can clean it up symmetrically.
+    #
+    # When called from inside ``install_package``'s outer
+    # ``db_transaction()`` (``conn`` is not None), bind that connection to
+    # the package's state handle for the duration of ``start()``.  A
+    # trigger's ``start()`` commonly reads/writes package_state (e.g.
+    # GmailPollTrigger / imap_poll's watermark CAS); without the binding
+    # those ops call ``get_db()`` on the same thread and trip the nested-
+    # transaction deadlock guard, printing a non-fatal traceback on every
+    # install.  Threading the install connection makes the trigger's
+    # start-time state writes part of the atomic install transaction.
+    def _start_inst(inst) -> None:
+        inst.start()
+
     started = 0
     for inst in instances:
         try:
-            inst.start()
+            if conn is not None and state_handle is not None and hasattr(
+                state_handle, "bind_conn",
+            ):
+                with state_handle.bind_conn(conn):
+                    _start_inst(inst)
+            else:
+                _start_inst(inst)
             started += 1
         except Exception:
             logger.exception(
@@ -1523,7 +1555,7 @@ def install_package(
     _merge_allowlist_proposals(conn, diff.added)
 
     # B-full: install KB articles (per-package folder under <kb_root>).
-    kb_articles_n = _install_kb_articles(installed_manifest, dest_path)
+    kb_articles_n = _install_kb_articles(installed_manifest, dest_path, conn=conn)
 
     # B-full: register trigger subscriptions (in-memory, tagged with the
     # package name so uninstall can drop them) and persist a
@@ -1534,7 +1566,7 @@ def install_package(
     # Phase 3a PR-B: instantiate any in-process Trigger classes the
     # package's manifest declared (idempotent on re-install: prior
     # registrations are dropped first).
-    triggers_n = _install_triggers(installed_manifest, dest_path)
+    triggers_n = _install_triggers(installed_manifest, dest_path, conn=conn)
 
     # ``kind: env`` credentials: for each declared env-credential ref,
     # create a one-time credential request for every required env var
@@ -1758,7 +1790,7 @@ def uninstall_package(
         shutil.rmtree(install_path)
 
     # B-full: remove the package's KB folder + re-index.
-    _uninstall_kb_articles(name)
+    _uninstall_kb_articles(name, conn=conn)
 
     _delete_install_record(conn, name)
 
