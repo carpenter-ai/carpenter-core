@@ -32,7 +32,6 @@ from ``~/notes/capability-packages.md``.
 
 from __future__ import annotations
 
-import importlib.util
 import logging
 import os
 import threading
@@ -162,16 +161,6 @@ def _read_raw_yaml(path: Path) -> dict:
     return data
 
 
-def _import_module_from_path(module_name: str, file_path: Path):
-    """Import a Python module from a file path, isolated namespace."""
-    spec = importlib.util.spec_from_file_location(module_name, str(file_path))
-    if spec is None or spec.loader is None:
-        raise ImportError(f"Cannot create module spec for {file_path}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
 class PackageRegistry:
     """Process-wide registry of loaded capability packages."""
 
@@ -281,17 +270,30 @@ class PackageRegistry:
         """
         from ..chat_tool_loader import register_extension_tool, _loaded_tools
         from ..chat_tool_registry import PLATFORM_TOOLS
+        from .loaders import _import_package_module
 
         registered: list[str] = []
         errors: list[str] = []
 
         for rel in manifest.chat_tools:
-            module_path = manifest.source_path / rel
-            module_name = (
-                f"_carpenter_pkg_.{manifest.name}.{Path(rel).stem}"
-            )
+            # Map the manifest's relative ``*.py`` path (e.g. ``tools.py``
+            # or ``chat/tools.py``) to the dotted module path
+            # ``_import_package_module`` expects (``tools`` /
+            # ``chat.tools``).  Loading PACKAGE-aware — i.e. under the
+            # synthetic ``_carpenter_pkg_.<name>`` parent package, with
+            # the package dir on its ``__path__`` — is what lets the
+            # module use intra-package relative imports such as
+            # ``from .arc_builders import ...`` or ``from .scripts import
+            # ...``.  This mirrors how ``loaders.py`` loads judge/data-
+            # model/capability modules; the prior bare
+            # ``spec_from_file_location`` load left ``__package__`` unset
+            # and raised ImportError on any relative import.
+            rel_path = Path(rel)
+            dotted = ".".join(rel_path.with_suffix("").parts)
             try:
-                module = _import_module_from_path(module_name, module_path)
+                module = _import_package_module(
+                    manifest.name, dotted, manifest.source_path,
+                )
             except Exception as exc:
                 errors.append(
                     f"Failed to import chat tool module {rel!r}: {exc}",

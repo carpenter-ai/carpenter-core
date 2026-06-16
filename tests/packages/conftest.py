@@ -74,14 +74,34 @@ def reset_package_registry():
     leaking state between tests would cause cross-contamination.  We
     also reset chat_tool_loader's loaded tools — extension tool
     registration mutates module state.
+
+    Package modules are loaded package-aware via
+    ``loaders._import_package_module``, which caches each module in
+    ``sys.modules`` under ``_carpenter_pkg_.<name>.<dotted>`` and returns
+    the cached object on subsequent loads.  Without purging those entries
+    between tests, two tests that reuse a package name (e.g. ``hello`` or
+    ``evil``) with different module bodies would silently get the FIRST
+    test's module back, cross-contaminating the second.  Drop the whole
+    synthetic namespace so every test loads its own fixture cleanly.
     """
+    import sys
+
     from carpenter.packages.registry import get_registry
     from carpenter import chat_tool_loader
 
+    def _purge_pkg_namespace() -> None:
+        for mod_name in [
+            m for m in sys.modules
+            if m == "_carpenter_pkg_" or m.startswith("_carpenter_pkg_.")
+        ]:
+            sys.modules.pop(mod_name, None)
+
     saved_tools = dict(chat_tool_loader._loaded_tools)
+    _purge_pkg_namespace()
     get_registry().reset()
     yield
     get_registry().reset()
+    _purge_pkg_namespace()
     # Restore loaded tools so other tests aren't affected.
     chat_tool_loader._loaded_tools.clear()
     chat_tool_loader._loaded_tools.update(saved_tools)
