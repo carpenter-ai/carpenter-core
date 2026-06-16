@@ -23,6 +23,29 @@ def test_update_dot_env_creates_new_file(tmp_path):
     assert "GIT_TOKEN=ghp_abc123" in dot_env.read_text()
 
 
+def test_update_dot_env_mirrors_into_os_environ(tmp_path):
+    """A successful .env write is mirrored into the live ``os.environ``.
+
+    This is the delivery mechanism that closes the "fresh credential not
+    visible until restart" gap: EXECUTOR subprocesses inherit the
+    daemon's ``os.environ`` (via ``dict(os.environ)``), so a credential
+    written after start-up must land in ``os.environ`` to reach a
+    subsequently-spawned subprocess without a restart.
+    """
+    from carpenter.util.dot_env import update_dot_env
+
+    key = "IMAP_EMAIL_PASSWORD_TEST_MIRROR"
+    assert key not in os.environ  # precondition
+    try:
+        update_dot_env(tmp_path / ".env", key, "s3cr3t")
+        assert os.environ.get(key) == "s3cr3t"
+        # A second write updating the value also updates the live env.
+        update_dot_env(tmp_path / ".env", key, "rotated")
+        assert os.environ.get(key) == "rotated"
+    finally:
+        os.environ.pop(key, None)
+
+
 def test_main_and_api_share_implementation():
     """The CLI's _update_dot_env is the shared helper from carpenter.util.dot_env.
 

@@ -41,7 +41,12 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .manifest import PackageManifest, ManifestError, load_manifest
+from .manifest import (
+    EnvCredentialRef,
+    PackageManifest,
+    ManifestError,
+    load_manifest,
+)
 from .security import PackageSecurityError, validate_manifest_security
 
 logger = logging.getLogger(__name__)
@@ -89,6 +94,14 @@ class InstallResult:
     # manifest's ``triggers:`` block.  Zero for packages that don't
     # contribute triggers.
     triggers_installed: int = 0
+    # ``kind: env`` credential requests created for env vars the package
+    # declared but that were not already set.  Each entry is a dict with
+    # ``key`` (full ``{prefix}_{suffix}`` env var name), ``provider``,
+    # ``request_id``, and ``url`` (the one-time credential form link).
+    # Surfaced so the operator / chat agent knows exactly what to supply
+    # out-of-band; install does NOT hard-fail on missing env creds
+    # (mirrors the OAuth posture — creds are provided after install).
+    env_credential_requests: tuple[dict, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -938,6 +951,107 @@ def _uninstall_triggers(package_name: str) -> int:
     return _treg.unregister_for_package(package_name)
 
 
+def _env_key_is_set(key: str) -> bool:
+    """Return True if ``key`` already has a value the package can read.
+
+    A package's pre-verified EXECUTOR scripts read credentials via
+    ``os.environ.get(key)``, and the daemon mirrors ``.env`` writes into
+    ``os.environ`` (see :mod:`carpenter.util.dot_env`).  We therefore
+    treat a key as "already set" if it is present *either* in the live
+    process environment *or* in the loaded platform config (which layers
+    in ``{base_dir}/.env`` for known credential keys).  Checking both is
+    deliberately permissive: the goal is to avoid re-prompting the
+    operator for a value they have already supplied, by whatever path.
+    """
+    if os.environ.get(key):
+        return True
+    try:
+        from .. import config
+    except ImportError:  # pragma: no cover — config always present in prod
+        return False
+    cfg = config.CONFIG
+    return bool(cfg.get(key) or cfg.get(key.lower()))
+
+
+def _request_env_credentials(manifest: PackageManifest) -> tuple[dict, ...]:
+    """Create one-time credential requests for declared ``kind: env`` creds.
+
+    For each :class:`EnvCredentialRef` in the manifest, and for each of
+    its ``required_keys`` suffixes, computes the full env var name
+    ``f"{env_key_prefix}_{suffix}"`` and — unless that key is already set
+    — creates a credential request via
+    :func:`carpenter.api.credentials.create_credential_request`.  Reuses
+    the existing one-time-link intake mechanism rather than inventing a
+    parallel flow.
+
+    OAuth credential refs are intentionally ignored here — they are
+    handled by the separate OAuth-callback flow
+    (:mod:`carpenter.api.oauth`).
+
+    Install never hard-fails on missing env creds (mirrors the OAuth
+    posture); the operator provides the values out-of-band via the
+    returned request URLs, and the write path mirrors them into
+    ``os.environ`` so subsequently-spawned EXECUTOR subprocesses pick
+    them up without a daemon restart.
+
+    Returns a tuple of request-info dicts (``key``, ``provider``,
+    ``request_id``, ``url``).  Returns an empty tuple if the package
+    declares no env creds, if all keys are already set, or if the
+    credentials API is unavailable (e.g. minimal test builds).
+    """
+    env_refs = [
+        c for c in manifest.credential_requirements
+        if isinstance(c, EnvCredentialRef)
+    ]
+    if not env_refs:
+        return ()
+
+    try:
+        from ..api.credentials import create_credential_request
+    except ImportError:
+        logger.warning(
+            "credentials API unavailable; cannot create env-credential "
+            "requests for package %r (declared %d env cred ref(s))",
+            manifest.name, len(env_refs),
+        )
+        return ()
+
+    requests: list[dict] = []
+    for ref in env_refs:
+        for suffix in ref.required_keys:
+            key = f"{ref.env_key_prefix}_{suffix}"
+            if _env_key_is_set(key):
+                logger.debug(
+                    "env credential %s for package %r already set; "
+                    "not re-requesting", key, manifest.name,
+                )
+                continue
+            info = create_credential_request(
+                key,
+                label=key,
+                description=(
+                    f"Required by package {manifest.name} "
+                    f"({ref.provider})"
+                ),
+            )
+            requests.append({
+                "key": key,
+                "provider": ref.provider,
+                "request_id": info["request_id"],
+                "url": info["url"],
+            })
+
+    if requests:
+        logger.info(
+            "Package %r needs %d env credential(s); created credential "
+            "request(s) for: %s.  Provide them via the one-time link(s) "
+            "(install proceeds without them).",
+            manifest.name, len(requests),
+            ", ".join(r["key"] for r in requests),
+        )
+    return tuple(requests)
+
+
 # ── Install / uninstall / verify ────────────────────────────────────
 
 
@@ -1053,6 +1167,16 @@ def install_package(
     # registrations are dropped first).
     triggers_n = _install_triggers(installed_manifest, dest_path)
 
+    # ``kind: env`` credentials: for each declared env-credential ref,
+    # create a one-time credential request for every required env var
+    # that is not already set.  Install does NOT hard-fail on missing
+    # env creds (mirrors the OAuth posture); the operator supplies the
+    # values out-of-band via the returned request URLs and the write
+    # path mirrors them into ``os.environ`` for live delivery to
+    # EXECUTOR subprocesses.  OAuth refs are handled by the separate
+    # OAuth-callback flow and are skipped here.
+    env_cred_requests = _request_env_credentials(installed_manifest)
+
     logger.info(
         "Installed capability package %r v%s (hash %s, %s)",
         manifest.name, manifest.version, pkg_hash[:12],
@@ -1071,6 +1195,7 @@ def install_package(
         kb_articles_installed=kb_articles_n,
         trigger_subscriptions_registered=subs_n,
         triggers_installed=triggers_n,
+        env_credential_requests=env_cred_requests,
     )
 
 

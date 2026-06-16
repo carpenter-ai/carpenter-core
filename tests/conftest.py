@@ -83,6 +83,35 @@ def _cleanup_old_templates():
     _cleanup_old_template_dbs()
 
 
+@pytest.fixture(autouse=True)
+def _restore_os_environ():
+    """Snapshot ``os.environ`` and restore it after each test.
+
+    ``carpenter.util.dot_env.update_dot_env`` mirrors every credential it
+    writes into the live ``os.environ`` (so freshly-provided credentials
+    reach subsequently-spawned EXECUTOR subprocesses without a daemon
+    restart — see that module's docstring).  In production that is the
+    desired behaviour; in the test suite, however, a test that writes a
+    *known* credential key (e.g. ``GIT_TOKEN``) via ``update_dot_env``
+    would otherwise leak it into ``os.environ`` for sibling tests sharing
+    the same xdist worker, where ``config.load_config`` reads real env
+    vars as its highest-precedence layer.  Snapshot/restore keeps tests
+    isolated without weakening the production delivery path.
+    """
+    snapshot = dict(os.environ)
+    try:
+        yield
+    finally:
+        # Restore exactly: drop keys added during the test, reset mutated
+        # ones, and re-add any the test deleted.
+        for key in list(os.environ.keys()):
+            if key not in snapshot:
+                del os.environ[key]
+        for key, value in snapshot.items():
+            if os.environ.get(key) != value:
+                os.environ[key] = value
+
+
 def _schema_hash() -> str:
     """Short hash of schema.sql so template DB auto-invalidates on schema changes."""
     schema_path = Path(__file__).parent.parent / "carpenter" / "schema.sql"
