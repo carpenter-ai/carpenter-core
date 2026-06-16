@@ -23,6 +23,16 @@ durability properties stay in sync across call sites:
 * **Non-POSIX** — on platforms without ``fcntl`` (Windows) the lock
   degrades to a no-op and directory fsync is skipped; the rest of
   the contract still holds.
+* **Live process env** — after the on-disk write succeeds the value
+  is also mirrored into ``os.environ`` in the running process.  This
+  closes the "fresh credential not visible until restart" gap: the
+  daemon's ``os.environ`` is otherwise populated only by systemd's
+  ``EnvironmentFile=`` at start-up, so a credential written *after*
+  boot would not reach EXECUTOR subprocesses (which inherit the
+  daemon's ``os.environ`` via ``dict(os.environ)``) until the next
+  restart.  Mirroring on every write means OAuth tokens, env-var
+  package credentials, and operator-CLI credentials are all available
+  to subsequently-spawned subprocesses immediately.
 """
 
 from __future__ import annotations
@@ -181,5 +191,13 @@ def update_dot_env(dot_env_path: Path, key: str, value: str) -> bool:
             except FileNotFoundError:
                 pass
             raise
+
+    # Mirror the value into the live process environment so that
+    # subprocesses spawned *after* this write (which inherit the
+    # daemon's ``os.environ`` via ``dict(os.environ)``) see the new
+    # credential without requiring a restart.  See module docstring.
+    # Done outside the lock — ``os.environ`` assignment is process-local
+    # and the durable on-disk write already committed above.
+    os.environ[key] = value
 
     return updated
