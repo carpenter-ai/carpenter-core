@@ -75,8 +75,24 @@ def _package_env_path(name: str) -> Path:
 # ── manifest preview ────────────────────────────────────────────────
 
 
-def _print_manifest_preview(manifest, pkg_hash: str, *, stream) -> None:
-    """Print a human-readable summary of what installing this package does."""
+def _print_manifest_preview(
+    manifest,
+    pkg_hash: str,
+    *,
+    stream,
+    read_only_tools=None,
+    write_tools=None,
+) -> None:
+    """Print a human-readable summary of what installing this package does.
+
+    Args:
+        read_only_tools / write_tools: optional classified chat-tool
+            lists from :func:`installer.classify_package_chat_tools`.
+            When provided, the preview enumerates the package's chat
+            tools grouped by capability (read-only — will register; vs
+            write/effectful — gated, listing each tool + its write
+            capabilities) so the operator's write opt-in is informed.
+    """
     p = lambda *a: print(*a, file=stream)  # noqa: E731
     p("")
     p(f"  Package : {manifest.name} v{manifest.version}")
@@ -94,6 +110,35 @@ def _print_manifest_preview(manifest, pkg_hash: str, *, stream) -> None:
     p(f"    trigger subscriptions: {len(manifest.trigger_subscriptions)}")
     p(f"    triggers             : {len(manifest.triggers)}")
     p(f"    allowlist proposals  : {len(manifest.allowlist_proposals)}")
+
+    # Chat tools grouped by capability so the operator's write opt-in is
+    # informed.  Read-only tools register by default; write/effectful
+    # tools are GATED and only register with an explicit --allow-write-
+    # chat-tools opt-in.
+    if read_only_tools is not None or write_tools is not None:
+        ro = read_only_tools or []
+        wr = write_tools or []
+        p("")
+        p("  Chat tools by capability:")
+        p(f"    read-only (register by default): {len(ro)}")
+        for t in ro:
+            caps = ", ".join(t["capabilities"]) or "pure"
+            p(f"      • {t['name']}  [{caps}]")
+        if wr:
+            p("")
+            p(
+                "    write / effectful (GATED — require "
+                "--allow-write-chat-tools):"
+            )
+            for t in wr:
+                wcaps = ", ".join(t["write_capabilities"])
+                confirm = (
+                    " (requires user confirm)"
+                    if t["requires_user_confirm"] else ""
+                )
+                p(f"      • {t['name']}  write caps: {wcaps}{confirm}")
+        else:
+            p("    write / effectful: 0")
 
     # Credential requirements (env-var keys the package needs).
     creds = manifest.credential_requirements
@@ -168,6 +213,15 @@ def _cmd_install(argv: list[str]) -> int:
              "for any platform_capabilities the package declares. Required "
              "to install a capability package non-interactively.",
     )
+    parser.add_argument(
+        "--allow-write-chat-tools", action="store_true",
+        help="Explicit operator opt-in to enable the package's WRITE-capable "
+             "chat tools (those declaring arc_create / external_effect / "
+             "database_write / filesystem_write). The chat agent is read-only "
+             "by default, so without this flag (and without confirming the "
+             "interactive prompt) the package's write chat tools are GATED "
+             "and not registered. SEPARATE from --accept-capabilities.",
+    )
     args = parser.parse_args(argv)
 
     if bool(args.path) == bool(args.source_name):
@@ -205,9 +259,71 @@ def _cmd_install(argv: list[str]) -> int:
         print(f"ERROR: could not load source package: {exc}", file=sys.stderr)
         return 1
 
-    _print_manifest_preview(manifest, pkg_hash, stream=sys.stderr)
+    # Classify the package's chat tools so the preview can group them by
+    # capability and the operator's write opt-in is informed.  Best-effort:
+    # a module that fails to import simply yields no entries.
+    try:
+        read_only_tools, write_tools = installer.classify_package_chat_tools(
+            manifest,
+        )
+    except Exception:  # noqa: BLE001 — preview is best-effort
+        read_only_tools, write_tools = [], []
+
+    _print_manifest_preview(
+        manifest, pkg_hash, stream=sys.stderr,
+        read_only_tools=read_only_tools, write_tools=write_tools,
+    )
 
     dest_path = _install_destination_for(manifest.name)
+
+    # Decide the write-chat-tools opt-in posture.  The chat agent is
+    # read-only by default; the package's write chat tools only register
+    # when the operator explicitly opts in (--allow-write-chat-tools or,
+    # interactively, by confirming the prompt).  Unlike platform
+    # capabilities, NON-interactive without the flag does NOT fail — the
+    # write chat tools are simply gated off (silently) and the package
+    # still installs.
+    allow_write_chat_tools = bool(args.allow_write_chat_tools)
+    if write_tools and not allow_write_chat_tools:
+        wnames = ", ".join(t["name"] for t in write_tools)
+        if hasattr(sys.stdin, "isatty") and sys.stdin.isatty():
+            print("", file=sys.stderr)
+            print(
+                f"  Package {manifest.name!r} ships {len(write_tools)} "
+                f"WRITE-capable chat tool(s): {wnames}",
+                file=sys.stderr,
+            )
+            print(
+                "  The chat agent is read-only by default. Enable these "
+                "write chat tools for this package?",
+                file=sys.stderr,
+            )
+            try:
+                resp = input(
+                    "  Type 'yes' to opt in (default: gated off): ",
+                )
+            except EOFError:
+                resp = ""
+            if isinstance(resp, str) and resp.strip().lower() == "yes":
+                allow_write_chat_tools = True
+                print(
+                    "  Opted IN: write chat tools will register.",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    "  Gated OFF: write chat tools will NOT register "
+                    "(re-install with --allow-write-chat-tools to enable).",
+                    file=sys.stderr,
+                )
+        else:
+            # Non-interactive without the flag → simply gated off.
+            print(
+                f"  NOTE: {len(write_tools)} write chat tool(s) ({wnames}) "
+                "are GATED off (chat agent is read-only by default). "
+                "Re-run with --allow-write-chat-tools to enable them.",
+                file=sys.stderr,
+            )
 
     # Decide the capability-consent posture.
     has_caps = bool(manifest.platform_capabilities)
@@ -246,6 +362,7 @@ def _cmd_install(argv: list[str]) -> int:
                 conn=db,
                 capability_input_fn=capability_input_fn,
                 capability_prompt_stream=sys.stderr,
+                allow_write_chat_tools=allow_write_chat_tools,
             )
     except (installer.InstallError, ManifestError, PackageSecurityError) as exc:
         print(f"ERROR: install failed: {exc}", file=sys.stderr)
@@ -273,6 +390,21 @@ def _cmd_install(argv: list[str]) -> int:
             "  NOTE: platform capabilities were DECLINED; the package's "
             "capability verbs are NOT registered."
         )
+
+    if write_tools:
+        print("")
+        if result.write_chat_tools_allowed:
+            print(
+                "  Write chat tools: ENABLED (operator opted in). The "
+                "package's write-capable chat tools WILL register on "
+                "next server start."
+            )
+        else:
+            print(
+                "  Write chat tools: GATED OFF (read-only default). The "
+                "package's write-capable chat tools will NOT register. "
+                "Re-install with --allow-write-chat-tools to enable."
+            )
 
     if result.env_credential_requests:
         print("")
@@ -436,7 +568,8 @@ def cmd_packages(argv: list[str]) -> int:
             "usage: python3 -m carpenter packages <command> [options]\n"
             "\n"
             "commands:\n"
-            "  install <source_name> [--path DIR] [--accept-capabilities]\n"
+            "  install <source_name> [--path DIR] [--accept-capabilities] "
+            "[--allow-write-chat-tools]\n"
             "  uninstall <name> [--force] [--preserve-state]\n"
             "  list\n",
             file=sys.stderr if (argv and argv[0] not in ("-h", "--help"))

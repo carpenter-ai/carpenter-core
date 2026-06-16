@@ -111,6 +111,10 @@ class InstallResult:
     # declares no platform capabilities.  Only granted capabilities are
     # later registered at load time.
     platform_capabilities_granted: tuple[dict, ...] = ()
+    # Operator-gated write chat tools (I10 relaxation): whether the
+    # operator opted this package's write-capable chat-boundary tools in
+    # at install time.  Default False (gated off; chat agent read-only).
+    write_chat_tools_allowed: bool = False
 
 
 @dataclass(frozen=True)
@@ -243,7 +247,16 @@ CREATE TABLE IF NOT EXISTS installed_packages (
     -- the verbs recorded here, so a declared-but-not-confirmed capability
     -- is never dispatchable.  Each element is {verb, kind, module,
     -- handler, grant{protocol, host_from, port, credential_ref}}.
-    platform_capabilities_json TEXT
+    platform_capabilities_json TEXT,
+    -- Operator-gated write chat tools (security invariant I10 relaxation):
+    -- the chat agent is read-only BY DEFAULT, so a package's write-capable
+    -- chat-boundary tools (those declaring arc_create / external_effect /
+    -- database_write / filesystem_write) are NOT registered unless the
+    -- operator explicitly opted in at install time.  This is ENFORCEMENT
+    -- state: the registry reads this flag per package and only registers
+    -- the write-capable chat tools when it is 1.  Default 0 (gated off).
+    -- This is SEPARATE from platform_capabilities_json (egress trust).
+    write_chat_tools_allowed INTEGER NOT NULL DEFAULT 0
 );
 """
 
@@ -285,6 +298,14 @@ def ensure_installer_tables(conn: sqlite3.Connection) -> None:
             "ALTER TABLE installed_packages "
             "ADD COLUMN platform_capabilities_json TEXT",
         )
+    # Operator-gated write chat tools migration: older DBs lack the
+    # write_chat_tools_allowed column.  Defaults to 0 (gated off) so
+    # existing installs stay read-only until re-installed with opt-in.
+    if "write_chat_tools_allowed" not in cols:
+        conn.execute(
+            "ALTER TABLE installed_packages "
+            "ADD COLUMN write_chat_tools_allowed INTEGER NOT NULL DEFAULT 0",
+        )
     conn.commit()
 
 
@@ -313,6 +334,7 @@ def _record_install(
     pkg_hash: str,
     installed_at: str,
     granted_capabilities: tuple[PlatformCapabilityRef, ...] = (),
+    write_chat_tools_allowed: bool = False,
 ) -> None:
     """Write the install row + templates rows.
 
@@ -335,8 +357,9 @@ def _record_install(
     conn.execute(
         "INSERT OR REPLACE INTO installed_packages "
         "(name, version, hash, source_path, install_path, installed_at, "
-        "allowlist_proposals_json, platform_capabilities_json) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "allowlist_proposals_json, platform_capabilities_json, "
+        "write_chat_tools_allowed) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             manifest.name,
             manifest.version,
@@ -346,6 +369,7 @@ def _record_install(
             installed_at,
             proposals_payload,
             capabilities_payload,
+            1 if write_chat_tools_allowed else 0,
         ),
     )
     # Refresh the templates join table for this package.
@@ -443,7 +467,8 @@ def get_install_record(
 ) -> dict | None:
     row = conn.execute(
         "SELECT name, version, hash, source_path, install_path, "
-        "installed_at, allowlist_proposals_json, platform_capabilities_json "
+        "installed_at, allowlist_proposals_json, platform_capabilities_json, "
+        "write_chat_tools_allowed "
         "FROM installed_packages WHERE name = ?",
         (name,),
     ).fetchone()
@@ -458,13 +483,15 @@ def get_install_record(
         "installed_at": row[5],
         "allowlist_proposals_json": row[6],
         "platform_capabilities_json": row[7],
+        "write_chat_tools_allowed": bool(row[8]),
     }
 
 
 def list_install_records(conn: sqlite3.Connection) -> list[dict]:
     rows = conn.execute(
         "SELECT name, version, hash, source_path, install_path, "
-        "installed_at, allowlist_proposals_json, platform_capabilities_json "
+        "installed_at, allowlist_proposals_json, platform_capabilities_json, "
+        "write_chat_tools_allowed "
         "FROM installed_packages ORDER BY name"
     ).fetchall()
     return [
@@ -474,6 +501,7 @@ def list_install_records(conn: sqlite3.Connection) -> list[dict]:
             "installed_at": r[5],
             "allowlist_proposals_json": r[6],
             "platform_capabilities_json": r[7],
+            "write_chat_tools_allowed": bool(r[8]),
         }
         for r in rows
     ]
@@ -517,6 +545,91 @@ def granted_verbs_for_package(
         c["verb"] for c in list_granted_capabilities(conn, name)
         if isinstance(c.get("verb"), str)
     )
+
+
+def write_chat_tools_allowed_for_package(
+    conn: sqlite3.Connection, name: str,
+) -> bool:
+    """Return whether the operator opted this package's WRITE chat tools in.
+
+    Authoritative source the registry consults at load time: a package's
+    write-capable chat-boundary tools are only registered when this is
+    ``True``.  Returns ``False`` for an uninstalled package (fail-closed —
+    the chat agent is read-only by default).
+    """
+    record = get_install_record(conn, name)
+    if record is None:
+        return False
+    return bool(record.get("write_chat_tools_allowed"))
+
+
+def classify_package_chat_tools(
+    manifest: PackageManifest,
+) -> tuple[list[dict], list[dict]]:
+    """Inspect a manifest's chat-tool modules and split tools by capability.
+
+    Imports each declared chat-tool module (package-aware, the same path
+    the registry uses) and collects ``@chat_tool``-decorated callables,
+    partitioning them into read-only and write/effectful groups so the
+    install preview can show the operator exactly what an opt-in would
+    enable.  A tool is "write/effectful" when it declares any capability
+    in :data:`carpenter.chat_tool_registry.WRITE_CAPABILITIES`.
+
+    Returns ``(read_only, write_capable)`` where each element is a dict
+    ``{"name": str, "capabilities": list[str], "write_capabilities":
+    list[str], "requires_user_confirm": bool}``.  Modules that fail to
+    import are skipped (logged at debug); the preview is best-effort and
+    never blocks the install.  Platform-boundary tools are omitted (they
+    are refused at registration regardless of opt-in).
+    """
+    from ..chat_tool_registry import WRITE_CAPABILITIES
+    from .loaders import _import_package_module
+
+    read_only: list[dict] = []
+    write_capable: list[dict] = []
+
+    for rel in manifest.chat_tools:
+        rel_path = Path(rel)
+        dotted = ".".join(rel_path.with_suffix("").parts)
+        try:
+            module = _import_package_module(
+                manifest.name, dotted, manifest.source_path,
+            )
+        except Exception as exc:  # noqa: BLE001 — preview is best-effort
+            logger.debug(
+                "classify_package_chat_tools: could not import %r for "
+                "package %r: %s", rel, manifest.name, exc,
+            )
+            continue
+        for attr_name in dir(module):
+            obj = getattr(module, attr_name)
+            if not callable(obj):
+                continue
+            meta = getattr(obj, "_chat_tool_meta", None)
+            if meta is None:
+                continue
+            if meta.get("trust_boundary") == "platform":
+                # Refused at registration regardless of opt-in; not a
+                # chat-boundary tool to preview.
+                continue
+            caps = list(meta.get("capabilities", []))
+            write_caps = [c for c in caps if c in WRITE_CAPABILITIES]
+            entry = {
+                "name": meta["name"],
+                "capabilities": caps,
+                "write_capabilities": write_caps,
+                "requires_user_confirm": bool(
+                    meta.get("requires_user_confirm", False),
+                ),
+            }
+            if write_caps:
+                write_capable.append(entry)
+            else:
+                read_only.append(entry)
+
+    read_only.sort(key=lambda e: e["name"])
+    write_capable.sort(key=lambda e: e["name"])
+    return read_only, write_capable
 
 
 # ── Atomic copy ─────────────────────────────────────────────────────
@@ -1268,6 +1381,7 @@ def install_package(
     conn: sqlite3.Connection,
     capability_input_fn=None,
     capability_prompt_stream=None,
+    allow_write_chat_tools: bool = False,
 ) -> InstallResult:
     """Validate, hash, and install a capability package.
 
@@ -1279,6 +1393,14 @@ def install_package(
             directory is created if missing; if it exists it is
             atomically replaced.
         conn: SQLite connection for recording the install.
+        allow_write_chat_tools: Explicit operator opt-in to enable the
+            package's WRITE-capable chat-boundary tools (I10 relaxation).
+            Default ``False`` — the chat agent is read-only by default,
+            so the package's write chat tools are recorded as gated-off
+            and the registry will SKIP registering them.  Set ``True``
+            only on explicit operator consent (CLI ``--allow-write-chat-
+            tools`` or interactive prompt).  This is SEPARATE from the
+            platform-capability egress grant (``capability_input_fn``).
 
     Returns:
         :class:`InstallResult` with the recorded hash + paths.
@@ -1376,6 +1498,7 @@ def install_package(
         pkg_hash=pkg_hash,
         installed_at=installed_at,
         granted_capabilities=granted_installed_caps,
+        write_chat_tools_allowed=allow_write_chat_tools,
     )
 
     # B-full: merge the proposed allowlist additions into the platform's
@@ -1432,6 +1555,7 @@ def install_package(
         platform_capabilities_granted=tuple(
             _capability_to_dict(c) for c in granted_installed_caps
         ),
+        write_chat_tools_allowed=allow_write_chat_tools,
     )
 
 

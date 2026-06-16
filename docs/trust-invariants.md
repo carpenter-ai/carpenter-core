@@ -279,13 +279,37 @@ and a `capabilities` list via `@chat_tool` decorators in Python modules under
 Platform boundary is restricted to `PLATFORM_TOOLS` frozenset (`submit_code`,
 `escalate_current_arc`, `escalate`) — user config cannot create platform tools.
 
+**Capability-package relaxation (operator-gated write chat tools):** The chat
+agent is read-only **by default**. A capability package may ship chat-boundary
+tools that declare write capabilities (`arc_create`, `external_effect`,
+`database_write`, `filesystem_write`), but they do **not** register unless the
+**operator explicitly opted the package in at install time**
+(`installed_packages.write_chat_tools_allowed = 1`, set via the
+`packages install --allow-write-chat-tools` flag or the interactive prompt).
+When the package is **not** opted in, its write-capable chat tools are
+gracefully **skipped** (logged + surfaced in the package's load summary as
+*gated*, NOT a fatal load error), while its read-only chat tools register
+normally. This relaxation **only** loosens the "chat-boundary tool may declare
+write capabilities" rule for an opted-in package; it never relaxes the
+platform-boundary refusal — a package tool declaring `trust_boundary='platform'`
+is always hard-refused. This is separate from the platform-capability egress
+grant (`platform_capabilities_json`); a package may need one, both, or neither.
+
 **Enforcement:**
-- `chat_tool_loader.py` — `@chat_tool` decorator validates at decoration time
+- `chat_tool_loader.py` — `@chat_tool` decorator validates at decoration time;
+  `register_extension_tool(..., allow_write_caps=...)` gates write-cap chat tools
 - `chat_tool_registry.py` `PLATFORM_TOOLS` — frozenset allowlist
-- `chat_tool_registry.py` `validate_tool_defs()` — load-time and hot-reload validation
+- `chat_tool_registry.py` `validate_tool_defs(..., write_chat_tools_allowed=...)`
+  — load-time and hot-reload validation; the flag relaxes only the chat-boundary
+  write check, never the platform-boundary refusal
+- `packages/registry.py` `_register_chat_tools()` — reads the per-package
+  `write_chat_tools_allowed` flag (via `installer`) and SKIPS gated write tools
+  (fail-closed when no DB connection is available to prove consent)
+- `packages/installer.py` — records the opt-in in `installed_packages`
 - `coordinator.py` — calls `load_chat_tools()`, raises RuntimeError on failure
 
-**Tests:** `tests/test_chat_tool_registry.py`, `tests/test_chat_tool_loader.py`
+**Tests:** `tests/test_chat_tool_registry.py`, `tests/test_chat_tool_loader.py`,
+`tests/packages/test_operator_gated_write_chat_tools.py`
 
 ---
 

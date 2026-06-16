@@ -281,6 +281,12 @@ def apply_reconciled_install(
         Path(record["source_path"]) if record is not None else dest_path
     )
     installed_at = datetime.now(timezone.utc).isoformat()
+    # Preserve the operator's prior write-chat-tools opt-in across a
+    # reconcile/upgrade — a version bump must not silently revoke an
+    # opt-in the operator already made.
+    prior_write_allowed = bool(
+        record.get("write_chat_tools_allowed") if record is not None else False
+    )
     _record_install(
         conn,
         manifest=installed_manifest,
@@ -288,6 +294,7 @@ def apply_reconciled_install(
         install_path=dest_path,
         pkg_hash=pkg_hash,
         installed_at=installed_at,
+        write_chat_tools_allowed=prior_write_allowed,
     )
 
     # Refresh KB articles for the reconciled tree the same way install
