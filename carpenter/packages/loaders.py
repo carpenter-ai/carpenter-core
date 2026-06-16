@@ -441,8 +441,8 @@ def load_platform_capabilities(
         return 0, []
     from .capabilities import (
         CapabilityError,
-        _resolve_platform_secret,
         get_capability_registry,
+        resolve_package_secret,
     )
 
     pkg_root = manifest.source_path
@@ -461,9 +461,13 @@ def load_platform_capabilities(
             continue
         # Resolve the confirmed egress host platform-side from the
         # package's credential.  The full env var is
-        # f"{credential_ref}_{host_from}".
+        # f"{credential_ref}_{host_from}".  Resolve via the package-aware
+        # resolver (keyed on ``manifest.name``) so a host that lives ONLY
+        # in the package's per-package ``.env`` is found — matching how
+        # ``CapabilityContext.secret`` resolves the rest of the package's
+        # credentials at dispatch time.
         host_key = f"{cap.grant.credential_ref}_{cap.grant.host_from}"
-        host = _resolve_platform_secret(host_key)
+        host = resolve_package_secret(manifest.name, host_key)
         if not host:
             errors.append(
                 f"platform_capabilities: verb {cap.verb!r}: egress host "

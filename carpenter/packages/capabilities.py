@@ -147,7 +147,7 @@ class CapabilityContext:
                 f"secret(): ref must be an UPPER_SNAKE suffix, got {ref!r}",
             )
         key = f"{self.credential_ref}_{ref}"
-        value = _resolve_platform_secret(key, package_name=self.package_name)
+        value = resolve_package_secret(self.package_name, key)
         if value is None:
             raise CapabilityError(
                 f"secret({ref!r}): credential {key!r} is not set "
@@ -210,10 +210,16 @@ def _read_package_env_value(package_name: str, key: str) -> str | None:
     return None
 
 
-def _resolve_platform_secret(
-    key: str, *, package_name: str | None = None,
-) -> str | None:
-    """Resolve ``key`` from the platform env / per-package ``.env`` / config.
+def resolve_package_secret(package_name: str, key: str) -> str | None:
+    """Resolve ``key`` for ``package_name`` PLATFORM-SIDE.
+
+    This is the single, package-aware credential resolver shared by both
+    :meth:`CapabilityContext.secret` (runtime credential access) and the
+    capability LOADER (:func:`carpenter.packages.loaders.load_platform_capabilities`,
+    which resolves a verb's egress *host* at registration time).  Both
+    paths MUST resolve a package's credentials identically — including the
+    package's OWN per-package ``.env`` — or a host that lives only in that
+    file will fail to register while ``ctx.secret`` reads it fine.
 
     Resolution order (highest precedence first):
 
@@ -223,12 +229,14 @@ def _resolve_platform_secret(
        ``{base_dir}/config/packages/{package_name}/.env`` — this is where
        env-credentialed package secrets actually live, and is loaded by
        neither ``os.environ`` nor ``config.CONFIG``.  Keyed strictly on
-       ``package_name`` so a handler can only read its own package's file.
+       ``package_name`` so a caller can only read its own package's file;
+       the path component is validated (no ``..``/separators) before use.
     3. The loaded platform config (which layers the MAIN ``{base_dir}/.env``
        for known credential keys).
 
     This is deliberately the PLATFORM environment, not anything the
-    untrusted executor can influence.
+    untrusted executor can influence.  Returns ``None`` if the credential
+    is not set in any of the three sources.
     """
     val = os.environ.get(key)
     if val:
@@ -243,6 +251,19 @@ def _resolve_platform_secret(
         return None
     cfg = config.CONFIG
     return cfg.get(key) or cfg.get(key.lower()) or None
+
+
+def _resolve_platform_secret(
+    key: str, *, package_name: str | None = None,
+) -> str | None:
+    """Backward-compatible alias for :func:`resolve_package_secret`.
+
+    Retained for any caller that resolves a key WITHOUT a package context
+    (``package_name=None`` skips the per-package ``.env`` step).  New code
+    should call :func:`resolve_package_secret` directly with the owning
+    package name.
+    """
+    return resolve_package_secret(package_name or "", key)
 
 
 @dataclass
