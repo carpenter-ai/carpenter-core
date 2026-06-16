@@ -66,6 +66,12 @@ _IGNORED_NAMES = frozenset({
     ".DS_Store",
     ".git",
     ".gitignore",
+    # Generated runtime state the subscription pipeline writes beside an
+    # installed package after install.  It is NOT part of the shipped,
+    # hash-pinned content, so excluding it keeps the SD6 integrity hash
+    # stable across loads (otherwise the package is refused on the load
+    # after its first subscription registration).
+    "_subscriptions.json",
 })
 _IGNORED_SUFFIXES = (".pyc", ".pyo", ".swp", "~")
 
