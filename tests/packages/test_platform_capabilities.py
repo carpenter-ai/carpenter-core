@@ -358,6 +358,99 @@ class TestLoader:
         handler_file = pkg / "handlers" / "echo.py"
         assert path_tier(str(handler_file)) == PATH_TIER_T1
 
+    def test_host_resolved_from_per_package_env_registers_verb(
+        self, tmp_path, monkeypatch, reset_cap_registry,
+    ):
+        """Egress host that lives ONLY in the package's per-package ``.env``.
+
+        This is the real-world ``carpenter-imap-email`` case: the host
+        credential (``DEMO_MAIL_HOST``) is provided ONLY in the package's
+        per-package ``.env`` — NOT in ``os.environ`` and NOT in the main
+        config.  The loader must resolve it package-side and REGISTER the
+        verb.  Before the fix the loader resolved the host without a
+        package context, so it failed with "not set platform-side" and the
+        verb never registered.
+        """
+        from carpenter.packages.loaders import load_platform_capabilities
+        from carpenter.packages.capabilities import get_capability_registry
+
+        # The package install dir (where the manifest lives) is distinct
+        # from the platform base_dir (where per-package .env files live).
+        src_root = tmp_path / "src"
+        src_root.mkdir()
+        pkg = _write_cap_pkg(src_root, name="capenvpkg")
+        m = load_manifest(pkg / "manifest.yaml")
+
+        base_dir = tmp_path / "base"
+        base_dir.mkdir()
+        monkeypatch.setattr(
+            "carpenter.config.CONFIG", {"base_dir": str(base_dir)},
+        )
+        # Host (and password) ONLY in the per-package .env — nothing in env.
+        monkeypatch.delenv("DEMO_MAIL_HOST", raising=False)
+        monkeypatch.delenv("DEMO_MAIL_PASSWORD", raising=False)
+        pkg_env_dir = base_dir / "config" / "packages" / "capenvpkg"
+        pkg_env_dir.mkdir(parents=True, exist_ok=True)
+        env_path = pkg_env_dir / ".env"
+        env_path.write_text(
+            "DEMO_MAIL_HOST=imap.from-pkg-env.example.com\n"
+            "DEMO_MAIL_PASSWORD=s3cr3t\n",
+            encoding="utf-8",
+        )
+        env_path.chmod(0o600)
+
+        n, errs = load_platform_capabilities(
+            m, granted_verbs=frozenset({"demo.echo"}),
+        )
+        assert n == 1, errs
+        assert errs == []
+
+        reg = get_capability_registry()
+        assert reg.is_capability_verb("demo.echo")
+        out = reg.dispatch("demo.echo", {"q": 1})
+        assert out["host"] == "imap.from-pkg-env.example.com"
+        # ctx.secret resolves from the same per-package .env.
+        assert out["has_password"] is True
+
+    def test_host_in_other_package_env_does_not_register(
+        self, tmp_path, monkeypatch, reset_cap_registry,
+    ):
+        """Isolation: package A's host is not resolvable from B's ``.env``.
+
+        Package A declares the egress verb; its host credential is planted
+        ONLY in a DIFFERENT package's per-package ``.env``.  The loader
+        keys resolution strictly on the OWNING package name, so the host is
+        not found and the verb is NOT registered.
+        """
+        from carpenter.packages.loaders import load_platform_capabilities
+        from carpenter.packages.capabilities import get_capability_registry
+
+        src_root = tmp_path / "src"
+        src_root.mkdir()
+        pkg = _write_cap_pkg(src_root, name="pkg-a")
+        m = load_manifest(pkg / "manifest.yaml")
+
+        base_dir = tmp_path / "base"
+        base_dir.mkdir()
+        monkeypatch.setattr(
+            "carpenter.config.CONFIG", {"base_dir": str(base_dir)},
+        )
+        monkeypatch.delenv("DEMO_MAIL_HOST", raising=False)
+        # Plant the host in package B's .env, not package A's.
+        other_env_dir = base_dir / "config" / "packages" / "pkg-b"
+        other_env_dir.mkdir(parents=True, exist_ok=True)
+        (other_env_dir / ".env").write_text(
+            "DEMO_MAIL_HOST=leaked.example.com\n", encoding="utf-8",
+        )
+
+        n, errs = load_platform_capabilities(
+            m, granted_verbs=frozenset({"demo.echo"}),
+        )
+        assert n == 0
+        assert len(errs) == 1
+        assert "not set platform-side" in errs[0]
+        assert not get_capability_registry().is_capability_verb("demo.echo")
+
 
 # ── CapabilityContext.secret resolution ─────────────────────────────
 
