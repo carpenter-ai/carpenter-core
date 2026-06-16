@@ -271,6 +271,67 @@ class TestAllowlistMerge:
         assert "a.com" in rows
         assert "b.com" in rows
 
+    def test_merge_inside_db_transaction_no_nested_connection(
+        self, tmp_path, monkeypatch,
+    ):
+        """Regression: installing a package WITH allowlist_proposals
+        inside a real ``db_transaction()`` must not trip the same-thread
+        deadlock guard.
+
+        Before the fix, ``_merge_allowlist_proposals`` called
+        ``get_policies()`` without threading the active connection.  When
+        the SecurityPolicies singleton was cold (None), the lazy
+        ``_load_from_db()`` opened a SECOND connection on the same thread
+        inside the install transaction, tripping the ``get_db()`` deadlock
+        guard and printing a traceback on every capability-package
+        install.  We assert no RuntimeError escapes and the rows persist.
+        """
+        from carpenter.db import db_transaction, get_db
+        from carpenter.security import policies as _p
+
+        # Force the cold-start (lazy-load) path: singleton is None, so
+        # ``get_policies()`` will run ``_load_from_db`` on first call.
+        saved = _p._singleton
+        _p._singleton = None
+        # Ensure the security_policies table exists in the real test DB.
+        conn0 = get_db()
+        try:
+            _make_security_policies_table(conn0)
+            from carpenter.packages.installer import ensure_installer_tables
+            ensure_installer_tables(conn0)
+            conn0.commit()
+        finally:
+            conn0.close()
+
+        src = _write_pkg(
+            tmp_path / "src", "p", """
+                name: p
+                version: "0.1.0"
+                description: x
+                allowlist_proposals:
+                  - {type: domain, value: nested.example.com}
+            """,
+        )
+        dest = tmp_path / "installed" / "p"
+        try:
+            # No RuntimeError("get_db() called while a db_transaction() ...")
+            # must escape here.
+            with db_transaction() as db:
+                result = install_package(src, dest, conn=db)
+            assert result.allowlist_added == (
+                ("domain", "nested.example.com"),
+            )
+            # Rows persisted (transaction committed cleanly).
+            with db_transaction() as db:
+                rows = db.execute(
+                    "SELECT value FROM security_policies "
+                    "WHERE policy_type='domain' "
+                    "AND value='nested.example.com'"
+                ).fetchall()
+            assert len(rows) == 1
+        finally:
+            _p._singleton = saved
+
     def test_uninstall_does_not_touch_allowlists(
         self, db_conn, tmp_path, isolated_policies,
     ):
@@ -571,3 +632,66 @@ class TestComputePlatformTemplates:
         attr = hr._PLATFORM_TEMPLATES  # type: ignore[attr-defined]
         assert isinstance(attr, frozenset)
         assert "coding-change" in attr
+
+
+# ── Install-time pristine-archive caching (reconcile prerequisite) ──
+
+
+class TestInstallArchiveCaching:
+    def test_install_caches_pristine_archive_round_trip(
+        self, db_conn, tmp_path,
+    ):
+        """On a successful install, the installed version's pristine tree
+        is archived into the local cache and round-trips via
+        ``load_pristine_tree`` against the recorded install hash."""
+        from carpenter.packages import archive_cache
+
+        src = _write_pkg(
+            tmp_path / "src", "p", """
+                name: p
+                version: "0.3.0"
+                description: x
+            """,
+            files={"extra.txt": "hello reconcile\n"},
+        )
+        dest = tmp_path / "installed" / "p"
+        result = install_package(src, dest, conn=db_conn)
+
+        # The archive exists at the cache path keyed by name/version.
+        cached = archive_cache.cache_dir() / "p" / "0.3.0.tar.gz"
+        assert cached.is_file()
+
+        # Round-trip: load_pristine_tree verifies against the install hash.
+        tree = archive_cache.load_pristine_tree(
+            "p", "0.3.0", expected_root_hash=result.hash,
+        )
+        assert tree["manifest.yaml"]
+        assert tree["extra.txt"] == b"hello reconcile\n"
+
+    def test_install_succeeds_when_archive_cache_write_fails(
+        self, db_conn, tmp_path, monkeypatch,
+    ):
+        """Archiving is best-effort: a cache-write failure must NOT fail
+        the install."""
+        from carpenter.packages import archive_cache
+
+        def _boom(*_a, **_k):
+            raise OSError("simulated cache write failure")
+
+        monkeypatch.setattr(archive_cache, "store_archive", _boom)
+
+        src = _write_pkg(
+            tmp_path / "src", "p", """
+                name: p
+                version: "0.4.0"
+                description: x
+            """,
+        )
+        dest = tmp_path / "installed" / "p"
+        # Must not raise despite the cache failure.
+        result = install_package(src, dest, conn=db_conn)
+        assert result.version == "0.4.0"
+        # Install record persisted.
+        rec = get_install_record(db_conn, "p")
+        assert rec is not None
+        assert rec["version"] == "0.4.0"

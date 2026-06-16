@@ -227,8 +227,20 @@ def load_data_models(
 
 def load_arc_templates(
     manifest: PackageManifest,
+    *,
+    db_conn=None,
 ) -> tuple[int, list[str], list[str]]:
     """Load each declared arc template into the platform's template DB.
+
+    Args:
+        manifest: The package manifest declaring the templates.
+        db_conn: Optional active DB connection.  The daemon's startup
+            discovery wraps ``discover_and_register`` in a
+            ``db_transaction()``; when set we thread the connection into
+            :func:`template_manager.load_template` so it reuses the
+            transaction instead of opening a nested one (which trips the
+            same-thread deadlock guard and stranded every package
+            template at startup).
 
     Returns ``(registered_count, errors, registered_names)``.  Each
     template is loaded by :func:`carpenter.core.engine.template_manager.load_template`,
@@ -286,7 +298,9 @@ def load_arc_templates(
             # package's own templates; platform/other-package arcs never
             # receive the grant.
             template_manager.load_template(
-                str(yaml_path), owner_package=manifest.name,
+                str(yaml_path),
+                owner_package=manifest.name,
+                db_conn=db_conn,
             )
         except Exception as exc:  # noqa: BLE001 — surface to load_errors
             errors.append(
@@ -624,8 +638,16 @@ def load_step_handlers(
 
 def load_package_artifacts(
     manifest: PackageManifest,
+    *,
+    db_conn=None,
 ) -> tuple[dict[str, int], list[str], list[str]]:
     """Run every B-min loader and aggregate results.
+
+    Args:
+        manifest: The package manifest whose artifacts to load.
+        db_conn: Optional active DB connection, threaded into
+            :func:`load_arc_templates` so template loading reuses the
+            caller's transaction (see that function's docstring).
 
     Returns ``(counts, errors, template_names)``:
 
@@ -652,7 +674,7 @@ def load_package_artifacts(
     counts["data_models"] = n
     errors.extend(errs)
 
-    n, errs, tnames = load_arc_templates(manifest)
+    n, errs, tnames = load_arc_templates(manifest, db_conn=db_conn)
     counts["arc_templates"] = n
     errors.extend(errs)
 

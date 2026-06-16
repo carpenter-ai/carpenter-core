@@ -766,7 +766,14 @@ def _merge_allowlist_proposals(
         )
         if get_policies is not None:
             try:
-                get_policies().add(ptype, value)
+                # Thread the active install transaction's connection so a
+                # cold first-call ``get_policies()`` (singleton is None)
+                # doesn't open a SECOND connection on this thread.  Inside
+                # ``install_package``'s ``db_transaction()`` that nested
+                # ``get_db()`` trips the deadlock guard in ``carpenter.db``
+                # and prints a traceback on every capability-package
+                # install (the install still persists, but ugly).
+                get_policies(_db_conn=conn).add(ptype, value)
             except (ValueError, KeyError) as exc:
                 # Manifest validation already rejects unknown types;
                 # this would be a real bug — surface a warning but
@@ -1532,6 +1539,32 @@ def install_package(
     # EXECUTOR subprocesses.  OAuth refs are handled by the separate
     # OAuth-callback flow and are skipped here.
     env_cred_requests = _request_env_credentials(installed_manifest)
+
+    # Reconcile prerequisite: cache the installed version's PRISTINE tree
+    # into the local archive cache (keyed by name/version on disk under
+    # ``{base_dir}``, off the SD card).  Upgrades diff this ``shipped_old``
+    # tree against the new version's tree to classify user edits.  We
+    # archive the freshly-materialised install dir (``dest_path``) so the
+    # cached tree's hash matches the recorded ``installed_packages.hash``.
+    # BEST-EFFORT: a cache-write failure must NOT fail the install -- the
+    # cache is a reconcile optimisation, not a correctness invariant.  No
+    # new DB row is recorded; the cache is content-addressed on disk.
+    try:
+        from . import archive_cache
+        cached_path = archive_cache.store_archive(
+            installed_manifest.name, installed_manifest.version, dest_path,
+        )
+        logger.debug(
+            "Cached pristine archive for %r v%s at %s",
+            installed_manifest.name, installed_manifest.version, cached_path,
+        )
+    except Exception:  # noqa: BLE001 — cache is best-effort
+        logger.warning(
+            "Could not cache pristine archive for %r v%s; reconcile "
+            "upgrades may need to re-fetch this version's tree",
+            installed_manifest.name, installed_manifest.version,
+            exc_info=True,
+        )
 
     logger.info(
         "Installed capability package %r v%s (hash %s, %s)",
