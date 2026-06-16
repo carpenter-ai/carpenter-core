@@ -148,6 +148,10 @@ def main():
         _cmd_setup_credential(sys.argv[2:])
         return
 
+    if len(sys.argv) > 1 and sys.argv[1] == "packages":
+        from .cli_packages import cmd_packages
+        sys.exit(cmd_packages(sys.argv[2:]))
+
     from .server import run_server
     run_server()
 
