@@ -21,6 +21,39 @@ API_VERSION = "2023-06-01"
 DEFAULT_MODEL = "claude-sonnet-4-6"
 DEFAULT_MAX_TOKENS = 4096
 
+# Model-id prefixes for models that reject the `temperature` request field.
+# Anthropic returns HTTP 400 ("`temperature` is deprecated for this model.")
+# when temperature is sent to these models, so we omit the field entirely.
+# Newer Opus models (4-7 and onward) dropped temperature support.
+TEMPERATURE_UNSUPPORTED_PREFIXES = (
+    "claude-opus-4-7",
+)
+
+
+def supports_temperature(model: str | None) -> bool:
+    """Return True if the given model accepts the `temperature` field.
+
+    Models in TEMPERATURE_UNSUPPORTED_PREFIXES reject temperature with a
+    400 error, so the request body must omit it for them.
+    """
+    if not model:
+        return True
+    return not any(model.startswith(p) for p in TEMPERATURE_UNSUPPORTED_PREFIXES)
+
+
+def _is_temperature_deprecated_error(error_body: object) -> bool:
+    """Return True if an API error body says `temperature` is deprecated.
+
+    Matches the Anthropic 400 message:
+        "`temperature` is deprecated for this model."
+    """
+    if not isinstance(error_body, dict):
+        return False
+    message = error_body.get("error", {})
+    if isinstance(message, dict):
+        message = message.get("message", "")
+    return isinstance(message, str) and "temperature" in message and "deprecated" in message
+
 
 def get_api_key() -> str:
     """Get Claude API key from config."""
@@ -182,10 +215,14 @@ def call(
     body = {
         "model": model,
         "max_tokens": max_tokens,
-        "temperature": temperature,
         "system": system_content,
         "messages": msgs,
     }
+
+    # Some models (e.g. claude-opus-4-7) reject the `temperature` field with a
+    # 400 ("`temperature` is deprecated for this model."). Omit it for those.
+    if supports_temperature(model):
+        body["temperature"] = temperature
 
     if tool_choice:
         body["tool_choice"] = tool_choice
@@ -280,6 +317,7 @@ def call(
                     e.response.status_code, attempt + 1, max_attempts)
             else:
                 # 4xx errors (except 429) - log the error body for debugging
+                error_body = None
                 try:
                     error_body = e.response.json()
                     logger.error("Claude API 4xx error: status=%d, body=%s",
@@ -287,6 +325,23 @@ def call(
                 except (ValueError, KeyError) as _exc:
                     logger.error("Claude API 4xx error: status=%d, body=%s",
                                 e.response.status_code, e.response.text)
+
+                # Defensive: a future model may start rejecting `temperature`
+                # before it lands in TEMPERATURE_UNSUPPORTED_PREFIXES. If the
+                # API tells us temperature is deprecated and we still sent it,
+                # strip it and retry once transparently.
+                if (
+                    e.response.status_code == 400
+                    and "temperature" in body
+                    and _is_temperature_deprecated_error(error_body)
+                ):
+                    logger.warning(
+                        "Claude API rejected `temperature` for model=%s; "
+                        "retrying once without it", model)
+                    del body["temperature"]
+                    last_error = e
+                    continue
+
                 raise  # 4xx (except 429) are not retryable
 
         except (httpx.ConnectError, httpx.TimeoutException) as e:

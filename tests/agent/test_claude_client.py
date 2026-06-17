@@ -111,6 +111,120 @@ def test_call_constructs_request(monkeypatch):
     assert result["content"][0]["text"] == "response"
 
 
+def test_call_omits_temperature_for_unsupported_model(monkeypatch):
+    """call must NOT send `temperature` for models that reject it (opus-4-7)."""
+    captured = {}
+
+    def mock_post(url, **kwargs):
+        import json as _json
+        captured["body"] = _json.loads(kwargs["content"])
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "content": [{"type": "text", "text": "ok"}],
+            "usage": {"input_tokens": 10, "output_tokens": 5},
+        }
+        mock_response.headers = {}
+        return mock_response
+
+    monkeypatch.setattr("httpx.post", mock_post)
+
+    claude_client.call(
+        "system", [{"role": "user", "content": "hi"}],
+        api_key="key", model="claude-opus-4-7", temperature=0.7,
+    )
+
+    assert "temperature" not in captured["body"]
+
+
+def test_call_sends_temperature_for_supported_model(monkeypatch):
+    """call must still send `temperature` for models that accept it."""
+    captured = {}
+
+    def mock_post(url, **kwargs):
+        import json as _json
+        captured["body"] = _json.loads(kwargs["content"])
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "content": [{"type": "text", "text": "ok"}],
+            "usage": {"input_tokens": 10, "output_tokens": 5},
+        }
+        mock_response.headers = {}
+        return mock_response
+
+    monkeypatch.setattr("httpx.post", mock_post)
+
+    claude_client.call(
+        "system", [{"role": "user", "content": "hi"}],
+        api_key="key", model="claude-sonnet-4-6", temperature=0.42,
+    )
+
+    assert captured["body"]["temperature"] == 0.42
+
+
+def test_supports_temperature_helper():
+    """supports_temperature flags opus-4-7 unsupported, others supported."""
+    assert claude_client.supports_temperature("claude-opus-4-7") is False
+    assert claude_client.supports_temperature("claude-sonnet-4-6") is True
+    assert claude_client.supports_temperature("claude-haiku-4-5") is True
+    assert claude_client.supports_temperature(None) is True
+
+
+def test_call_retries_without_temperature_on_400_deprecated(monkeypatch):
+    """On a 400 'temperature is deprecated' error, call retries once stripping it."""
+    calls = []
+
+    def mock_post(url, **kwargs):
+        import json as _json
+        body = _json.loads(kwargs["content"])
+        calls.append(body)
+        if len(calls) == 1:
+            # First attempt: simulate the 400 deprecation error
+            err_response = MagicMock()
+            err_response.status_code = 400
+            err_response.json.return_value = {
+                "type": "error",
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": "`temperature` is deprecated for this model.",
+                },
+            }
+            err_response.text = "deprecated"
+            import httpx as _httpx
+            raise _httpx.HTTPStatusError(
+                "400", request=MagicMock(), response=err_response)
+        # Retry succeeds
+        ok = MagicMock()
+        ok.json.return_value = {
+            "content": [{"type": "text", "text": "ok"}],
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+        }
+        ok.headers = {}
+        return ok
+
+    monkeypatch.setattr("httpx.post", mock_post)
+    # Use a model NOT in the deny-set so temperature is sent on the first try
+    result = claude_client.call(
+        "system", [{"role": "user", "content": "hi"}],
+        api_key="key", model="claude-future-9", temperature=0.7,
+    )
+
+    assert len(calls) == 2
+    assert "temperature" in calls[0]  # first attempt sent it
+    assert "temperature" not in calls[1]  # retry stripped it
+    assert result["content"][0]["text"] == "ok"
+
+
+def test_is_temperature_deprecated_error():
+    """Helper detects the deprecation error message and ignores others."""
+    assert claude_client._is_temperature_deprecated_error(
+        {"error": {"message": "`temperature` is deprecated for this model."}}
+    ) is True
+    assert claude_client._is_temperature_deprecated_error(
+        {"error": {"message": "some other error"}}
+    ) is False
+    assert claude_client._is_temperature_deprecated_error(None) is False
+
+
 def test_build_messages_conversation_cache_breakpoint():
     """build_messages adds cache_control to penultimate user message in long conversations."""
     conversation = [
