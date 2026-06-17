@@ -202,19 +202,20 @@ async def handle_arc_dispatch(work_id: int, payload: dict):
             should_invoke = agent_config is not None or policy_id is not None or agent_type == "EXECUTOR"
 
             if should_invoke:
+                # The source conversation is only an output-routing target;
+                # _run_arc_agent runs the agent in its own ephemeral
+                # conversation regardless.  Trigger/background-spawned arc
+                # trees (triage, reflections, the index pipeline) have no
+                # originating chat conversation, so conv_id is None for
+                # them — invoke anyway rather than freezing the pipeline.
                 conv_id = _find_arc_conversation(arc_id)
-                if conv_id:
-                    logger.info(
-                        "Arc %d (%s): invoking agent for goal: %s",
-                        arc_id, agent_type, goal[:80],
-                    )
-                    await _run_arc_agent(arc_id, goal, conv_id, agent_config=agent_config)
-                else:
-                    logger.warning(
-                        "Arc %d: no conversation found for invoke_agent, "
-                        "freezing without execution",
-                        arc_id,
-                    )
+                logger.info(
+                    "Arc %d (%s): invoking agent (source_conv=%s) for goal: %s",
+                    arc_id, agent_type,
+                    conv_id if conv_id else "none",
+                    goal[:80],
+                )
+                await _run_arc_agent(arc_id, goal, conv_id, agent_config=agent_config)
             else:
                 # PLANNER/REVIEWER/JUDGE arcs without config or code: freeze immediately
                 logger.info(
@@ -816,7 +817,7 @@ async def _run_judge_checks(arc_id: int) -> None:
 
 
 async def _run_arc_agent(
-    arc_id: int, goal: str, source_conv_id: int,
+    arc_id: int, goal: str, source_conv_id: int | None,
     agent_config: dict | None = None,
 ) -> None:
     """Invoke the chat agent to execute an arc's goal.
@@ -826,6 +827,11 @@ async def _run_arc_agent(
     archives the ephemeral conversation.
 
     Args:
+        source_conv_id: The originating chat conversation, used only as an
+                      output-routing/notification target. ``None`` for
+                      trigger/background-spawned arcs that have no
+                      originating conversation; the agent still runs in its
+                      own ephemeral conversation.
         agent_config: Optional model_policies row dict with 'model', 'agent_role',
                       'temperature', 'max_tokens'. When present, overrides the
                       default model for this invocation.
@@ -841,7 +847,7 @@ async def _run_arc_agent(
         "arc_execute",
         arc_id=arc_id,
         goal=goal,
-        source_conv_id=source_conv_id,
+        source_conv_id=source_conv_id or 0,
     )
     conv_module.add_message(arc_conv_id, "user", message)
 

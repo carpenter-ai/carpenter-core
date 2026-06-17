@@ -29,6 +29,8 @@ CREATE TABLE IF NOT EXISTS arcs (
     arc_role TEXT DEFAULT 'worker',
     verification_target_id INTEGER REFERENCES arcs(id),
     priority INTEGER NOT NULL DEFAULT 100,
+    origin_kind TEXT,
+    origin_ref TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP
 );
