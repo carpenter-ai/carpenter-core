@@ -465,3 +465,100 @@ def test_reviewer_target_linkage():
         assert target_id == tainted_id
     finally:
         db.close()
+
+
+def test_create_batch_persists_code_file_id():
+    """A batch arc spec carrying code_file_id persists it on the arc, and
+    dispatch_arc routes that arc to the execute_code action (running the
+    pre-verified script directly) rather than invoke_agent.
+
+    This is the path package-authored pre-verified scripts use (e.g. the
+    email fetch script that calls a brokered capability verb, which the
+    normal submit_code verifier would reject).
+    """
+    from carpenter.core import code_manager
+    from carpenter.core.arcs import manager as arc_manager
+
+    # Save a trivial pre-verified script as a code file.
+    saved = code_manager.save_code(
+        "result = 1 + 1\n", source="template", name="preverified",
+    )
+    code_file_id = saved["code_file_id"]
+
+    parent = arc_manager.create_arc("parent", agent_type="PLANNER")
+    arc_manager.update_status(parent, "active")
+
+    result = arc_backend.handle_create_batch({
+        "arcs": [
+            {
+                "name": "preseeded-executor",
+                "goal": "Run the pre-verified script.",
+                "parent_id": parent,
+                "integrity_level": "untrusted",
+                "output_type": "json",
+                "agent_type": "EXECUTOR",
+                "code_file_id": code_file_id,
+                "step_order": 0,
+            },
+            {
+                "name": "reviewer",
+                "parent_id": parent,
+                "agent_type": "REVIEWER",
+                "integrity_level": "trusted",
+                "reviewer_profile": "security-reviewer",
+                "step_order": 1,
+            },
+            {
+                "name": "judge",
+                "parent_id": parent,
+                "agent_type": "JUDGE",
+                "integrity_level": "trusted",
+                "reviewer_profile": "judge",
+                "step_order": 2,
+            },
+        ]
+    })
+
+    assert "error" not in result, result
+    executor_id = result["arc_ids"][0]
+
+    # Column persisted on the arc.
+    arc = arc_manager.get_arc(executor_id)
+    assert arc["code_file_id"] == code_file_id
+
+    # dispatch_arc routes a code_file_id arc to execute_code.
+    dispatched = arc_manager.dispatch_arc(executor_id)
+    assert dispatched["action"] == "execute_code"
+    assert dispatched["arc_id"] == executor_id
+
+
+def test_create_batch_rejects_non_integer_code_file_id():
+    """A non-integer code_file_id fails the batch atomically."""
+    result = arc_backend.handle_create_batch({
+        "arcs": [
+            {
+                "name": "bad-executor",
+                "code_file_id": "not-an-int",
+            },
+        ]
+    })
+    assert "error" in result
+    assert "code_file_id" in result["error"]
+
+
+def test_create_batch_no_code_file_id_routes_to_invoke_agent():
+    """An arc without code_file_id still routes to invoke_agent (regression)."""
+    parent = arc_manager.create_arc("parent", agent_type="PLANNER")
+    arc_manager.update_status(parent, "active")
+
+    result = arc_backend.handle_create_batch({
+        "arcs": [
+            {"name": "plain-executor", "goal": "Do work", "parent_id": parent},
+        ]
+    })
+    assert "error" not in result, result
+    arc_id = result["arc_ids"][0]
+    arc = arc_manager.get_arc(arc_id)
+    assert arc["code_file_id"] is None
+    dispatched = arc_manager.dispatch_arc(arc_id)
+    assert dispatched["action"] == "invoke_agent"

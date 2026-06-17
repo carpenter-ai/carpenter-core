@@ -326,13 +326,33 @@ def handle_create_batch(params: dict) -> dict:
                         arc_spec["model_policy"], _db_conn=db
                     )
 
+                # Optional pre-seeded code file: when set, dispatch_arc
+                # routes this arc to execute_code (running the pre-verified
+                # script directly in the arc-step sandbox) instead of
+                # invoke_agent.  Used for package-authored pre-verified
+                # scripts (e.g. the email fetch script that calls a brokered
+                # capability verb, which the normal submit_code verifier
+                # would reject).
+                code_file_id = arc_spec.get("code_file_id")
+                if code_file_id is not None:
+                    try:
+                        code_file_id = int(code_file_id)
+                    except (TypeError, ValueError):
+                        db.rollback()
+                        return {
+                            "error": f"Invalid code_file_id "
+                                     f"{arc_spec.get('code_file_id')!r} for arc "
+                                     f"'{arc_spec.get('name')}'"
+                        }
+
                 # Insert arc
                 cursor = db.execute(
                     "INSERT INTO arcs "
                     "(name, goal, parent_id, step_order, depth, "
                     " integrity_level, output_type, agent_type, "
-                    " model_policy_id, origin_kind, origin_ref, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    " model_policy_id, origin_kind, origin_ref, "
+                    " code_file_id, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         arc_spec.get("name", ""),
                         arc_spec.get("goal"),
@@ -345,6 +365,7 @@ def handle_create_batch(params: dict) -> dict:
                         policy_id,
                         inherited_origin_kind,
                         inherited_origin_ref,
+                        code_file_id,
                         now,
                     ),
                 )
