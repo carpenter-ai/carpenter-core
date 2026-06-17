@@ -31,9 +31,16 @@ def handle_create(params: dict) -> dict:
     """
     kwargs = {}
     for key in ("integrity_level", "output_type", "agent_type", "model", "model_role",
-                "agent_role", "wait_until", "output_contract", "model_policy_id"):
+                "agent_role", "wait_until", "output_contract", "model_policy_id",
+                "origin_kind", "origin_ref"):
         if key in params:
             kwargs[key] = params[key]
+
+    # A root arc created via the chat-boundary arc.create tool originated
+    # from chat unless the caller stamped a more specific origin.  Children
+    # (parent_id set) inherit the root's origin in create_arc.
+    if params.get("parent_id") is None and "origin_kind" not in kwargs:
+        kwargs["origin_kind"] = "chat"
 
     arc_id = arc_manager.create_arc(
         name=params["name"],
@@ -294,14 +301,20 @@ def handle_create_batch(params: dict) -> dict:
                 output_type = validate_output_type(arc_spec.get("output_type", "python"))
                 agent_type = validate_agent_type(arc_spec.get("agent_type", "EXECUTOR"))
 
-                # Calculate depth
+                # Calculate depth + inherit provenance from the parent so
+                # batch children carry the root tree's origin.
                 depth = 0
+                inherited_origin_kind = None
+                inherited_origin_ref = None
                 if parent_id is not None:
                     parent = db.execute(
-                        "SELECT depth FROM arcs WHERE id = ?", (parent_id,)
+                        "SELECT depth, origin_kind, origin_ref "
+                        "FROM arcs WHERE id = ?", (parent_id,)
                     ).fetchone()
                     if parent is not None:
                         depth = parent["depth"] + 1
+                        inherited_origin_kind = parent["origin_kind"]
+                        inherited_origin_ref = parent["origin_ref"]
 
                 # Resolve model_policy_id (by name or direct ID).
                 # Pass the transaction's connection so the lookup reuses
@@ -318,8 +331,8 @@ def handle_create_batch(params: dict) -> dict:
                     "INSERT INTO arcs "
                     "(name, goal, parent_id, step_order, depth, "
                     " integrity_level, output_type, agent_type, "
-                    " model_policy_id, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    " model_policy_id, origin_kind, origin_ref, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         arc_spec.get("name", ""),
                         arc_spec.get("goal"),
@@ -330,6 +343,8 @@ def handle_create_batch(params: dict) -> dict:
                         output_type,
                         agent_type,
                         policy_id,
+                        inherited_origin_kind,
+                        inherited_origin_ref,
                         now,
                     ),
                 )

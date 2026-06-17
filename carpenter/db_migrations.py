@@ -1053,6 +1053,31 @@ def _migrate_template_owner_package(
         conn.commit()
 
 
+def _migrate_arc_origin(conn: sqlite3.Connection, tables: set) -> None:
+    """Add arc provenance columns: origin_kind + origin_ref.
+
+    Records where a root arc tree came from (chat, trigger, schedule,
+    webhook, reflection, arc, manual, cli) and a compact JSON reference
+    to the originating entity.  Descendants inherit the root's origin at
+    creation time, so background/trigger-spawned trees carry provenance
+    even though they have no chat conversation link.
+    """
+    if "arcs" not in tables:
+        return
+    cols = {
+        row[1] for row in conn.execute("PRAGMA table_info(arcs)").fetchall()
+    }
+    changed = False
+    if "origin_kind" not in cols:
+        conn.execute("ALTER TABLE arcs ADD COLUMN origin_kind TEXT")
+        changed = True
+    if "origin_ref" not in cols:
+        conn.execute("ALTER TABLE arcs ADD COLUMN origin_ref TEXT")
+        changed = True
+    if changed:
+        conn.commit()
+
+
 def run_migrations(conn: sqlite3.Connection) -> None:
     """Run all data migrations for existing databases.
 
@@ -1098,3 +1123,4 @@ def run_migrations(conn: sqlite3.Connection) -> None:
     _migrate_package_state(conn, tables)
     # package_vectors must run after installed_packages (FK target).
     _migrate_package_vectors(conn, tables)
+    _migrate_arc_origin(conn, tables)

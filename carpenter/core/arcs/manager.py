@@ -108,6 +108,8 @@ def create_arc(
     arc_role: str = "worker",
     verification_target_id: int | None = None,
     priority: int | None = None,
+    origin_kind: str | None = None,
+    origin_ref: str | None = None,
     _db_conn=None,
     _audit_queue: list | None = None,
 ) -> int:
@@ -173,6 +175,8 @@ def create_arc(
         arc_role=arc_role,
         verification_target_id=verification_target_id,
         priority=priority,
+        origin_kind=origin_kind,
+        origin_ref=origin_ref,
         _db_conn=_db_conn,
         _audit_queue=_audit_queue,
     )
@@ -204,6 +208,8 @@ def _insert_arc(
     arc_role: str = "worker",
     verification_target_id: int | None = None,
     priority: int | None = None,
+    origin_kind: str | None = None,
+    origin_ref: str | None = None,
     _db_conn=None,
     _audit_queue: list | None = None,
 ) -> int:
@@ -244,11 +250,19 @@ def _insert_arc(
         parent_priority: int | None = None
         if parent_id is not None:
             parent = db.execute(
-                "SELECT depth, priority FROM arcs WHERE id = ?", (parent_id,)
+                "SELECT depth, priority, origin_kind, origin_ref "
+                "FROM arcs WHERE id = ?", (parent_id,)
             ).fetchone()
             if parent is not None:
                 depth = parent["depth"] + 1
                 parent_priority = parent["priority"]
+                # Provenance inheritance: a child inherits the root's origin
+                # unless explicitly overridden, so an entire trigger/background
+                # tree carries the same origin without re-stamping each node.
+                if origin_kind is None:
+                    origin_kind = parent["origin_kind"]
+                if origin_ref is None:
+                    origin_ref = parent["origin_ref"]
 
         # Priority inheritance: explicit value wins; else inherit from parent
         # if one exists; else default to 100.
@@ -277,13 +291,15 @@ def _insert_arc(
             "(name, goal, parent_id, code_file_id, template_id, step_role, "
             " from_template, template_mutable, timeout_minutes, step_order, depth, "
             " integrity_level, output_type, agent_type, model_policy_id, "
-            " wait_until, output_contract, arc_role, verification_target_id, priority, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " wait_until, output_contract, arc_role, verification_target_id, priority, "
+            " origin_kind, origin_ref, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 name, goal, parent_id, code_file_id, template_id, step_role,
                 from_template, template_mutable, timeout_minutes, step_order, depth,
                 integrity_level, output_type, agent_type, model_policy_id,
-                wait_until, output_contract, arc_role, verification_target_id, resolved_priority, now,
+                wait_until, output_contract, arc_role, verification_target_id, resolved_priority,
+                origin_kind, origin_ref, now,
             ),
         )
         arc_id = cursor.lastrowid

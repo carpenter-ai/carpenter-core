@@ -277,6 +277,32 @@ async def test_explicit_dispatch_works_regardless_of_wait_until():
     assert arc["status"] in ("waiting", "completed")
 
 
+@pytest.mark.asyncio
+async def test_dispatch_invokes_agent_without_source_conversation():
+    """Trigger/background-spawned arcs have no chat conversation; the agent
+    must still be invoked (not frozen without execution)."""
+    parent = arc_manager.create_arc("bg-parent", agent_type="PLANNER")
+    arc_manager.update_status(parent, "active")
+    child = arc_manager.add_child(parent, "bg-exec", goal="Do background work")
+
+    with patch(
+        "carpenter.core.arcs.dispatch_handler._run_arc_agent",
+        new_callable=AsyncMock,
+    ) as mock_agent, patch(
+        "carpenter.core.arcs.dispatch_handler._find_arc_conversation",
+        return_value=None,
+    ):
+        await arc_dispatch_handler.handle_arc_dispatch(
+            work_id=51, payload={"arc_id": child},
+        )
+
+    mock_agent.assert_awaited_once()
+    # _run_arc_agent(arc_id, goal, source_conv_id, ...) — 3rd positional
+    # arg is the source conversation, which must be None (not a freeze).
+    args, _kwargs = mock_agent.call_args
+    assert args[2] is None
+
+
 def test_enqueue_ready_children_after_child_completes():
     """When a child completes, the next child should be enqueued."""
     parent = arc_manager.create_arc("parent", agent_type="PLANNER")

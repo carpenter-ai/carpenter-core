@@ -383,10 +383,19 @@ def handle_subscription_create_arc(payload: dict) -> int | None:
     if priority is not None:
         create_kwargs["priority"] = priority
 
+    # Provenance: this root arc was spawned by a trigger/event subscription.
+    # The whole tree inherits this origin via create_arc.
+    subscription_name = payload.get("_subscription")
+    origin_ref = json.dumps(
+        {k: v for k, v in {"subscription": subscription_name}.items() if v}
+    )
+
     parent_id = arc_manager.create_arc(
         name=arc_name,
         goal=arc_goal,
         template_id=template_id,
+        origin_kind="trigger",
+        origin_ref=origin_ref,
         **create_kwargs,
     )
 
