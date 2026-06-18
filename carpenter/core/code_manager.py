@@ -38,6 +38,7 @@ def save_code(
     source: str,
     arc_id: int | None = None,
     name: str = "script",
+    review_status: str | None = None,
 ) -> dict:
     """Save Python code to a date-partitioned file and track it in the database.
 
@@ -46,6 +47,14 @@ def save_code(
         source: Origin of the code (e.g. "agent", "user", "template").
         arc_id: Optional arc ID to associate with the code file.
         name: Base name for the file (default "script").
+        review_status: Optional review status to stamp on the row. Defaults
+            to ``None`` (unreviewed) — agent-submitted code is reviewed via
+            the submit_code pipeline, which sets this later. Trusted callers
+            may pass ``"approved"`` for PRE-VERIFIED code (e.g. a capability
+            package's audited, operator-trusted script), so its
+            ``code_manager.execute`` session is ``reviewed`` and may invoke
+            action/dispatch verbs. Trusted-side only — untrusted executor
+            code cannot call ``save_code``.
 
     Returns:
         Dict with ``code_file_id`` and ``file_path``.
@@ -67,8 +76,9 @@ def save_code(
     # Use a placeholder path; we will update it after we know the id.
     with db_transaction() as db:
         cursor = db.execute(
-            "INSERT INTO code_files (file_path, source, arc_id) VALUES (?, ?, ?)",
-            ("__pending__", source, arc_id),
+            "INSERT INTO code_files (file_path, source, arc_id, review_status) "
+            "VALUES (?, ?, ?, ?)",
+            ("__pending__", source, arc_id, review_status),
         )
         code_file_id = cursor.lastrowid
 

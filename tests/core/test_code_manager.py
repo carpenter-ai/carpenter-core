@@ -39,6 +39,37 @@ def test_save_code_tracks_in_db():
         db.close()
 
 
+def test_save_code_review_status_defaults_unreviewed():
+    """By default save_code leaves review_status NULL (unreviewed)."""
+    result = code_manager.save_code("x = 1\n", source="agent")
+    db = get_db()
+    try:
+        row = db.execute(
+            "SELECT review_status FROM code_files WHERE id = ?",
+            (result["code_file_id"],),
+        ).fetchone()
+        assert row["review_status"] is None
+    finally:
+        db.close()
+
+
+def test_save_code_can_stamp_approved_for_preverified():
+    """Trusted callers may stamp pre-verified code as approved, so its
+    execute() session is reviewed and may invoke action/dispatch verbs."""
+    result = code_manager.save_code(
+        "pass\n", source="template", review_status="approved",
+    )
+    db = get_db()
+    try:
+        row = db.execute(
+            "SELECT review_status FROM code_files WHERE id = ?",
+            (result["code_file_id"],),
+        ).fetchone()
+        assert row["review_status"] == "approved"
+    finally:
+        db.close()
+
+
 def test_save_code_date_partitioned():
     """save_code uses YYYY/MM/DD directory structure."""
     result = code_manager.save_code("pass\n", source="agent")
