@@ -11,12 +11,14 @@ which communicates with the main thread over a queue pair.  All data crossing th
 boundary is JSON-serialized to prevent object reference leakage.
 """
 
+import builtins as _builtins_module
 import ctypes
 import json
 import logging
 import queue
 import threading
 import traceback
+import types
 from typing import Any, Callable
 
 from RestrictedPython import compile_restricted, safe_builtins, PrintCollector
@@ -56,6 +58,40 @@ _EXTRA_BUILTINS = {
 }
 
 
+# TRIPWIRE: This is a FAIL-CLOSED allowlist of vetted PURE-DATA stdlib packages
+# that EXECUTOR code may import. Everything not on this set is denied by default
+# (see the final `raise ImportError` in `_restricted_import`). The point of the
+# executor restriction is to block DIRECT network/filesystem/syscall access and
+# sandbox-escape primitives — NOT to forbid pure-data Python like `json`/`re`.
+#
+# Rules for adding to this set:
+#   1. The module must NOT provide I/O (network, filesystem, subprocess) or any
+#      sandbox-escape capability (code compilation/execution, introspection,
+#      object-graph walking, raw memory, deserialization of arbitrary objects).
+#   2. Re-exporting a dangerous module as a plain attribute (e.g. `uuid.os`,
+#      `datetime.sys`) is OK *only because* the `_module_blocking_getattr` guard
+#      below denies reaching ANY module object via attribute access. Do NOT rely
+#      on a module being "clean" — rely on that generic guard.
+#   3. A module exposing a dangerous NON-module callable as a plain attribute
+#      (e.g. a bare `system`/`popen`/`open`) is NOT covered by the guard and MUST
+#      be dropped. Vet each entry. (Current set: `re.compile` compiles regexes,
+#      not code; `operator.call` is just `f(*args)` — neither is an escape.)
+#
+# DELIBERATELY EXCLUDED (do not add): os, io, sys, socket, subprocess, urllib,
+# http, requests, ssl, asyncio, threading, multiprocessing, pathlib, shutil,
+# tempfile, glob, signal, platform, resource, pwd, grp, inspect, gc, importlib,
+# builtins, ctypes, pickle, marshal, ast, code, types, gzip, bz2, lzma
+# (gzip/bz2/lzma import os/io and expose them as attributes; the rest are direct
+# I/O / introspection / escape vectors).
+_IMPORT_ALLOWLIST = frozenset({
+    "json", "re", "math", "datetime", "base64", "binascii", "hashlib", "hmac",
+    "uuid", "decimal", "fractions", "statistics", "random", "secrets", "string",
+    "textwrap", "unicodedata", "difflib", "itertools", "functools", "operator",
+    "heapq", "bisect", "array", "collections", "enum", "dataclasses", "typing",
+    "copy", "numbers", "struct", "html", "csv", "zlib",
+})
+
+
 def _inplacevar_(op, x, y):
     """Handle augmented assignment operators (+=, -=, *=, etc.).
 
@@ -87,6 +123,37 @@ def _inplacevar_(op, x, y):
     elif op == ">>=":
         return x >> y
     raise NotImplementedError(f"Unsupported in-place operator: {op}")
+
+
+def _module_blocking_getattr(object, name, default=None, getattr=getattr):
+    """``_getattr_`` guard: ``safer_getattr`` plus a module re-export block.
+
+    ``safer_getattr`` already blocks underscore/private/inspect attribute names.
+    But allowlisted pure-data modules frequently ``import os`` / ``import sys``
+    (etc.) at top level and expose them as NON-underscore attributes
+    (``uuid.os``, ``datetime.sys``, ``dataclasses.inspect`` …). Reaching any of
+    those would be an immediate sandbox escape.
+
+    TRIPWIRE: This guard MUST deny resolving an attribute whose value is a
+    ``types.ModuleType`` instance. That is the generic defense that lets the
+    import allowlist safely contain modules which re-export dangerous modules:
+    you may ``import uuid``, but ``uuid.os`` is unreachable. Do NOT remove the
+    ModuleType check, and do NOT special-case any module name as "trusted".
+    The carpenter_tools proxies are ``_ToolModule``/``_CarpenterToolsRoot``/etc.
+    (custom objects, NOT ModuleType), so they are unaffected.
+    """
+    # First apply all of safer_getattr's checks (underscore, format, inspect
+    # attrs, default handling). This resolves and returns the attribute value.
+    value = safer_getattr(object, name, default, getattr)
+    # Then deny if the resolved value is a real module object. This blocks the
+    # `import uuid; uuid.os.system(...)` style re-export escape generically,
+    # regardless of which allowlisted module re-exported it.
+    if isinstance(value, types.ModuleType):
+        raise AttributeError(
+            f'"{name}" resolves to a module object, which is forbidden to '
+            f"access in the restricted executor."
+        )
+    return value
 
 
 class ExecutionResult:
@@ -249,11 +316,14 @@ def _build_namespace(
     # sub-modules from the compatibility namespace.  This allows code
     # written for the subprocess executor (``from carpenter_tools.act
     # import arc``) to work unmodified in the restricted sandbox.
-    # TRIPWIRE: _restricted_import MUST allow only the `carpenter_tools` namespace
-    # and raise ImportError for everything else. Reason: any other importable
-    # module is an immediate sandbox escape (os, subprocess, ctypes, builtins…).
+    # TRIPWIRE: _restricted_import is FAIL-CLOSED. It allows ONLY (a) the
+    # `carpenter_tools` namespace and (b) absolute imports whose top-level
+    # package is in `_IMPORT_ALLOWLIST` (vetted pure-data stdlib modules). It
+    # raises ImportError for everything else. Reason: any non-allowlisted module
+    # is a potential sandbox escape (os, subprocess, ctypes, builtins, pickle…).
     # The final `raise ImportError` branch below is load-bearing — do not add
-    # an "else: return ..." fallback for unknown names.
+    # an "else: return ..." fallback for unknown names, and do not widen the
+    # allowlist without vetting per the rules above `_IMPORT_ALLOWLIST`.
     # Related: coding-invariants I5 (executor attests to nothing — platform-level
     # whitelisting is authoritative).
     def _restricted_import(name, globals=None, locals=None, fromlist=(), level=0):
@@ -272,16 +342,36 @@ def _build_namespace(
                 return obj
             # Handle ``import carpenter_tools`` (return top-level)
             return compat["carpenter_tools"]
+
+        # Allow vetted pure-data stdlib modules. Relative imports (level > 0)
+        # are not meaningful for stdlib here and are denied. The TOP-LEVEL
+        # package name must be on the allowlist; submodules of an allowed
+        # package (e.g. ``collections.abc``) are permitted. The actual import is
+        # delegated to the REAL builtin __import__ so that import X / import X
+        # as y / from X import a / dotted-submodule semantics are all correct.
+        # The platform process importing the real module is fine; the executor
+        # restriction is on WHICH modules are reachable, and the
+        # `_module_blocking_getattr` guard prevents reaching re-exported modules
+        # (e.g. `uuid.os`) via attribute access.
+        if level == 0 and isinstance(name, str) and name:
+            top = name.split(".")[0]
+            if top in _IMPORT_ALLOWLIST:
+                return _builtins_module.__import__(
+                    name, globals, locals, fromlist or (), level
+                )
+
         raise ImportError(
-            f"Imports are not allowed in the restricted executor. "
-            f"Use dispatch() or the pre-imported carpenter_tools modules instead."
+            f"Imports are not allowed in the restricted executor "
+            f"except for carpenter_tools and a vetted set of pure-data stdlib "
+            f"modules. Module {name!r} is not permitted. Use dispatch() or the "
+            f"pre-imported carpenter_tools modules instead."
         )
 
     builtins["__import__"] = _restricted_import
 
     namespace = {
         "__builtins__": builtins,
-        "_getattr_": safer_getattr,
+        "_getattr_": _module_blocking_getattr,
         "_getitem_": default_guarded_getitem,
         "_getiter_": default_guarded_getiter,
         "_write_": full_write_guard,

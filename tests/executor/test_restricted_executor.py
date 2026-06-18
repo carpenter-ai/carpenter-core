@@ -544,3 +544,249 @@ class TestExtraNamespaceGuardProtection:
         )
         assert result.exit_code == 0
         assert "allowed" in result.output
+
+
+# ── Import allowlist: vetted pure-data stdlib modules ────────────────
+
+
+class TestImportAllowlist:
+    """Executor code may import a vetted set of pure-data stdlib modules.
+
+    The restriction exists to block direct network/FS/syscall access and
+    sandbox-escape primitives — not pure-data Python like ``json``/``re``.
+    """
+
+    def test_import_json_and_dumps(self):
+        executor = RestrictedExecutor()
+        result = executor.execute(
+            "import json\nprint(json.dumps({'a': 1}))"
+        )
+        assert result.exit_code == 0, result.error
+        assert '"a": 1' in result.output
+
+    def test_from_base64_import_b64encode(self):
+        executor = RestrictedExecutor()
+        result = executor.execute(
+            "from base64 import b64encode\n"
+            "print(b64encode(b'hi').decode())"
+        )
+        assert result.exit_code == 0, result.error
+        assert "aGk=" in result.output
+
+    def test_import_re_findall(self):
+        executor = RestrictedExecutor()
+        result = executor.execute(
+            "import re\nprint(re.findall(r'\\d+', 'a1b22c333'))"
+        )
+        assert result.exit_code == 0, result.error
+        assert "['1', '22', '333']" in result.output
+
+    def test_import_datetime_construct(self):
+        executor = RestrictedExecutor()
+        result = executor.execute(
+            "import datetime\n"
+            "d = datetime.datetime(2020, 1, 1)\n"
+            "print(d.year)"
+        )
+        assert result.exit_code == 0, result.error
+        assert "2020" in result.output
+
+    def test_import_collections_abc_submodule(self):
+        """Dotted-submodule import of an allowed package succeeds.
+
+        ``import collections.abc`` is permitted by the allowlist (top-level
+        package ``collections``). Note that *reaching* the submodule via
+        attribute access (``collections.abc.X``) is intentionally blocked by
+        the module-blocking getattr guard, so we use ``from ... import`` which
+        binds the name directly without traversing a module attribute.
+        """
+        executor = RestrictedExecutor()
+        result = executor.execute(
+            "from collections.abc import Sequence\n"
+            "print(isinstance([], Sequence))"
+        )
+        assert result.exit_code == 0, result.error
+        assert "True" in result.output
+
+    def test_import_collections_abc_bare_succeeds(self):
+        """`import collections.abc` itself does not raise (binds collections)."""
+        executor = RestrictedExecutor()
+        result = executor.execute(
+            "import collections.abc\n"
+            "from collections import OrderedDict\n"
+            "od = OrderedDict([('a', 1), ('b', 2)])\n"
+            "print(list(od.items()))"
+        )
+        assert result.exit_code == 0, result.error
+        assert "[('a', 1), ('b', 2)]" in result.output
+
+    def test_import_as_alias(self):
+        executor = RestrictedExecutor()
+        result = executor.execute(
+            "import json as j\nprint(j.dumps([1, 2]))"
+        )
+        assert result.exit_code == 0, result.error
+        assert "[1, 2]" in result.output
+
+
+class TestImportDenied:
+    """Modules outside the allowlist (I/O, escape vectors) stay blocked."""
+
+    @pytest.mark.parametrize("code", [
+        "import os",
+        "import sys",
+        "import socket",
+        "import subprocess",
+        "import inspect",
+        "import gc",
+        "import importlib",
+        "import pickle",
+        "import ctypes",
+        "import urllib.request",
+        "import os.path",
+        "import gzip",
+        "import io",
+        "import builtins",
+        "__import__('os')",
+    ])
+    def test_disallowed_import_blocked(self, code):
+        executor = RestrictedExecutor()
+        result = executor.execute(code)
+        assert result.exit_code == 1, f"expected block for: {code!r}"
+
+    def test_relative_import_blocked(self):
+        """Relative imports (level > 0) are rejected for stdlib."""
+        from carpenter.executor.restricted import _build_namespace
+
+        ns = _build_namespace(lambda *a, **k: None)
+        imp = ns["__builtins__"]["__import__"]
+        with pytest.raises(ImportError):
+            imp("json", None, None, (), 1)
+
+
+class TestModuleReExportEscape:
+    """The getattr guard denies reaching any module via attribute access.
+
+    Several allowlisted modules ``import os``/``sys``/etc. at top level and
+    expose them as plain (non-underscore) attributes (e.g. ``uuid.os``,
+    ``datetime.sys``). ``safer_getattr`` only blocks underscore names, so we
+    additionally deny any attribute whose resolved value is a module object.
+    """
+
+    def test_uuid_import_succeeds(self):
+        """uuid is on the allowlist; importing and using it is permitted.
+
+        We keep uuid on the allowlist (it is pure-data) and rely on the
+        getattr guard to block uuid.os / uuid.sys re-export escapes. Using
+        uuid's own data API must work.
+        """
+        executor = RestrictedExecutor()
+        result = executor.execute(
+            "import uuid\n"
+            "u = uuid.UUID('12345678123456781234567812345678')\n"
+            "print(u.hex)"
+        )
+        assert result.exit_code == 0, result.error
+        assert "12345678123456781234567812345678" in result.output
+
+    def test_uuid_module_attribute_blocked(self):
+        """import uuid then uuid.os must be blocked (uuid imports os)."""
+        executor = RestrictedExecutor()
+        result = executor.execute(
+            "import uuid\nx = uuid.os"
+        )
+        assert result.exit_code == 1
+        assert "module object" in result.error or "forbidden" in result.error
+
+    def test_uuid_os_system_escape_blocked(self):
+        """The full escape chain uuid.os.system(...) is blocked."""
+        executor = RestrictedExecutor()
+        result = executor.execute(
+            "import uuid\nuuid.os.system('echo pwned')"
+        )
+        assert result.exit_code == 1
+
+    def test_datetime_sys_attribute_blocked(self):
+        """datetime re-exports sys as datetime.sys; reaching it is blocked."""
+        executor = RestrictedExecutor()
+        result = executor.execute(
+            "import datetime\nx = datetime.sys"
+        )
+        assert result.exit_code == 1
+
+    def test_guard_function_blocks_module_value(self):
+        """Unit-test the guard: resolving a module-typed attr raises."""
+        import types as _types
+
+        from carpenter.executor.restricted import _module_blocking_getattr
+
+        class Holder:
+            mod = _types  # a real ModuleType exposed as a plain attribute
+            data = {"k": "v"}
+
+        h = Holder()
+        # Non-module attribute access is fine.
+        assert _module_blocking_getattr(h, "data") == {"k": "v"}
+        # Module-typed attribute access is denied.
+        with pytest.raises(AttributeError):
+            _module_blocking_getattr(h, "mod")
+
+    def test_guard_still_blocks_underscore(self):
+        """The guard retains safer_getattr's underscore block."""
+        from carpenter.executor.restricted import _module_blocking_getattr
+
+        with pytest.raises(AttributeError):
+            _module_blocking_getattr("abc", "__class__")
+
+
+class TestGuardDoesNotBreakNormalAccess:
+    """The module-blocking guard must not break data access or tools."""
+
+    def test_regex_match_attribute_access(self):
+        executor = RestrictedExecutor()
+        result = executor.execute(
+            "import re\n"
+            "m = re.match(r'(\\w+)', 'hello world')\n"
+            "print(m.group(1))"
+        )
+        assert result.exit_code == 0, result.error
+        assert "hello" in result.output
+
+    def test_datetime_object_attribute_access(self):
+        executor = RestrictedExecutor()
+        result = executor.execute(
+            "import datetime\n"
+            "d = datetime.date(2021, 6, 15)\n"
+            "print(d.month)"
+        )
+        assert result.exit_code == 0, result.error
+        assert "6" in result.output
+
+    def test_dict_method_access(self):
+        executor = RestrictedExecutor()
+        result = executor.execute(
+            "d = {'a': 1, 'b': 2}\nprint(sorted(d.keys()))"
+        )
+        assert result.exit_code == 0, result.error
+        assert "['a', 'b']" in result.output
+
+    def test_carpenter_tools_proxy_still_works(self):
+        """carpenter_tools proxies are not ModuleType; attr access works."""
+        handler, calls = _stateful_handler()
+        executor = RestrictedExecutor(tool_handler=handler)
+        result = executor.execute(
+            "r = dispatch('state.get', {'key': 'k'})\nprint(r['value'])"
+        )
+        assert result.exit_code == 0, result.error
+        assert "k" in result.output
+
+    def test_carpenter_tools_module_attr_access(self):
+        """Accessing arc/state pre-imported proxies and calling them works."""
+        handler, calls = _stateful_handler()
+        executor = RestrictedExecutor(tool_handler=handler)
+        result = executor.execute(
+            "state.get(key='foo')\nprint('ok')"
+        )
+        assert result.exit_code == 0, result.error
+        assert "ok" in result.output
+        assert calls and calls[0][0] == "state.get"
