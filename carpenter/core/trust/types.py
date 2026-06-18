@@ -46,6 +46,9 @@ _DEFAULT_AGENT_CAPABILITIES = {
             # NULL); a later template-arc pipeline can derive a trusted
             # successor from it.
             "resource.create",
+            # PLANNER may persist + finalize a raw Resource blob in one
+            # trusted call (str or JSON payload).
+            "resource.write",
             # Phase B PR B3: PLANNER may fetch a URL into a raw Resource in
             # one step (dispatch-only; chat agents route through the
             # reviewed fetch_web_content pipeline instead).
@@ -68,6 +71,9 @@ _DEFAULT_AGENT_CAPABILITIES = {
             # PR3: template reviewers commit derived Resources by writing
             # the blob and then calling resource.finalize(..., deprecate_inputs=True).
             "resource.finalize",
+            # REVIEWER may persist + finalize a derived/raw Resource blob in
+            # one trusted call (str or JSON payload).
+            "resource.write",
             # Phase B PR B1: REVIEWER may also register raw Resources when
             # its review produces new untrusted byte streams that need a
             # follow-up template pipeline (rather than just a derived
