@@ -224,6 +224,14 @@ _DISPATCH = {
     # by any agent; the handler enforces that the caller arc is the
     # Resource's producer.
     "resource.finalize": resource_backend.handle_finalize,
+    # Resource write (PR: untrusted EXECUTOR persistence path).  Persists a
+    # content payload (str or JSON-serializable object) to the Resource
+    # blob AND finalizes in one trusted call.  Callable by any agent — the
+    # handler enforces that the caller arc is the Resource's producer.
+    # Registered the same way as resource.create/finalize so an untrusted
+    # EXECUTOR arc (allowed_tools=None) may call it; the trusted-side file
+    # I/O is the whole point (the sandbox cannot write the blob itself).
+    "resource.write": resource_backend.handle_write,
     # Resource create (Phase B PR B1): any arc registers a new raw
     # Resource it will then write + finalize.  Content-type is a free-form
     # label; produced_by_template=NULL means the row is forever untrusted

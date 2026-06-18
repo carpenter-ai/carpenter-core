@@ -7,8 +7,14 @@ Handles:
     Resources consumed by the same arc).
   - ``resource.create`` — any arc registers a new raw Resource it will
     subsequently write a blob to and then ``resource.finalize``.
+  - ``resource.write`` — producer arcs persist a content payload (str or
+    JSON-serializable object) AND finalize in one trusted call.  This is
+    the write path for untrusted EXECUTOR arcs, which cannot write the
+    Resource blob themselves (``files.write`` refuses out-of-workspace
+    writes and ``open`` is blocked in the sandbox).
 """
 
+import json
 import logging
 import os
 
@@ -130,6 +136,102 @@ def handle_finalize(params: dict) -> dict:
         raise ValueError(
             f"Resource {resource_id} has no file_path; cannot finalize"
         )
+
+    byte_size, content_hash = hash_file(file_path)
+    update_resource_content_stats(resource_id, byte_size, content_hash)
+
+    deprecated_count = 0
+    if params.get("deprecate_inputs") and caller_arc_id is not None:
+        deprecated_count = deprecate_inputs_of_arc(int(caller_arc_id))
+
+    return {
+        "ok": True,
+        "resource_id": resource_id,
+        "byte_size": byte_size,
+        "content_hash": content_hash,
+        "deprecated_inputs": deprecated_count,
+    }
+
+
+def handle_write(params: dict) -> dict:
+    """Persist a content payload to a Resource's blob AND finalize it.
+
+    This is the trusted write path for arcs — notably untrusted EXECUTOR
+    arcs — that cannot write the Resource blob themselves: ``files.write``
+    refuses writes outside an arc's own workspace (and the Resource store
+    isn't in it), and ``open`` is blocked in the RestrictedPython sandbox.
+    The executor calls this verb via ``dispatch`` and the actual file I/O
+    happens here, on the trusted side, with natural Python.
+
+    Params:
+        resource_id: int — required.  The Resource whose blob to write.
+        content: required — a ``str`` (written verbatim) OR any
+            JSON-serializable object (written via ``json.dump``).
+        deprecate_inputs: bool, optional (default False) — mirrors
+            ``resource.finalize``: when True, mark all Resources linked
+            as ``input`` to the caller arc as deprecated.
+
+    Auth mirrors ``resource.finalize``: the caller arc (``_caller_arc_id``,
+    injected by the dispatch bridge) must be the Resource's
+    ``produced_by_arc_id`` when both are present.
+
+    If the Resource has no ``file_path`` yet (NULL), one is assigned via
+    ``resource_storage_path`` + ``set_resource_file_path`` and its parent
+    directory is created — mirroring ``resource.create``.
+
+    After writing, hashes the file and updates ``byte_size`` /
+    ``content_hash`` (same as ``resource.finalize``).
+
+    Returns ``{"ok": True, "resource_id", "byte_size", "content_hash",
+    "deprecated_inputs"}``.
+    """
+    resource_id = params.get("resource_id")
+    if resource_id is None:
+        raise ValueError("resource.write requires resource_id")
+    resource_id = int(resource_id)
+
+    if "content" not in params:
+        raise ValueError("resource.write requires content")
+    content = params["content"]
+
+    caller_arc_id = params.get("_caller_arc_id")
+    # Look up the Resource and confirm the caller is the producer.
+    with db_connection() as db:
+        row = db.execute(
+            "SELECT produced_by_arc_id, file_path FROM resources WHERE id = ?",
+            (resource_id,),
+        ).fetchone()
+    if row is None:
+        raise ValueError(f"Resource {resource_id} not found")
+
+    produced_by = row["produced_by_arc_id"]
+    # When both are present, the caller must be the producer.  Mirrors
+    # resource.finalize so one arc cannot write another arc's Resource.
+    if caller_arc_id is not None and produced_by is not None:
+        if int(caller_arc_id) != int(produced_by):
+            raise PermissionError(
+                f"resource.write: arc {caller_arc_id} is not the "
+                f"producer of Resource {resource_id} "
+                f"(producer is arc {produced_by})"
+            )
+
+    file_path = row["file_path"]
+    if not file_path:
+        # No path assigned yet — mirror resource.create's path wiring.
+        path = resource_storage_path(resource_id)
+        os.makedirs(path.parent, exist_ok=True)
+        file_path = str(path)
+        set_resource_file_path(resource_id, file_path)
+    else:
+        os.makedirs(os.path.dirname(file_path), exist_ok=True)
+
+    # Natural Python file I/O, trusted-side.  A str is written verbatim;
+    # anything else is serialized as JSON.
+    with open(file_path, "w", encoding="utf-8") as f:
+        if isinstance(content, str):
+            f.write(content)
+        else:
+            json.dump(content, f, sort_keys=True, indent=2)
 
     byte_size, content_hash = hash_file(file_path)
     update_resource_content_stats(resource_id, byte_size, content_hash)
