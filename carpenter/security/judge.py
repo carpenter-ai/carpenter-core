@@ -472,7 +472,138 @@ def _load_extraction_resource(resource_row: dict) -> Any:
             f"Resource {resource_id} kind={kind!r}: expected JSON object "
             f"to deserialise as dataclass, got {type(payload).__name__}"
         )
-    return cls(**payload)
+    return _construct_dataclass(cls, payload)
+
+
+def _construct_dataclass(cls: type, payload: dict) -> Any:
+    """Construct a dataclass from a JSON-decoded ``payload`` dict.
+
+    JSON has no tuple type, so every dataclass ``tuple[...]`` field
+    arrives as a ``list`` and every nested dataclass field arrives as a
+    plain ``dict``.  A naive ``cls(**payload)`` would therefore store the
+    wrong runtime types, and the package/platform JUDGE handlers — which
+    assert ``isinstance(x, tuple)`` and ``isinstance(x, SomeDataclass)``
+    as structural gates — would reject otherwise-valid extracts.
+
+    This helper makes the REVIEWER -> JUDGE handoff reliable-by-default:
+    a REVIEWER that persists its extract as a JSON object (the only shape
+    ``resource.write`` can store) is decoded back into the exact runtime
+    types the dataclass declares.  It is type-driven (uses the field
+    annotations), recursion-safe for nested dataclasses, and conservative
+    — it only coerces ``list -> tuple`` for tuple-annotated fields and
+    recurses into dataclass-annotated fields; anything else is passed
+    through untouched so this never silently reshapes a value the JUDGE
+    means to inspect.
+
+    Unknown payload keys and missing fields are left to ``cls(**...)`` to
+    surface (a ``TypeError`` the caller already maps to a decode failure
+    / rejection).
+    """
+    import dataclasses
+    import typing
+
+    if not dataclasses.is_dataclass(cls):
+        return cls(**payload) if isinstance(payload, dict) else payload
+
+    try:
+        hints = typing.get_type_hints(cls)
+    except Exception:  # noqa: BLE001 — fall back to raw annotations
+        hints = {f.name: f.type for f in dataclasses.fields(cls)}
+
+    field_names = {f.name for f in dataclasses.fields(cls)}
+    kwargs: dict = {}
+    for key, value in payload.items():
+        if key not in field_names:
+            # Preserve the original behaviour: an unexpected key is a
+            # TypeError at construction, which the caller treats as a
+            # decode failure.  Keep it so smuggled extra fields reject.
+            kwargs[key] = value
+            continue
+        kwargs[key] = _coerce_field_value(hints.get(key), value)
+    return cls(**kwargs)
+
+
+def _coerce_field_value(annotation: Any, value: Any) -> Any:
+    """Coerce one JSON-decoded ``value`` to match a dataclass field type.
+
+    Handles the two shapes JSON loses and the JUDGE handlers care about:
+
+    * ``tuple[X, ...]`` (or ``Tuple[...]``): a JSON ``list`` becomes a
+      ``tuple``; each element is coerced against the element annotation
+      (so ``tuple[AttachmentMetadata, ...]`` rebuilds the nested
+      dataclasses).
+    * a nested dataclass annotation: a JSON ``dict`` becomes an instance
+      of that dataclass (recursively).
+
+    Everything else (str / int / bool / PolicyLiteral fields, which the
+    dataclass or dispatch wrapper handle) is returned unchanged.
+    """
+    import dataclasses
+    import typing
+
+    if annotation is None:
+        return value
+
+    origin = typing.get_origin(annotation)
+    args = typing.get_args(annotation)
+
+    # tuple[...] field: JSON list -> tuple, coercing each element.
+    if origin in (tuple,) and isinstance(value, list):
+        if args and args[-1] is Ellipsis:
+            elem_ann = args[0]
+            return tuple(_coerce_field_value(elem_ann, v) for v in value)
+        if args:
+            return tuple(
+                _coerce_field_value(args[i] if i < len(args) else None, v)
+                for i, v in enumerate(value)
+            )
+        return tuple(value)
+
+    # Nested dataclass field: JSON dict -> dataclass instance.
+    if (
+        isinstance(annotation, type)
+        and dataclasses.is_dataclass(annotation)
+        and isinstance(value, dict)
+    ):
+        return _construct_dataclass(annotation, value)
+
+    # PolicyLiteral field (EmailPolicy, Url, Domain, ...): JSON primitive
+    # -> PolicyLiteral instance.  This is SECURITY-LOAD-BEARING: the
+    # in-process policy-field validation (_validate_policy_fields) only
+    # runs on values that are ``isinstance(.., PolicyLiteral)``.  A JSON
+    # string would otherwise stay a plain ``str``, the allowlist check
+    # (e.g. from_address must be allowlisted) would be silently skipped,
+    # and the trust gate would weaken.  Reconstructing the literal here
+    # ensures every declared-PolicyLiteral field is actually validated.
+    if (
+        isinstance(annotation, type)
+        and not isinstance(value, (dict, list))
+        and _is_policy_literal_cls(annotation)
+    ):
+        try:
+            return annotation(value)
+        except Exception:  # noqa: BLE001 — let cls(**) surface a type error
+            return value
+
+    return value
+
+
+def _is_policy_literal_cls(annotation: Any) -> bool:
+    """Return True if ``annotation`` is a ``PolicyLiteral`` subclass.
+
+    Imports ``PolicyLiteral`` lazily so the JUDGE module stays importable
+    in stripped test environments where ``carpenter_tools`` is absent;
+    there we simply skip literal reconstruction (the package handler's
+    own structural checks still run).
+    """
+    try:
+        from carpenter_tools.policy.types import PolicyLiteral
+    except ImportError:
+        return False
+    try:
+        return issubclass(annotation, PolicyLiteral)
+    except TypeError:
+        return False
 
 
 def _resolve_package_template(resource_row: dict) -> tuple[str, str] | None:
