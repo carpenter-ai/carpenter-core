@@ -407,3 +407,113 @@ class TestPolicyCheckListDataclass:
         assert _extraction_to_checks(extraction) == [
             {"field": "f", "policy_type": "", "value": "v"}
         ]
+
+
+class TestConstructDataclassCoercion:
+    """JSON-decoded payloads must rebuild the dataclass's runtime types.
+
+    JSON has no tuple type and no dataclass type, so a REVIEWER that
+    persists its extract via ``resource.write`` (the only reliable
+    persistence path) stores tuples as lists and nested dataclasses as
+    dicts.  The JUDGE handlers assert ``isinstance(x, tuple)`` /
+    ``isinstance(x, SomeDataclass)`` and the policy-field validator only
+    runs on ``PolicyLiteral`` instances, so the deserialiser must coerce
+    these back or otherwise-valid extracts reject and allowlist checks
+    silently skip.
+    """
+
+    def test_list_field_coerced_to_tuple(self):
+        from dataclasses import dataclass, field
+        from carpenter.security.judge import _construct_dataclass
+
+        @dataclass(frozen=True)
+        class _Extract:
+            flags: tuple[str, ...] = ()
+            schema_version: str = "1.0"
+
+        obj = _construct_dataclass(
+            _Extract, {"flags": ["a", "b"], "schema_version": "1.0"},
+        )
+        assert isinstance(obj.flags, tuple)
+        assert obj.flags == ("a", "b")
+
+    def test_nested_dataclass_list_coerced(self):
+        from dataclasses import dataclass, field
+        from carpenter.security.judge import _construct_dataclass
+
+        @dataclass(frozen=True)
+        class _Inner:
+            name: str = ""
+            size: int = 0
+
+        @dataclass(frozen=True)
+        class _Outer:
+            items: tuple[_Inner, ...] = ()
+
+        obj = _construct_dataclass(
+            _Outer, {"items": [{"name": "x", "size": 3}]},
+        )
+        assert isinstance(obj.items, tuple)
+        assert isinstance(obj.items[0], _Inner)
+        assert obj.items[0].name == "x"
+        assert obj.items[0].size == 3
+
+    def test_policy_literal_field_reconstructed(self):
+        # SECURITY: a PolicyLiteral field arriving as a bare JSON string
+        # must be rebuilt into the literal so _validate_policy_fields
+        # (which keys off isinstance(.., PolicyLiteral)) actually runs the
+        # allowlist check rather than silently skipping the field.
+        pytest.importorskip("carpenter_tools.policy.types")
+        from dataclasses import dataclass, field
+        from carpenter_tools.policy.types import EmailPolicy, PolicyLiteral
+        from carpenter.security.judge import (
+            _construct_dataclass,
+            _validate_policy_fields,
+        )
+
+        @dataclass(frozen=True)
+        class _Extract:
+            sender: EmailPolicy = field(
+                default_factory=lambda: EmailPolicy(""),
+            )
+            recipients: tuple[EmailPolicy, ...] = ()
+
+        obj = _construct_dataclass(
+            _Extract,
+            {"sender": "a@b.com", "recipients": ["c@d.com", "e@f.com"]},
+        )
+        assert isinstance(obj.sender, PolicyLiteral)
+        assert all(isinstance(r, PolicyLiteral) for r in obj.recipients)
+        # The validator now sees PolicyLiteral instances and emits a check
+        # per field (3 total: sender + 2 recipients).
+        checks = _validate_policy_fields(obj)
+        assert len(checks) == 3
+
+    def test_unexpected_key_still_rejects(self):
+        # Smuggled extra fields must still raise (caller maps to reject).
+        from dataclasses import dataclass
+        from carpenter.security.judge import _construct_dataclass
+
+        @dataclass(frozen=True)
+        class _Extract:
+            ok: str = ""
+
+        with pytest.raises(TypeError):
+            _construct_dataclass(_Extract, {"ok": "v", "evil": "x"})
+
+    def test_primitive_fields_passed_through(self):
+        from dataclasses import dataclass
+        from carpenter.security.judge import _construct_dataclass
+
+        @dataclass(frozen=True)
+        class _Extract:
+            count: int = 0
+            name: str = ""
+            flag: bool = False
+
+        obj = _construct_dataclass(
+            _Extract, {"count": 5, "name": "hi", "flag": True},
+        )
+        assert obj.count == 5
+        assert obj.name == "hi"
+        assert obj.flag is True
