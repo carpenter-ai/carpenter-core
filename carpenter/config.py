@@ -427,6 +427,15 @@ DEFAULTS = {
              "notify": {"enabled": True, "priority": "urgent"}},
         ],
     },
+    # Reflection runs on a daily cadence (NOT per arc-completion). The cron
+    # registered by the reflection template package emits ``reflection.daily_tick``;
+    # the handler batches arcs completed since the last tick into ``period``
+    # reflections of at most ``batch_size`` arcs each.
+    "reflection": {
+        "daily_cron": "0 4 * * *",          # 04:00 daily
+        "batch_size": 20,                    # arcs per period reflection
+        "max_actions_per_reflection": 5,     # fan-out cap for proposed actions
+    },
     "model_presets": {},  # User overrides for model selector presets (see model_selector.py)
     # Platform-integrity classifier config.  Read by
     # ``carpenter/security/platform_paths.py`` to drive path-tier and

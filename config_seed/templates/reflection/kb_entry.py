@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 def build_reflection_entry(
     reflected_arc_id: int | None = None,
     *,
+    subject: dict | None = None,
     content: str | None = None,
     proposed_actions: str | None = None,
     model: str | None = None,
@@ -36,10 +37,13 @@ def build_reflection_entry(
 ) -> dict | None:
     """Build the payload for a reflection KB entry write.
 
-    Returns a dict with ``kb_path``, ``content`` (formatted markdown
-    with frontmatter), ``description``, and ``entry_type`` suitable for
-    enqueueing under the platform ``kb.write_entry`` work-item type,
-    or for passing directly to ``store.write_entry(**payload)``.
+    Three call shapes:
+
+    - ``subject`` given — the generalised path: KB path/title/frontmatter
+      derive from the typed subject (arcs / period / theme).
+    - ``reflected_arc_id`` given — legacy per-arc shape
+      (``reflections/by-arc/{id}``).
+    - ``cadence`` given — legacy daily/weekly/monthly shape.
 
     Returns ``None`` when ``content`` is empty — the caller should skip.
     """
@@ -56,7 +60,23 @@ def build_reflection_entry(
     if proposed_actions:
         frontmatter["proposed_actions"] = proposed_actions
 
-    if reflected_arc_id is not None:
+    if subject is not None:
+        from ._subject import (
+            subject_arc_ids, subject_kb_path, subject_period, subject_title,
+        )
+        kb_path = subject_kb_path(subject)
+        title = subject_title(subject)
+        s_start, s_end = subject_period(subject)
+        if s_start:
+            frontmatter["period_start"] = s_start
+        if s_end:
+            frontmatter["period_end"] = s_end
+        frontmatter = {
+            "subject_kind": subject.get("kind"),
+            "subject_refs": subject_arc_ids(subject),
+            **frontmatter,
+        }
+    elif reflected_arc_id is not None:
         kb_path = f"reflections/by-arc/{reflected_arc_id}"
         frontmatter = {
             "reflected_arc_id": reflected_arc_id,

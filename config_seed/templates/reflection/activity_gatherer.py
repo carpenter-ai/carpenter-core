@@ -111,3 +111,96 @@ def gather_from_arc(arc_id: int) -> str:
     parts.append(gather_period_stats(1))
     parts.append("")
     return "\n".join(parts)
+
+
+# Cap how many arcs we inline in full for a batch, to bound the reflect
+# step's prompt size. Beyond this the batch is summarised by id only.
+_BATCH_FULL_DETAIL_MAX = 8
+
+
+def gather_from_subject(subject: dict) -> str:
+    """Return the reflection data block for a typed subject.
+
+    - ``arcs`` (one ref) → the single-arc block (unchanged behaviour).
+    - ``period`` / ``arcs`` (many) → a batch block: a framing header plus
+      each arc's trajectory (capped), so the reflect step can find
+      cross-arc patterns across the day's work.
+    - ``theme`` → a set-of-updates block built from the KB subtree named
+      by the subject (``theme``/``slug``).
+    """
+    from ._subject import KIND_THEME, subject_arc_ids
+
+    if subject.get("kind") == KIND_THEME:
+        return _gather_theme(subject)
+
+    arc_ids = subject_arc_ids(subject)
+    if not arc_ids:
+        return "# Reflection — no arcs in subject\n"
+    if len(arc_ids) == 1:
+        return gather_from_arc(arc_ids[0])
+
+    window = subject.get("window") or {}
+    parts = [
+        "# Reflection Data — batch of completed arcs",
+        "",
+        (
+            "You are reflecting on a *batch* of arcs that completed in one "
+            "period. Look across them for recurring patterns, repeated "
+            "failures, and lessons worth distilling into a KB entry under "
+            "`skills/`. Note that several of these may be related. Prefer "
+            "concrete, cross-cutting observations over per-arc detail."
+        ),
+        "",
+        f"- period: {window.get('from', '?')} → {window.get('to', '?')}",
+        f"- arc count: {len(arc_ids)}",
+        f"- arc ids: {', '.join('#' + str(i) for i in arc_ids)}",
+        "",
+    ]
+    for aid in arc_ids[:_BATCH_FULL_DETAIL_MAX]:
+        parts.append("---")
+        parts.append(gather_from_arc(aid))
+    if len(arc_ids) > _BATCH_FULL_DETAIL_MAX:
+        rest = arc_ids[_BATCH_FULL_DETAIL_MAX:]
+        parts.append("---")
+        parts.append(
+            f"## {len(rest)} further arc(s) in this batch (ids only): "
+            + ", ".join("#" + str(i) for i in rest)
+        )
+    parts.append("")
+    return "\n".join(parts)
+
+
+def _gather_theme(subject: dict) -> str:
+    """Build a 'set of updates' block from a KB subtree for a theme subject."""
+    theme = subject.get("theme") or subject.get("slug") or "general"
+    kb_prefix = subject.get("kb_prefix") or f"skills/{theme}"
+    parts = [
+        f"# Reflection Data — theme: {theme}",
+        "",
+        (
+            "You are reflecting on a set of related updates rather than a "
+            "single arc. Review the KB entries below as a group: what is the "
+            "intent behind these changes, are they consistent, and what "
+            "should be distilled or corrected?"
+        ),
+        "",
+        f"- kb prefix: `{kb_prefix}`",
+        "",
+    ]
+    try:
+        from carpenter.kb import get_store
+        store = get_store()
+        children = store.list_children(kb_prefix)
+        if not children:
+            parts.append("## Updates\n- (none found under this prefix)")
+        else:
+            parts.append("## Updates")
+            for child in children:
+                if child.get("is_folder"):
+                    continue
+                parts.append(f"- {child.get('path')}: {child.get('description', '')}")
+    except Exception:
+        logger.exception("theme gather failed for prefix %s", kb_prefix)
+        parts.append("## Updates\n- (error reading KB)")
+    parts.append("")
+    return "\n".join(parts)
