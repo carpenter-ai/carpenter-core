@@ -14,6 +14,10 @@ def filter_matches(event_filter, payload: dict) -> bool:
     - ``{"$ne": value}`` — match when the payload's value is not equal
       to ``value``. Also matches when the key is absent from the
       payload (absent ≠ present).
+    - ``{"$nin": [v1, v2, ...]}`` — match when the payload's value is
+      not in the given list. Like ``$ne`` but for a set; an absent key
+      counts as not-in (absent ∉ any list). Useful for excluding a
+      handful of values (e.g. several template names) in one filter.
     - ``{"$starts_with": prefix}`` — match when the payload's value is
       a string that begins with ``prefix``. Missing keys or non-string
       values never match. Useful for KB / repo / URL path filters.
@@ -42,6 +46,11 @@ def filter_matches(event_filter, payload: dict) -> bool:
             if op_name == "$ne":
                 # Not-equals operator. Absent key counts as not-equal.
                 if payload.get(key) == op_val:
+                    return False
+                continue
+            if op_name == "$nin":
+                # Not-in operator. Absent key counts as not-in.
+                if payload.get(key) in op_val:
                     return False
                 continue
             if op_name == "$starts_with":

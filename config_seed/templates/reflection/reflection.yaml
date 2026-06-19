@@ -9,13 +9,17 @@ triggers:
     filter:
       is_root: true
       new_status: completed
-      # Prevent reflection-of-reflection recursion. arc.status_changed
-      # includes template_name when the arc was created from a template.
-      # ``$ne`` also matches when the key is absent (non-template arcs
-      # have no template_name), so genuine user-goal root arcs still
-      # trigger reflections.
+      # Don't reflect on the reflection pipeline's own byproduct arcs.
+      # Excluding ``reflection`` alone (the old ``$ne: reflection``) left
+      # a loop: a reflection's actions write to skills/, which spawns a
+      # ``skill-kb-review`` root arc; when it completed it re-triggered a
+      # reflection, whose actions wrote skills/ again, and so on — an
+      # unbounded amplification loop that burned API credits. Excluding
+      # both meta-templates breaks the cycle while still reflecting on
+      # genuine user work (non-template arcs *and* task templates like
+      # coding-change, which have a template_name not in this list).
       template_name:
-        $ne: reflection
+        $nin: [reflection, skill-kb-review]
     action:
       type: create_arc
       template_name: reflection

@@ -66,6 +66,22 @@ class TestIsNull:
                                   {"auto_source": None})
 
 
+class TestNotIn:
+    def test_matches_value_not_in_list(self):
+        assert filter_matches({"template_name": {"$nin": ["reflection",
+                              "skill-kb-review"]}}, {"template_name": "coding-change"})
+
+    def test_rejects_value_in_list(self):
+        flt = {"template_name": {"$nin": ["reflection", "skill-kb-review"]}}
+        assert not filter_matches(flt, {"template_name": "reflection"})
+        assert not filter_matches(flt, {"template_name": "skill-kb-review"})
+
+    def test_matches_absent_key(self):
+        # Absent key counts as not-in: genuine user-goal (non-template)
+        # arcs carry no template_name yet must still pass the exclusion.
+        assert filter_matches({"template_name": {"$nin": ["reflection"]}}, {})
+
+
 class TestOperatorFallthrough:
     def test_unknown_operator_falls_back_to_equality(self):
         # Documented behaviour: unknown operators are treated as a
