@@ -1,35 +1,19 @@
 name: reflection
-description: Per-arc reflection — analyse a completed root arc and distill lessons to KB
+description: Reflection — analyse completed work (a daily batch, or specific arcs) and distil lessons to KB
 capabilities:
   - system.read
   - kb.write
-triggers:
-  - name: on-root-arc-completed
-    on: arc.status_changed
-    filter:
-      is_root: true
-      new_status: completed
-      # Don't reflect on the reflection pipeline's own byproduct arcs.
-      # Excluding ``reflection`` alone (the old ``$ne: reflection``) left
-      # a loop: a reflection's actions write to skills/, which spawns a
-      # ``skill-kb-review`` root arc; when it completed it re-triggered a
-      # reflection, whose actions wrote skills/ again, and so on — an
-      # unbounded amplification loop that burned API credits. Excluding
-      # both meta-templates breaks the cycle while still reflecting on
-      # genuine user work (non-template arcs *and* task templates like
-      # coding-change, which have a template_name not in this list).
-      template_name:
-        $nin: [reflection, skill-kb-review]
-    action:
-      type: create_arc
-      template_name: reflection
-      arc_name: reflection
-      priority: 1000
-      initial_arc_state:
-        reflected_arc_id: "{event.payload.arc_id}"
+# Reflection is driven by a daily cadence, NOT a per-arc-completion trigger.
+# A cron emits ``reflection.daily_tick`` (registered in __init__.py); the
+# handler batches the arcs completed since the last tick into ``period``
+# reflections. This replaces the old ``arc.status_changed`` trigger, whose
+# create-on-every-completion semantics could form an unbounded feedback
+# loop (a reflection's actions wrote skills/, spawning a skill-kb-review
+# root arc, whose completion re-triggered a reflection, ...). A cadence
+# that runs once/day over a bounded batch cannot loop.
 steps:
   - name: gather-activity
-    description: Build the reflect step's goal from the reflected arc's trajectory
+    description: Build the reflect step's goal from the subject's arc trajectories
     role: prepare
     order: 0
   - name: reflect

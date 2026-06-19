@@ -43,3 +43,39 @@ def register_handlers(registry) -> None:
     registry.register_step_handler(
         "reflection", "dispatch", handle_dispatch_actions,
     )
+
+    _register_cadence()
+
+
+def _register_cadence() -> None:
+    """Wire the daily-cadence batching: a cron that emits
+    ``reflection.daily_tick`` and the work-item handler that turns a tick
+    into batched ``period`` reflections.
+
+    Reflection no longer triggers per arc-completion (which could form a
+    feedback loop); it runs once per day over the arcs that completed since
+    the last tick. The schedule is config-overridable via
+    ``reflection.daily_cron`` (default 04:00 daily).
+    """
+    import logging
+
+    from carpenter import config
+    from carpenter.core.engine import main_loop
+
+    from .daily_tick import handle_reflection_tick
+
+    main_loop.register_handler("reflection.daily_tick", handle_reflection_tick)
+
+    cron_expr = config.CONFIG.get("reflection", {}).get("daily_cron", "0 4 * * *")
+    try:
+        from carpenter.core.engine import trigger_manager
+        trigger_manager.add_cron(
+            name="reflection-daily-tick",
+            cron_expr=cron_expr,
+            event_type="reflection.daily_tick",
+        )
+    except Exception as exc:  # pragma: no cover - best-effort registration
+        if not ("UNIQUE" in str(exc) or "already" in str(exc).lower()):
+            logging.getLogger(__name__).warning(
+                "reflection: failed to register daily cron: %s", exc,
+            )

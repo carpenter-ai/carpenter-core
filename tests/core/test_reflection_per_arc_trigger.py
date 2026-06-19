@@ -122,71 +122,30 @@ class TestFilterNotIn:
         assert filter_matches({"x": {"$nin": ["a", "b"]}}, {})
 
 
-# ── Template loads its own trigger ──────────────────────────────────
+# ── Reflection is cadence-driven, NOT per-arc-completion ────────────
 
 
-def test_reflection_template_declares_trigger(tmp_path):
-    """The reflection template ships a ``triggers:`` section that loads
-    as a subscription."""
-    dest = _copy_seed(tmp_path)
-    template_manager.load_templates_from_dir(dest)
+def test_reflection_declares_no_arc_completion_trigger(tmp_path):
+    """Reflection must NOT register an ``arc.status_changed`` subscription.
 
-    loaded = template_manager.load_template_triggers()
-    assert loaded >= 1
-
-    subs = subscriptions.get_subscriptions()
-    refl_subs = [s for s in subs if s.event_type == "arc.status_changed"]
-    assert refl_subs, "reflection template should register a subscription on arc.status_changed"
-
-    sub = refl_subs[0]
-    assert sub.action_type == "create_arc"
-    assert sub.action_config.get("template_name") == "reflection"
-    assert sub.action_config.get("priority") == 1000
-    assert "reflected_arc_id" in (sub.action_config.get("initial_arc_state") or {})
-
-
-def test_reflection_subscription_filter_gates_correctly(tmp_path):
-    """The subscription's filter accepts root+completed non-reflection
-    arcs and rejects anything else."""
+    The per-arc-completion trigger could form an unbounded feedback loop
+    (reflection → skills/ write → skill-kb-review root arc → its completion
+    re-triggers reflection → ...). Reflection is now driven by a daily
+    cadence (see ``daily_tick.py`` + the cron registered in ``__init__.py``)
+    over a bounded batch, which cannot loop.
+    """
     dest = _copy_seed(tmp_path)
     template_manager.load_templates_from_dir(dest)
     template_manager.load_template_triggers()
 
-    sub = next(
+    refl_subs = [
         s for s in subscriptions.get_subscriptions()
         if s.event_type == "arc.status_changed"
+    ]
+    assert refl_subs == [], (
+        "reflection must not subscribe to arc.status_changed — that was the "
+        "per-arc trigger whose loop burned credits"
     )
-
-    # ✅ Root arc, completed, non-reflection → fires.
-    assert filter_matches(sub.event_filter, {
-        "is_root": True, "new_status": "completed", "arc_id": 42,
-    })
-    # ✅ Root arc, completed, different template → fires.
-    assert filter_matches(sub.event_filter, {
-        "is_root": True, "new_status": "completed",
-        "template_name": "coding-change",
-    })
-    # ❌ Child arc → doesn't fire.
-    assert not filter_matches(sub.event_filter, {
-        "is_root": False, "new_status": "completed",
-    })
-    # ❌ Failed → doesn't fire.
-    assert not filter_matches(sub.event_filter, {
-        "is_root": True, "new_status": "failed",
-    })
-    # ❌ Reflection arc completing → doesn't fire (recursion guard).
-    assert not filter_matches(sub.event_filter, {
-        "is_root": True, "new_status": "completed",
-        "template_name": "reflection",
-    })
-    # ❌ skill-kb-review arc completing → doesn't fire. This is the
-    # loop-breaker: skill-kb-review is spawned (transitively) by a
-    # reflection's skills/ writes, so re-triggering reflection here
-    # created an unbounded amplification loop.
-    assert not filter_matches(sub.event_filter, {
-        "is_root": True, "new_status": "completed",
-        "template_name": "skill-kb-review",
-    })
 
 
 # ── arc.status_changed payload includes template_name ───────────────

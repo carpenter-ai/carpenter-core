@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 
 def save_reflection(
-    reflected_arc_id: int,
+    subject_or_arc_id,
     content: str,
     proposed_actions: str | None = None,
     model: str | None = None,
@@ -34,32 +34,44 @@ def save_reflection(
     """Enqueue an async KB write for a completed reflection.
 
     Args:
-        reflected_arc_id: ID of the root arc the reflection analyses.
-            Becomes the KB filename (``reflections/by-arc/{arc_id}``).
+        subject_or_arc_id: Either a typed subject dict (``{kind, refs,
+            window}``) or — for backward compatibility — a single arc id
+            (treated as ``{kind: arcs, refs: [id]}``). Determines the KB
+            path (by-day / by-arc / by-theme).
         content: Reflection markdown body.
         proposed_actions: Optional parsed action block (frontmatter).
         model: Model string (frontmatter / provenance).
-        input_tokens: Reserved for future provenance.
-        output_tokens: Reserved for future provenance.
     """
-    with db_connection() as db:
-        arc_row = db.execute(
-            "SELECT created_at, updated_at FROM arcs WHERE id = ?",
-            (reflected_arc_id,),
-        ).fetchone()
+    from ._subject import subject_arc_ids, subject_kb_path, subject_period
 
-    if arc_row:
-        period_start = arc_row["created_at"] or ""
-        period_end = arc_row["updated_at"] or period_start
+    if isinstance(subject_or_arc_id, dict):
+        subject = subject_or_arc_id
+    elif subject_or_arc_id is not None:
+        subject = {"kind": "arcs", "refs": [int(subject_or_arc_id)]}
     else:
-        now = datetime.now(timezone.utc).isoformat()
-        period_start = now
-        period_end = now
+        subject = None
+
+    period_start, period_end = subject_period(subject)
+    if not period_start:
+        ids = subject_arc_ids(subject)
+        if ids:
+            placeholders = ",".join("?" * len(ids))
+            with db_connection() as db:
+                row = db.execute(
+                    f"SELECT MIN(created_at) AS s, MAX(updated_at) AS e "
+                    f"FROM arcs WHERE id IN ({placeholders})",
+                    ids,
+                ).fetchone()
+            period_start = (row["s"] if row else "") or ""
+            period_end = (row["e"] if row else "") or period_start
+        else:
+            now = datetime.now(timezone.utc).isoformat()
+            period_start = period_end = now
 
     from .kb_entry import build_reflection_entry
 
     entry = build_reflection_entry(
-        reflected_arc_id,
+        subject=subject,
         content=content,
         proposed_actions=proposed_actions,
         model=model,
@@ -69,18 +81,17 @@ def save_reflection(
     if entry is None:
         return
 
+    kb_path = subject_kb_path(subject)
+    idem = "refl-kb-" + kb_path.replace("/", "-")
     try:
         from carpenter.core.engine import work_queue
         work_queue.enqueue(
             "kb.write_entry",
             entry,
-            idempotency_key=f"refl-kb-by-arc-{reflected_arc_id}",
+            idempotency_key=idem,
         )
     except (ImportError, sqlite3.Error):
-        logger.exception(
-            "Failed to enqueue kb.write_entry for reflection arc %d",
-            reflected_arc_id,
-        )
+        logger.exception("Failed to enqueue kb.write_entry for %s", kb_path)
 
 
 def get_reflections(limit: int = 5) -> list[dict]:

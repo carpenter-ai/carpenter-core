@@ -76,30 +76,21 @@ async def handle_gather_activity(arc_id: int, arc_info: dict) -> None:
     step runs an LLM agent and reads its goal from the arcs row).
     """
     from . import activity_gatherer
+    from ._subject import get_subject
 
     if arc_info.get("status") == "pending":
         arc_manager.update_status(arc_id, "active")
 
     parent_id = arc_info["parent_id"]
-    reflected_arc_id = _get_arc_state(parent_id, "reflected_arc_id")
-    if reflected_arc_id is None:
+    subject = get_subject(parent_id)
+    if subject is None:
         logger.warning(
-            "gather-activity arc %d: parent %d has no reflected_arc_id — "
-            "the reflection subscription must set it via initial_arc_state",
+            "gather-activity arc %d: parent %d has no reflection_subject",
             arc_id, parent_id,
         )
-        gathered = "# Reflection — no arc specified\n"
+        gathered = "# Reflection — no subject specified\n"
     else:
-        try:
-            reflected_arc_id = int(reflected_arc_id)
-        except (TypeError, ValueError):
-            logger.warning(
-                "gather-activity arc %d: reflected_arc_id=%r is not an int",
-                arc_id, reflected_arc_id,
-            )
-            gathered = "# Reflection — bad reflected_arc_id\n"
-        else:
-            gathered = activity_gatherer.gather_from_arc(reflected_arc_id)
+        gathered = activity_gatherer.gather_from_subject(subject)
 
     reflect_arc_id = find_sibling_arc_id(arc_id, "analyze")
     if reflect_arc_id is not None:
@@ -128,15 +119,13 @@ async def handle_gather_activity(arc_id: int, arc_info: dict) -> None:
 
 async def handle_save_reflection(arc_id: int, arc_info: dict) -> None:
     """Save the reflection from its sibling reflect arc's AI output."""
+    from ._subject import get_subject
+
     if arc_info.get("status") == "pending":
         arc_manager.update_status(arc_id, "active")
 
     parent_id = arc_info["parent_id"]
-    reflected_arc_id = _get_arc_state(parent_id, "reflected_arc_id")
-    try:
-        reflected_arc_id = int(reflected_arc_id) if reflected_arc_id is not None else None
-    except (TypeError, ValueError):
-        reflected_arc_id = None
+    subject = get_subject(parent_id)
 
     response_text = "(No reflection output)"
     reflect_arc_id = find_sibling_arc_id(arc_id, "analyze")
@@ -158,17 +147,15 @@ async def handle_save_reflection(arc_id: int, arc_info: dict) -> None:
 
     model = model_resolver.get_model_for_role("reflection")
 
-    if reflected_arc_id is None:
+    if subject is None:
         logger.warning(
-            "save-reflection arc %d: no reflected_arc_id on parent %d — "
-            "nothing to key the reflection on",
+            "save-reflection arc %d: parent %d has no reflection_subject — "
+            "keying the reflection on the parent arc id as a fallback",
             arc_id, parent_id,
         )
-        # Fall back to using the parent's id so the row still writes;
-        # this path only trips in tests or misconfigured subscriptions.
-        reflected_arc_id = parent_id
+        subject = {"kind": "arcs", "refs": [parent_id]}
 
-    save_reflection(reflected_arc_id, response_text, model=model)
+    save_reflection(subject, response_text, model=model)
 
     # Auto-action fan-out now lives in the ``dispatch-actions`` template
     # step (see :func:`handle_dispatch_actions`); spawning child arcs per
@@ -190,10 +177,21 @@ async def handle_save_reflection(arc_id: int, arc_info: dict) -> None:
         conv_module.archive_conversation(conv_row["conversation_id"])
 
     logger.info(
-        "save-reflection arc %d completed: KB write enqueued "
-        "(reflected_arc_id=%s)",
-        arc_id, reflected_arc_id,
+        "save-reflection arc %d completed: KB write enqueued (subject=%s)",
+        arc_id, subject.get("kind") if subject else None,
     )
+
+
+def _is_batch_restricted(arc_ids: list[int], proposed_action: dict | None) -> bool:
+    """A batch is restricted if *any* arc in it would be restricted.
+
+    Conservative: one tainted/high-tier arc in a daily batch routes the
+    batch's spawned actions through the gated human-review path. With no
+    arc ids (e.g. a theme subject), falls back to the path/category arm.
+    """
+    if not arc_ids:
+        return _is_reflection_restricted(None, proposed_action)
+    return any(_is_reflection_restricted(aid, proposed_action) for aid in arc_ids)
 
 
 def _is_reflection_restricted(
@@ -368,14 +366,11 @@ async def handle_dispatch_actions(arc_id: int, arc_info: dict) -> None:
     if arc_info.get("status") == "pending":
         arc_manager.update_status(arc_id, "active")
 
+    from ._subject import get_subject, subject_arc_ids
+
     parent_id = arc_info["parent_id"]
-    reflected_arc_id_raw = _get_arc_state(parent_id, "reflected_arc_id")
-    try:
-        reflected_arc_id = (
-            int(reflected_arc_id_raw) if reflected_arc_id_raw is not None else None
-        )
-    except (TypeError, ValueError):
-        reflected_arc_id = None
+    subject = get_subject(parent_id)
+    subject_ids = subject_arc_ids(subject)
 
     # Fetch the reflect arc's AI output as the raw proposed-actions text.
     raw_response: str | None = None
@@ -437,7 +432,7 @@ async def handle_dispatch_actions(arc_id: int, arc_info: dict) -> None:
         if not action_desc:
             continue
 
-        restricted = _is_reflection_restricted(reflected_arc_id, action)
+        restricted = _is_batch_restricted(subject_ids, action)
         if restricted:
             any_restricted = True
         review_mode = "human" if restricted else "auto"
