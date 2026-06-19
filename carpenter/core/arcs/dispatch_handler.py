@@ -843,8 +843,17 @@ async def _run_arc_agent(
         arc_conv_id, f"[Arc #{arc_id}] {goal[:50]}"
     )
 
+    # REVIEWER arc-step agents read their inputs with read tools and emit
+    # their typed extract via the ``submit_extract`` tool — they do NOT write
+    # code. The default ``arc_execute`` prompt is submit_code-centric (and
+    # forbids reading files), which actively confuses a REVIEWER. Select an
+    # agent-type-appropriate prompt: REVIEWERs get the read+submit_extract
+    # template; EXECUTOR/PLANNER keep the submit_code template.
+    _arc_info = arc_manager.get_arc(arc_id)
+    _agent_type = (_arc_info.get("agent_type") if _arc_info else None) or "EXECUTOR"
+    _template = "arc_execute_reviewer" if _agent_type == "REVIEWER" else "arc_execute"
     message = templates.render(
-        "arc_execute",
+        _template,
         arc_id=arc_id,
         goal=goal,
         source_conv_id=source_conv_id or 0,
