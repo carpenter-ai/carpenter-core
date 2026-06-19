@@ -112,6 +112,104 @@ _PLATFORM_KINDS: dict[str, type] = {
 }
 
 
+def resolve_kind_dataclass(kind: str) -> type | None:
+    """Resolve an extract ``kind`` tag to its dataclass, or None.
+
+    Single source of truth for the ``kind`` -> class mapping used by
+    both the JUDGE-dispatch deserialiser (:func:`_load_extraction_resource`)
+    and the ``submit_extract`` field-schema validator
+    (``invocation._handle_submit_extract``).  Keeping one resolver means
+    the validator the REVIEWER hits and the decoder the JUDGE runs can
+    never disagree about what fields a ``kind`` declares.
+
+    Resolution order (platform kinds always win):
+
+      1. ``_PLATFORM_KINDS`` — platform-shipped extract dataclasses.
+      2. The package handler registry's ``lookup_kind`` — kinds a
+         capability package contributed via its ``data_models`` manifest
+         entry, registered under the same unprefixed name.
+
+    Returns the dataclass, or ``None`` when the kind is unknown (or the
+    packages subsystem is unavailable in a stripped build).
+    """
+    cls = _PLATFORM_KINDS.get(kind)
+    if cls is not None:
+        return cls
+    try:
+        from ..packages.handler_registry import get_handler_registry
+        return get_handler_registry().lookup_kind(kind)
+    except ImportError:
+        logger.warning(
+            "packages.handler_registry unavailable; cannot resolve "
+            "package-shipped kind %r",
+            kind,
+        )
+        return None
+
+
+def validate_extract_fields(cls: type, fields: dict) -> str | None:
+    """Validate a ``submit_extract`` ``fields`` dict against a dataclass.
+
+    Returns ``None`` when ``fields`` matches ``cls`` (every key names a
+    real dataclass field and every required field — one with no default
+    and no default_factory — is present).  Otherwise returns a corrective
+    error STRING that names the unexpected keys and lists the exact
+    expected field names (required vs optional).  This string is handed
+    straight back to the REVIEWER LLM as the ``submit_extract`` tool
+    result so it can self-correct within its agent loop.
+
+    The check is intentionally structural-only — it mirrors what
+    ``cls(**payload)`` would accept after the JUDGE's
+    ``_construct_dataclass`` coercions (list->tuple, nested dataclass,
+    PolicyLiteral).  It does NOT attempt to validate VALUES; the JUDGE
+    remains the sole authority on whether the data graduates.
+    """
+    import dataclasses
+
+    if not dataclasses.is_dataclass(cls):
+        # Non-dataclass kind: we can't introspect fields; let the write
+        # proceed and the JUDGE decode decide.
+        return None
+
+    flds = dataclasses.fields(cls)
+    field_names = [f.name for f in flds]
+    field_set = set(field_names)
+
+    required = [
+        f.name
+        for f in flds
+        if f.default is dataclasses.MISSING
+        and f.default_factory is dataclasses.MISSING  # type: ignore[misc]
+    ]
+    optional = [n for n in field_names if n not in set(required)]
+
+    supplied = set(fields.keys())
+    unexpected = supplied - field_set
+    missing = [r for r in required if r not in supplied]
+
+    if not unexpected and not missing:
+        return None
+
+    parts: list[str] = ["submit_extract rejected:"]
+    if unexpected:
+        parts.append(
+            f"unexpected field(s) {sorted(unexpected)!r};"
+        )
+    if missing:
+        parts.append(
+            f"missing required field(s) {missing!r};"
+        )
+    parts.append(
+        f"the {cls.__name__} fields are: {', '.join(field_names)}."
+    )
+    if required:
+        parts.append(f"Required: {', '.join(required)}.")
+    if optional:
+        parts.append(f"Optional: {', '.join(optional)}.")
+    parts.append("Re-call submit_extract with exactly those keys.")
+    return " ".join(parts)
+
+
 # ---------------------------------------------------------------------------
 # Public entry points
 # ---------------------------------------------------------------------------
@@ -436,29 +534,14 @@ def _load_extraction_resource(resource_row: dict) -> Any:
         # Legacy / kind-less path: hand back the raw decoded JSON.
         return payload
 
-    cls = _PLATFORM_KINDS.get(kind)
-    if cls is None:
-        # D24 stage 3b: consult the package-shipped kind registry.
-        # Platform kinds always win (we already checked above), so this
-        # path only runs for kinds a capability package contributed via
-        # its ``data_models`` manifest entry.  The package's loader
-        # registered the dataclass against the same unprefixed name.
-        # ImportError is the only soft-fallback case (e.g. a stripped
-        # build with no packages subsystem); any other exception from
-        # ``lookup_kind`` is a registry-corruption bug that should
-        # surface to the caller, not be swallowed into a confusing
-        # "unknown kind" rejection (PR #306 followup: the prior broad
-        # ``except Exception`` here masked exactly that class of bug).
-        try:
-            from ..packages.handler_registry import get_handler_registry
-            cls = get_handler_registry().lookup_kind(kind)
-        except ImportError:
-            logger.warning(
-                "packages.handler_registry unavailable; cannot resolve "
-                "package-shipped kind %r on Resource %d",
-                kind, resource_id,
-            )
-            cls = None
+    # D24 stage 3b: resolve via the shared kind resolver.  Platform kinds
+    # win over package-shipped kinds; ImportError (stripped build with no
+    # packages subsystem) soft-falls to None.  Any other exception from
+    # ``lookup_kind`` is a registry-corruption bug that should surface to
+    # the caller, not be swallowed into a confusing "unknown kind"
+    # rejection (PR #306 followup: a prior broad ``except Exception``
+    # here masked exactly that class of bug).
+    cls = resolve_kind_dataclass(kind)
     if cls is None:
         from ..packages.handler_registry import get_handler_registry
         pkg_kinds = [k for k, _ in get_handler_registry().list_kinds()]

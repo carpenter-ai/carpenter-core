@@ -517,3 +517,113 @@ class TestConstructDataclassCoercion:
         assert obj.count == 5
         assert obj.name == "hi"
         assert obj.flag is True
+
+
+class TestResolveKindDataclass:
+    """resolve_kind_dataclass is the single source of truth for kind ->
+    dataclass used by both the JUDGE decoder and the submit_extract
+    field-schema validator."""
+
+    def test_platform_kind_resolves(self):
+        from carpenter.security.judge import (
+            PolicyCheckList,
+            resolve_kind_dataclass,
+        )
+
+        assert resolve_kind_dataclass("PolicyCheckList") is PolicyCheckList
+
+    def test_unknown_kind_returns_none(self):
+        from carpenter.security.judge import resolve_kind_dataclass
+
+        assert resolve_kind_dataclass("NoSuchKindXyz") is None
+
+    def test_package_kind_resolves_via_registry(self):
+        from dataclasses import dataclass
+        from carpenter.packages.handler_registry import get_handler_registry
+        from carpenter.security.judge import resolve_kind_dataclass
+
+        @dataclass
+        class _PkgExtract:
+            a: str = ""
+
+        reg = get_handler_registry()
+        reg.register_kind("test-pkg", "_PkgExtract", _PkgExtract)
+        try:
+            assert resolve_kind_dataclass("_PkgExtract") is _PkgExtract
+        finally:
+            reg.unregister_package("test-pkg")
+
+
+class TestValidateExtractFields:
+    """validate_extract_fields returns None on a match, else a corrective
+    error string naming the unexpected/missing keys + the expected list."""
+
+    def _cls(self):
+        from dataclasses import dataclass, field
+
+        @dataclass(frozen=True)
+        class _Triage:
+            provider_message_id: str = ""
+            category: str = "unknown"
+            importance_flags: tuple = ()
+            required_thing: str = field(default_factory=str)
+
+        return _Triage
+
+    def test_correct_fields_pass(self):
+        from carpenter.security.judge import validate_extract_fields
+
+        cls = self._cls()
+        err = validate_extract_fields(cls, {
+            "provider_message_id": "x",
+            "category": "personal",
+            "importance_flags": [],
+            "required_thing": "y",
+        })
+        assert err is None
+
+    def test_unknown_field_rejected_with_corrective(self):
+        from carpenter.security.judge import validate_extract_fields
+
+        cls = self._cls()
+        err = validate_extract_fields(cls, {
+            "provider_message_id": "x",
+            "category": "personal",
+            "attachment_count": 3,
+            "classification": "spam",
+        })
+        assert err is not None
+        assert "rejected" in err.lower()
+        assert "attachment_count" in err
+        assert "classification" in err
+        # The exact expected field names must be present.
+        assert "provider_message_id" in err
+        assert "category" in err
+        assert "Re-call submit_extract" in err
+
+    def test_missing_required_field_rejected(self):
+        from carpenter.security.judge import validate_extract_fields
+
+        cls = self._cls()
+        # 'provider_message_id' has a plain default -> NOT required.
+        # 'required_thing' has a default_factory -> also not required.
+        # Construct a class with a truly-required field to exercise this.
+        from dataclasses import dataclass
+
+        @dataclass
+        class _NeedsField:
+            must_have: str
+            opt: str = ""
+
+        err = validate_extract_fields(_NeedsField, {"opt": "x"})
+        assert err is not None
+        assert "must_have" in err
+        assert "missing required" in err.lower()
+
+    def test_non_dataclass_kind_passes(self):
+        from carpenter.security.judge import validate_extract_fields
+
+        class _NotDataclass:
+            pass
+
+        assert validate_extract_fields(_NotDataclass, {"anything": 1}) is None
