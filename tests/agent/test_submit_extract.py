@@ -186,6 +186,142 @@ class TestSubmitExtractOfferGate:
         assert "submit_extract" not in get_always_available_names()
 
 
+class TestSubmitExtractFieldSchema:
+    """The handler validates ``fields`` against the Resource's ``kind``
+    dataclass BEFORE persisting.  On a mismatch it returns a corrective
+    error and does NOT write, so the REVIEWER LLM can self-correct.
+
+    Carpenter-core has no email package loaded, so we register a test
+    dataclass kind in the package handler registry to exercise the path.
+    """
+
+    @pytest.fixture
+    def registered_kind(self):
+        from dataclasses import dataclass, field as dc_field
+        from carpenter.packages.handler_registry import get_handler_registry
+
+        @dataclass(frozen=True)
+        class _TestTriage:
+            provider_message_id: str = ""
+            category: str = "unknown"
+            importance_flags: tuple[str, ...] = ()
+            schema_version: str = "1.0"
+
+        reg = get_handler_registry()
+        reg.register_kind("test-pkg-submit", "_TestTriage", _TestTriage)
+        try:
+            yield "_TestTriage"
+        finally:
+            reg.unregister_package("test-pkg-submit")
+
+    def test_unknown_field_rejected_not_persisted(self, registered_kind):
+        reviewer, rid = _reviewer_arc_with_pending_extract(
+            kind=registered_kind
+        )
+        result = _handle_submit_extract(
+            {"fields": {
+                "provider_message_id": "x",
+                "category": "personal",
+                "attachment_count": 3,
+                "classification": "spam",
+            }},
+            executor_arc_id=reviewer,
+        )
+        # Corrective error returned…
+        assert "rejected" in result.lower()
+        assert "attachment_count" in result
+        assert "classification" in result
+        assert "provider_message_id" in result
+        # …and NOTHING was persisted (no blob written).
+        row = res_manager.get_resource(rid)
+        assert row["byte_size"] in (None, 0)
+
+    def test_missing_required_field_rejected(self):
+        from dataclasses import dataclass
+        from carpenter.packages.handler_registry import get_handler_registry
+
+        @dataclass
+        class _NeedsField:
+            must_have: str
+            opt: str = ""
+
+        reg = get_handler_registry()
+        reg.register_kind("test-pkg-req", "_NeedsField", _NeedsField)
+        try:
+            reviewer, rid = _reviewer_arc_with_pending_extract(
+                kind="_NeedsField"
+            )
+            result = _handle_submit_extract(
+                {"fields": {"opt": "x"}}, executor_arc_id=reviewer
+            )
+            assert "must_have" in result
+            assert "missing required" in result.lower()
+            row = res_manager.get_resource(rid)
+            assert row["byte_size"] in (None, 0)
+        finally:
+            reg.unregister_package("test-pkg-req")
+
+    def test_correct_fields_persist_and_decode(self, registered_kind):
+        from carpenter.security import judge as judge_mod
+
+        reviewer, rid = _reviewer_arc_with_pending_extract(
+            kind=registered_kind
+        )
+        fields = {
+            "provider_message_id": "abc12",
+            "category": "personal",
+            "importance_flags": ["personal"],
+            "schema_version": "1.0",
+        }
+        result = _handle_submit_extract(
+            {"fields": fields}, executor_arc_id=reviewer
+        )
+        assert "persisted" in result.lower()
+
+        text = read_resource_content(rid, caller_arc_id=None)
+        assert json.loads(text) == fields
+        # The JUDGE decoder can now construct the dataclass without error.
+        row = res_manager.get_resource(rid)
+        decoded = judge_mod._load_extraction_resource(row)
+        assert decoded.provider_message_id == "abc12"
+        assert decoded.importance_flags == ("personal",)
+
+    def test_kindless_resource_still_writes(self):
+        """A Resource with no ``kind`` keeps the historical write-as-is
+        behaviour — the validator can't introspect fields and must not
+        block non-typed callers."""
+        reviewer = arc_manager.create_arc(
+            name="kindless-reviewer",
+            agent_type="REVIEWER",
+            integrity_level="trusted",
+        )
+        rid = derive_resource(
+            content_type="dataclass",
+            file_path=None,
+            produced_by_arc_id=reviewer,
+            produced_by_template="some_template",
+            template_verdict="pending",
+            source_descriptor="extract:kindless",
+            kind=None,
+        )
+        path = resource_storage_path(rid, "blob")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with db_transaction() as db:
+            db.execute(
+                "UPDATE resources SET file_path = ? WHERE id = ?",
+                (str(path), rid),
+            )
+        set_arc_state(reviewer, "extract_resource_id", rid)
+
+        result = _handle_submit_extract(
+            {"fields": {"anything": 1, "goes": "here"}},
+            executor_arc_id=reviewer,
+        )
+        assert "persisted" in result.lower()
+        text = read_resource_content(rid, caller_arc_id=None)
+        assert json.loads(text) == {"anything": 1, "goes": "here"}
+
+
 class TestSubmitExtractJudgeDecodes:
     def test_judge_decodes_and_approves_persisted_extract(self):
         """End-to-end: submit_extract persists a valid EmailTriageExtract,

@@ -1608,6 +1608,36 @@ def _handle_submit_extract(
             "can only persist a template-created pending extract Resource."
         )
 
+    # Field-schema gate (self-healing): if the pending extract Resource
+    # declares a typed ``kind``, validate the supplied ``fields`` against
+    # that dataclass BEFORE persisting.  On mismatch we DO NOT write —
+    # we return a corrective error naming the unexpected keys and the
+    # exact expected field list, so the REVIEWER LLM self-corrects within
+    # its agent loop (a tool error lets it retry).  This closes the
+    # failure mode where a REVIEWER hallucinates its own schema, the blob
+    # is written, and the JUDGE's ``cls(**payload)`` decode then dies on
+    # an unexpected keyword argument (extract stuck ``pending`` forever).
+    #
+    # A kind-less Resource (no typed dataclass) keeps the historical
+    # write-as-is behaviour — we can't introspect fields, so we let the
+    # JUDGE decode decide and don't break non-typed callers.
+    from ..core.resources.manager import get_resource
+    from ..security.judge import resolve_kind_dataclass, validate_extract_fields
+
+    resource_row = get_resource(int(extract_resource_id))
+    if resource_row is not None and resource_row.get("kind"):
+        kind = resource_row["kind"]
+        cls = resolve_kind_dataclass(kind)
+        if cls is not None:
+            corrective = validate_extract_fields(cls, fields)
+            if corrective is not None:
+                logger.info(
+                    "submit_extract field-schema rejection for arc %s "
+                    "(kind=%s): %s",
+                    executor_arc_id, kind, corrective,
+                )
+                return corrective
+
     try:
         result = resource_backend.handle_write({
             "resource_id": int(extract_resource_id),
