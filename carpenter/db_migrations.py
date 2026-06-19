@@ -1078,6 +1078,32 @@ def _migrate_arc_origin(conn: sqlite3.Connection, tables: set) -> None:
         conn.commit()
 
 
+def _migrate_budget_breaker(conn: sqlite3.Connection, tables: set) -> None:
+    """Add the API budget circuit-breaker state store + a hot-path index.
+
+    ``budget_state`` is a small kv store holding the persistent kill-switch,
+    restrict latch, runtime threshold overrides, and warn timestamps — kept
+    in the DB so a process restart cannot reset an active breaker. The
+    ``api_calls(created_at)`` index keeps the per-window rate/cost
+    aggregates cheap.
+    """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS budget_state (
+            key TEXT PRIMARY KEY,
+            value_json TEXT NOT NULL,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    if "api_calls" in tables:
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_api_calls_created_at "
+            "ON api_calls(created_at)"
+        )
+    conn.commit()
+
+
 def run_migrations(conn: sqlite3.Connection) -> None:
     """Run all data migrations for existing databases.
 
@@ -1124,3 +1150,4 @@ def run_migrations(conn: sqlite3.Connection) -> None:
     # package_vectors must run after installed_packages (FK target).
     _migrate_package_vectors(conn, tables)
     _migrate_arc_origin(conn, tables)
+    _migrate_budget_breaker(conn, tables)

@@ -1052,6 +1052,16 @@ def scan_for_ready_arcs():
 
     Called every ~5 seconds from main_loop heartbeat.
     """
+    from .. import budget
+
+    # Budget safety net: dispatching pending arcs is autonomous spend. While
+    # the breaker is restricting/capping, stop enqueuing dispatch work — the
+    # arcs stay pending and resume once the breaker clears.
+    allowed, reason = budget.autonomous_allowed()
+    if not allowed:
+        logger.debug("scan_for_ready_arcs deferred by budget breaker (%s)", reason)
+        return
+
     with db_connection() as db:
         # Find all pending arcs — exclude coding-change arcs, which are managed
         # exclusively by coding_change_handler via its own work queue events.

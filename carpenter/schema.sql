@@ -675,3 +675,15 @@ CREATE TABLE IF NOT EXISTS package_vectors (
 );
 CREATE INDEX IF NOT EXISTS idx_package_vectors_pkg_model
     ON package_vectors(package_name, model_identity);
+
+-- API budget circuit breaker state (see carpenter/core/budget.py). A small
+-- kv store for the persistent kill-switch, restrict latch, runtime threshold
+-- overrides, and warn timestamps — kept in the DB so a process restart cannot
+-- reset an active breaker.
+CREATE TABLE IF NOT EXISTS budget_state (
+    key TEXT PRIMARY KEY,
+    value_json TEXT NOT NULL,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+-- Keeps per-window rate/cost aggregates cheap.
+CREATE INDEX IF NOT EXISTS idx_api_calls_created_at ON api_calls(created_at);

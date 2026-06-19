@@ -2902,6 +2902,11 @@ def _call_with_retries(
                 exc_info=True,
             )
 
+            # Budget kill-switch is fatal — stop retrying immediately.
+            if error_info.type == "BudgetExceededError":
+                last_error_info = error_info
+                break
+
             # Store for return on final attempt
             if attempt == max_retries - 1:
                 last_error_info = error_info

@@ -33,6 +33,9 @@ PLATFORM_TOOLS = frozenset({
     # human-confirmation pattern (requires_user_confirm=True).
     "install_package",
     "uninstall_package",
+    # API budget circuit breaker control: clearing a tripped breaker or
+    # raising a limit mutates safety-critical platform state.
+    "budget_control",
 })
 
 _VALID_BOUNDARIES = frozenset({"chat", "platform"})
