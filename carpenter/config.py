@@ -380,6 +380,16 @@ DEFAULTS = {
             "smtp_tls": True,
             "command": "",          # shell command for command mode
         },
+        # Signal channel via a local signal-cli-rest-api instance. Off by
+        # default in the seed config; operators who run signal-cli enable it
+        # and fill in numbers. Delivery: POST {base_url}/v2/send.
+        "signal": {
+            "enabled": False,
+            "base_url": "http://localhost:8080",
+            "bot_number": "",       # registered sender (E.164)
+            "recipient": "",        # owner recipient (E.164 or UUID)
+            "timeout": 15,
+        },
         "batch_window": 60,        # seconds to batch notifications
         "priorities": ["urgent", "normal", "low", "fyi"],
         "default_routing": {
@@ -392,6 +402,30 @@ DEFAULTS = {
             "review_needed": "normal",
             "security_events": "urgent",
         },
+    },
+    # API budget circuit breaker — the universal safety net against runaway
+    # spend (see carpenter/core/budget.py). Each limit is an independent
+    # rule; compose a low ``warn`` with a higher ``cap`` on the same
+    # metric/window for a staged response. ``notify_human`` is the master
+    # opt-in for human messaging and is OFF by default in this seed config.
+    "api_budget": {
+        "enabled": True,
+        "notify_human": False,
+        "eval_interval_seconds": 5,
+        "limits": [
+            {"name": "hourly-calls-warn", "metric": "calls",
+             "window_seconds": 3600, "threshold": 750, "action": "warn",
+             "notify": {"enabled": True, "priority": "low"}},
+            {"name": "hourly-calls-cap", "metric": "calls",
+             "window_seconds": 3600, "threshold": 1000, "action": "cap",
+             "notify": {"enabled": True, "priority": "urgent"}},
+            {"name": "daily-cost-restrict", "metric": "cost_usd",
+             "window_seconds": 86400, "threshold": 15.0, "action": "restrict",
+             "notify": {"enabled": True, "priority": "urgent"}},
+            {"name": "daily-cost-shutdown", "metric": "cost_usd",
+             "window_seconds": 86400, "threshold": 40.0, "action": "shutdown",
+             "notify": {"enabled": True, "priority": "urgent"}},
+        ],
     },
     "model_presets": {},  # User overrides for model selector presets (see model_selector.py)
     # Platform-integrity classifier config.  Read by

@@ -219,6 +219,15 @@ def check_cron() -> int:
     Returns the number of events emitted.
     """
     from . import event_bus
+    from .. import budget
+
+    # Budget safety net: cron/timer firing is autonomous work. While the
+    # breaker is restricting/capping, defer firing (don't advance next_fire_at)
+    # so scheduled jobs resume — not pile up — once the breaker clears.
+    allowed, reason = budget.autonomous_allowed()
+    if not allowed:
+        logger.debug("check_cron deferred by budget breaker (%s)", reason)
+        return 0
 
     db = get_db()
     events_emitted = 0

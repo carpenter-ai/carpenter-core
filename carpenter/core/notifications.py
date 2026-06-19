@@ -135,6 +135,10 @@ def _deliver(message: str, priority: str, category: str | None,
                 sent = _send_email(message, priority, category)
                 if sent:
                     delivered_channels.append("email")
+            elif channel_name == "signal":
+                sent = _send_signal(message, priority, category)
+                if sent:
+                    delivered_channels.append("signal")
         except Exception:  # broad catch: channel delivery may raise anything
             logger.exception("Failed to deliver notification via %s", channel_name)
 
@@ -252,6 +256,51 @@ def _send_email_command(email_config: dict, message: str, subject: str) -> bool:
         return False
     except OSError as _exc:
         logger.exception("Failed to send email via command: %s", command)
+        return False
+
+
+def _send_signal(message: str, priority: str, category: str | None) -> bool:
+    """Send a Signal message via a local signal-cli-rest-api instance.
+
+    POSTs to ``{base_url}/v2/send``. Returns True on success. Uses only the
+    stdlib so the platform stays dependency-light.
+    """
+    import json as _json
+    import urllib.error
+    import urllib.request
+
+    sig = config.CONFIG.get("notifications", {}).get("signal", {})
+    if not sig.get("enabled"):
+        return False
+    base_url = (sig.get("base_url") or "http://localhost:8080").rstrip("/")
+    bot = sig.get("bot_number") or ""
+    recipient = sig.get("recipient") or ""
+    if not bot or not recipient:
+        logger.warning("Signal channel enabled but bot_number/recipient unset")
+        return False
+
+    body = _json.dumps({
+        "message": message,
+        "number": bot,
+        "recipients": [recipient],
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        f"{base_url}/v2/send", data=body,
+        headers={"Content-Type": "application/json"}, method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=sig.get("timeout", 15)) as resp:
+            if 200 <= resp.status < 300:
+                logger.info("Signal notification sent to %s", recipient)
+                return True
+            logger.warning("Signal send returned HTTP %s", resp.status)
+            return False
+    except urllib.error.HTTPError as exc:
+        logger.warning("Signal send failed: HTTP %s %s", exc.code,
+                       exc.read()[:200] if hasattr(exc, "read") else "")
+        return False
+    except (urllib.error.URLError, OSError) as exc:
+        logger.warning("Signal send failed (transport): %s", exc)
         return False
 
 

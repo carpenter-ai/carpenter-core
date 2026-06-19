@@ -113,8 +113,23 @@ def classify_error(
             raw_error=raw_error,
         )
 
-    # Check for circuit breaker by exception type name
     exc_type_name = type(exception).__name__
+
+    # Budget kill-switch — fatal and non-retryable. The gate runs before any
+    # network I/O, so retrying would never spend; we break immediately.
+    if "BudgetExceededError" in exc_type_name:
+        return ErrorInfo(
+            type="BudgetExceededError",
+            retry_count=retry_count,
+            source_location="invocation._call_with_retries",
+            message="API budget kill-switch is active — model calls are "
+                    "blocked until the breaker is cleared.",
+            model=model,
+            provider=provider,
+            raw_error=raw_error,
+        )
+
+    # Check for circuit breaker by exception type name
     if "CircuitOpenError" in exc_type_name or "CircuitBreakerError" in exc_type_name:
         return ErrorInfo(
             type="APIOutageError",

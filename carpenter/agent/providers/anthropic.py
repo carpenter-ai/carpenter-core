@@ -199,7 +199,13 @@ def call(
 
     Raises:
         httpx.HTTPStatusError: On API errors.
+        budget.BudgetExceededError: When the API budget kill-switch is active.
     """
+    # Universal safety net: refuse paid calls while the budget kill-switch
+    # is latched. Runs before any network I/O, so a blocked call never spends.
+    from ...core import budget
+    budget.guard_paid_call(model)
+
     key = api_key or get_api_key()
     model = model or config.CONFIG.get("claude_model", DEFAULT_MODEL)
     max_tokens = max_tokens or config.CONFIG.get("claude_max_tokens", DEFAULT_MAX_TOKENS)

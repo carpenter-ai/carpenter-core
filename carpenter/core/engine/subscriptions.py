@@ -371,6 +371,18 @@ def handle_subscription_create_arc(payload: dict) -> int | None:
     from ..arcs import manager as arc_manager
     from ..workflows._arc_state import set_arc_state
     from . import template_manager
+    from .. import budget
+
+    # Budget safety net: trigger-driven arc creation is autonomous work and
+    # is exactly how a runaway feedback loop propagates. Refuse it while the
+    # breaker is restricting/capping so a loop cannot keep spawning roots.
+    allowed, reason = budget.autonomous_allowed()
+    if not allowed:
+        logger.warning(
+            "Subscription %s: create_arc suppressed by budget breaker (%s)",
+            payload.get("_subscription"), reason,
+        )
+        return None
 
     template_id = payload.get("template_id")
     template_name = payload.get("template_name")
