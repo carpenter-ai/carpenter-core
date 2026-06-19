@@ -27,6 +27,10 @@ PLATFORM_TOOLS = frozenset({
     "escalate_current_arc",
     "escalate",
     "fetch_web_content",
+    # REVIEWER-arc-scoped structured extract emit. Writes only the caller
+    # arc's own pre-created pending Resource (handler enforces caller ==
+    # producer); never flips the verdict (JUDGE stays authoritative).
+    "submit_extract",
     "set_conversation_model",
     # D24 stage 3a: capability-package install/uninstall.  These mutate
     # platform state (filesystem + DB) and use the standard chat-tool

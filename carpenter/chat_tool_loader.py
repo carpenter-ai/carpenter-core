@@ -146,6 +146,42 @@ _PLATFORM_TOOL_DEFS = [
         "capabilities": ["arc_create", "database_write", "external_effect"],
         "always_available": True,
     },
+    {
+        "name": "submit_extract",
+        "description": (
+            "REVIEWER arcs ONLY. Persist your typed extract by supplying its "
+            "field VALUES as a structured JSON object — you do NOT write code "
+            "or call dispatch(). The extract Resource was already created for "
+            "you (pending verdict, kind-tagged); this tool writes your values "
+            "into that ONE Resource and finalizes it. It cannot target any "
+            "other Resource and it does NOT approve your output — the JUDGE "
+            "validates it after you exit. Call this exactly once with the "
+            "computed fields, then stop."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "fields": {
+                    "type": "object",
+                    "description": (
+                        "A JSON object whose keys are the extract dataclass's "
+                        "field names and whose values are the computed field "
+                        "values. Written verbatim as the Resource blob; the "
+                        "JUDGE decodes it into the typed dataclass named by the "
+                        "Resource's kind and validates every field."
+                    ),
+                },
+            },
+            "required": ["fields"],
+        },
+        "trust_boundary": "platform",
+        # Scoped write: persists only the caller arc's OWN pre-created
+        # pending Resource (handler enforces caller == producer). Not a
+        # general chat tool — not always_available; offered only to
+        # REVIEWER arc-step agents (see invocation.invoke_for_chat).
+        "capabilities": ["database_write"],
+        "always_available": False,
+    },
 ]
 
 
