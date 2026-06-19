@@ -126,3 +126,20 @@ def test_builtin_used_when_no_user_override(tmp_path, monkeypatch):
     # Should still load the built-in chat_new template
     result = templates.render("chat_new", system_prompt="SP")
     assert "SP" in result
+
+
+def test_arc_execute_reviewer_template_directs_submit_extract():
+    """The REVIEWER arc-step prompt directs read-tools + the submit_extract
+    tool and explicitly forbids submit_code/dispatch (the EXECUTOR pattern
+    that confuses a REVIEWER)."""
+    out = templates.render(
+        "arc_execute_reviewer", arc_id=42, goal="triage this", source_conv_id=0,
+    )
+    assert "submit_extract" in out
+    assert "files.read" in out
+    # Must steer away from the submit_code/dispatch persistence path.
+    assert "submit_code" in out and "Do NOT call `submit_code`" in out
+    assert "dispatch" in out
+    # Carries the goal + arc id through.
+    assert "triage this" in out
+    assert "42" in out
