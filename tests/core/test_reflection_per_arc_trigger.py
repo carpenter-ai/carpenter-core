@@ -5,8 +5,10 @@ Replaces the old cadence-based trigger suite. Covers:
 - The template's ``triggers:`` section is picked up at load time and
   registered as a subscription.
 - The subscription's filter correctly gates on ``is_root=True`` +
-  ``new_status=completed`` + ``template_name != 'reflection'``.
-- ``$ne`` filter semantics (incl. absent-key) in ``filter_matches``.
+  ``new_status=completed`` + ``template_name`` not in the reflection
+  pipeline's own meta-templates (reflection, skill-kb-review).
+- ``$ne`` / ``$nin`` filter semantics (incl. absent-key) in
+  ``filter_matches``.
 - ``handle_subscription_create_arc`` threads through ``priority`` and
   ``initial_arc_state`` (including ``{event.payload.X}`` substitution).
 - ``arc.status_changed`` event payload now includes ``template_name``
@@ -106,6 +108,20 @@ class TestFilterNotEquals:
         assert not filter_matches(flt, {"is_root": False})
 
 
+class TestFilterNotIn:
+    def test_nin_matches_when_value_absent_from_list(self):
+        assert filter_matches({"x": {"$nin": ["a", "b"]}}, {"x": "c"})
+
+    def test_nin_rejects_when_value_in_list(self):
+        assert not filter_matches({"x": {"$nin": ["a", "b"]}}, {"x": "a"})
+        assert not filter_matches({"x": {"$nin": ["a", "b"]}}, {"x": "b"})
+
+    def test_nin_matches_when_key_absent(self):
+        # Non-template arcs have no ``template_name`` — they must still
+        # pass a ``$nin`` exclusion of meta-templates.
+        assert filter_matches({"x": {"$nin": ["a", "b"]}}, {})
+
+
 # ── Template loads its own trigger ──────────────────────────────────
 
 
@@ -162,6 +178,14 @@ def test_reflection_subscription_filter_gates_correctly(tmp_path):
     assert not filter_matches(sub.event_filter, {
         "is_root": True, "new_status": "completed",
         "template_name": "reflection",
+    })
+    # ❌ skill-kb-review arc completing → doesn't fire. This is the
+    # loop-breaker: skill-kb-review is spawned (transitively) by a
+    # reflection's skills/ writes, so re-triggering reflection here
+    # created an unbounded amplification loop.
+    assert not filter_matches(sub.event_filter, {
+        "is_root": True, "new_status": "completed",
+        "template_name": "skill-kb-review",
     })
 
 
