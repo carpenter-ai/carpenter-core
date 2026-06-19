@@ -268,6 +268,54 @@ def _select_chat_tools(context_budget: int | None = None) -> list[dict]:
     return sorted(core_tools + selected_non_core, key=lambda t: t["name"])
 
 
+def _maybe_add_reviewer_emit_tool(
+    tools: list[dict], executor_arc_id: int | None,
+) -> list[dict]:
+    """Add the ``submit_extract`` tool def iff the executing arc is a REVIEWER.
+
+    ``submit_extract`` lets a REVIEWER arc persist its typed extract by
+    supplying field VALUES as a structured argument (no code, no
+    dispatch()).  It is REVIEWER-arc-scoped, so it is NOT
+    ``always_available`` and is intentionally absent from the normal
+    chat agent's tool set (I10).  We resolve the caller arc's
+    ``agent_type`` and inject the API def only for REVIEWER arcs, keeping
+    the prompt cache stable for every other agent type.
+
+    Returns ``tools`` unchanged for non-REVIEWER arcs or when the agent
+    type cannot be resolved (fail-closed: do not offer the tool).
+    """
+    if executor_arc_id is None:
+        return tools
+    try:
+        from ..core.arcs import manager as _am
+        arc_info = _am.get_arc(executor_arc_id)
+    except Exception:  # noqa: BLE001 — DB lookup; fail-closed (don't offer)
+        logger.debug(
+            "Could not resolve arc %s agent_type for submit_extract",
+            executor_arc_id, exc_info=True,
+        )
+        return tools
+    if not arc_info or arc_info.get("agent_type") != "REVIEWER":
+        return tools
+    if any(t.get("name") == "submit_extract" for t in tools):
+        return tools
+
+    from ..chat_tool_loader import get_loaded_tools
+    emit = get_loaded_tools().get("submit_extract")
+    if emit is None:
+        logger.warning(
+            "submit_extract tool def not loaded; REVIEWER arc %s cannot "
+            "use the structured emit path", executor_arc_id,
+        )
+        return tools
+    emit_def = {
+        "name": emit.name,
+        "description": emit.description,
+        "input_schema": emit.input_schema,
+    }
+    return sorted([*tools, emit_def], key=lambda t: t["name"])
+
+
 def _load_prompt_parts_from_templates(
     compact: bool,
     model_name: str | None = None,
@@ -835,6 +883,10 @@ def _execute_chat_tool(
         elif tool_name == "fetch_web_content":
             return _handle_fetch_web_content(
                 tool_input, conversation_id=conversation_id,
+            )
+        elif tool_name == "submit_extract":
+            return _handle_submit_extract(
+                tool_input, executor_arc_id=executor_arc_id,
             )
 
         # 3. Loaded handlers (from config/chat_tools/ modules)
@@ -1489,6 +1541,97 @@ def _handle_fetch_web_content(
     )
 
     return f"Web fetch started (arc #{parent_id}). Result will arrive automatically."
+
+
+def _handle_submit_extract(
+    tool_input: dict,
+    executor_arc_id: int | None = None,
+) -> str:
+    """Handle ``submit_extract`` — the REVIEWER's structured emit path.
+
+    A REVIEWER arc-step agent calls this tool to persist its typed
+    extract.  The LLM supplies the extracted DATA as a structured tool
+    argument (``fields``, a JSON object of the dataclass field values);
+    it never writes code and never calls ``dispatch()``.  Data crossing
+    the tool boundary as an argument needs no code verification — only
+    the values are untrusted, and the JUDGE is the gate that decides
+    whether they graduate.
+
+    Trust model (why this stays inside the boundary):
+
+      * **Caller-scoped write only.**  The handler reads the REVIEWER
+        arc's *own* pre-created pending extract Resource id from its arc
+        state (``extract_resource_id``, seeded by the template builder)
+        and persists via ``resource.handle_write`` with
+        ``_caller_arc_id = executor_arc_id``.  ``handle_write`` enforces
+        ``caller_arc_id == produced_by_arc_id`` — so a REVIEWER can only
+        ever write the one Resource it produces.  It cannot target an
+        arbitrary Resource id (the id is NOT a tool argument).
+      * **No self-approval.**  ``handle_write`` writes the blob + stats
+        only; it never touches ``produced_by_template`` or
+        ``template_verdict``.  The Resource stays ``pending`` and the
+        deterministic JUDGE remains the sole authority that flips it to
+        approved.  This tool exposes no verdict surface.
+      * **Arc-only.**  With no ``executor_arc_id`` (the normal chat
+        agent has none) the tool refuses — it is not a general chat
+        tool and respects I10.  It is offered only to REVIEWER arc-step
+        agents (see ``invoke_for_chat``).
+
+    Params:
+        fields: required — a JSON object (dict) of the extract's typed
+            field values.  Written verbatim as the Resource blob (JSON)
+            via ``resource.write``; the JUDGE-dispatch deserialiser
+            decodes it back into the dataclass named by the Resource's
+            ``kind`` and validates it.
+    """
+    from ..core.workflows._arc_state import get_arc_state
+    from ..tool_backends import resource as resource_backend
+
+    if executor_arc_id is None:
+        return (
+            "Error: submit_extract is only callable by a REVIEWER arc-step "
+            "agent (no arc context present)."
+        )
+
+    fields = tool_input.get("fields")
+    if not isinstance(fields, dict):
+        return (
+            "Error: submit_extract requires a 'fields' object (a JSON "
+            "dict of the extract's typed field values)."
+        )
+
+    extract_resource_id = get_arc_state(executor_arc_id, "extract_resource_id")
+    if extract_resource_id is None:
+        return (
+            "Error: this arc has no pre-created extract Resource "
+            "(arc state key 'extract_resource_id' is unset). submit_extract "
+            "can only persist a template-created pending extract Resource."
+        )
+
+    try:
+        result = resource_backend.handle_write({
+            "resource_id": int(extract_resource_id),
+            "content": fields,
+            # Mirror the historical REVIEWER submit_code path: retire the
+            # raw/briefing inputs the REVIEWER consumed once its derived
+            # output is committed.
+            "deprecate_inputs": True,
+            "_caller_arc_id": executor_arc_id,
+        })
+    except PermissionError as exc:
+        # caller != producer — the only Resource this arc may write is its
+        # own pending extract; refuse anything else.
+        logger.warning("submit_extract permission denied: %s", exc)
+        return f"Error: submit_extract refused — {exc}"
+    except (ValueError, OSError) as exc:
+        logger.warning("submit_extract write failed: %s", exc)
+        return f"Error: submit_extract failed to persist extract — {exc}"
+
+    return (
+        f"Extract persisted to Resource #{result['resource_id']} "
+        f"({result['byte_size']} bytes). The JUDGE will validate it; you "
+        "do not approve it yourself. Your work is done — exit."
+    )
 
 
 def _save_api_call(
@@ -2398,6 +2541,16 @@ def invoke_for_chat(
         conversation.add_message(conv_id, "system", err_msg)
         logger.error("Tool loading failed: %s", err_msg)
         return {"conversation_id": conv_id, "response_text": err_msg, "code": None, "message_id": None}
+
+    # REVIEWER arc-step agents get the structured `submit_extract` emit
+    # tool. It is NOT always_available (it must not be offered to the
+    # normal chat agent — it is a scoped write of the caller arc's own
+    # pending Resource, see I10), so `_select_chat_tools` may not include
+    # it under budget pressure. Inject it explicitly for REVIEWER arcs so
+    # the emit path is reliable-by-default rather than fragile
+    # code-generation via submit_code.
+    if _is_arc:
+        tools = _maybe_add_reviewer_emit_tool(tools, _executor_arc_id)
 
     collected_text = []
     total_tokens = 0
