@@ -1,24 +1,35 @@
 """Python step handlers for the reflection template.
 
-Two Python-only steps ship in this package:
+Three Python-only steps ship in this package:
 
-- :func:`handle_gather_activity` — pre-reflect step. Reads the reflected
-  root arc's id from the parent arc's ``reflected_arc_id`` state (set
-  by the subscription's ``initial_arc_state`` at arc creation), calls
-  :func:`activity_gatherer.gather_from_arc`, and writes the result into
-  the sibling ``reflect`` arc's goal. Then completes and propagates so
-  the ``reflect`` step can be dispatched with its goal populated.
+- :func:`handle_gather_activity` — pre-reflect step. Reads the typed
+  reflection *subject* off the parent arc (see ``_subject.py``), calls
+  :func:`activity_gatherer.gather_from_subject` (which dispatches on
+  ``kind`` — single-arc, period-batch, or theme), and writes the result
+  into the sibling ``reflect`` arc's goal. Then completes and propagates
+  so the ``reflect`` step can be dispatched with its goal populated.
+  Falls back to a synthesised single-arc subject from the legacy
+  ``reflected_arc_id`` for backwards compat.
 
 - :func:`handle_save_reflection` — post-reflect step. Reads the sibling
   ``reflect`` arc's ``_agent_response`` via
   :func:`arc_outputs.find_sibling_arc_id` (``role=analyze``), enqueues
   the KB write via :func:`.reflection_storage.save_reflection` keyed on
-  the reflected arc id, and completes. Auto-action fan-out is owned by
-  the ``dispatch-actions`` sibling step.
+  the subject (``by-arc/{id}``, ``by-day/{date}``, or ``by-theme/{slug}``)
+  and completes. Auto-action fan-out is owned by the ``dispatch-actions``
+  sibling step.
 
-Both are registered in ``__init__.py`` via
-:func:`register_handlers`. Neither is cadence-aware — reflection is now
-triggered per root-arc completion.
+- :func:`handle_dispatch_actions` — post-save step. Parses proposed
+  actions out of the reflect output, classifies each, applies the
+  ``_is_batch_restricted`` predicate (taint roll-up: any non-trusted arc
+  in the batch routes the *whole batch's* actions through the gated
+  human-review templates), and spawns one child arc per action up to
+  ``reflection.max_actions_per_reflection`` (default 5).
+
+All three are registered in ``__init__.py`` via :func:`register_handlers`.
+Reflection is driven by a daily cron (see :mod:`.daily_tick`), not by
+per-arc completion — the per-arc trigger formed an unbounded feedback
+loop and was replaced by the cadence model.
 """
 
 from __future__ import annotations

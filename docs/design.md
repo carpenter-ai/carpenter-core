@@ -199,6 +199,30 @@ carpenter_tools/
 
 The `@tool()` decorator declares safety properties: `local`, `readonly`, `side_effects`, `trusted_output`. `validate_package()` enforces that read/ tools are all safe and act/ tools have at least one unsafe property. The `trusted_output=False` declaration (currently only on the web tool) feeds into taint tracking.
 
+### Spend Safety: API Budget Breaker
+
+A universal safety net against runaway spend, independent of any specific failure mode. Every *paid* model call passes through `guard_paid_call()`, and every *autonomous* work source (arc dispatch, cron/timer firing, trigger-driven arc creation) passes through `autonomous_allowed()`. Together they bound Anthropic API spend by call-rate and cost over configurable windows, so an unforeseen feedback loop cannot burn credits unbounded.
+
+**Why this exists**: a reflection→skill-review trigger loop once dispatched ~2 calls/sec for hours. A point-fix closed that specific loop; this module guarantees the *class* of failure is bounded regardless of cause.
+
+A *limit* is one independent rule `{name, metric, window_seconds, threshold, action, notify}`:
+
+- `metric`: `"calls"` (count of `api_calls` rows) or `"cost_usd"` (token cost via the model registry) within the trailing window.
+- `action` escalates in severity:
+  - `warn` — notify only (rate-limited to once per window per limit); never blocks.
+  - `cap` — block *autonomous* work until the window drains (self-clearing). Interactive chat keeps working so the human can intervene or raise the limit.
+  - `restrict` — latch off autonomous functionality until a human clears it. Chat keeps working.
+  - `shutdown` — latch a kill-switch blocking *all* paid calls until a human clears it. The nuclear option.
+- Limits compose: pair a low `warn` with a higher `cap` on the same metric/window for a staged response.
+
+**State persists in SQLite** (`budget_state` kv table): kill-switch and restrict latches, runtime overrides, warn timestamps. A process restart cannot reset an active breaker — the original incident kept resuming across restarts because state was in-memory only.
+
+**Chokepoints wired**: `anthropic.call()` (paid call gate), `arc dispatch` (autonomous), `cron/timer firing` (autonomous), `trigger-driven arc creation` (autonomous). `BudgetExceededError` is classified fatal so the retry loop breaks immediately.
+
+**Operator control**: the `budget_status` and `budget_control` chat tools (the latter in the `PLATFORM_TOOLS` allowlist so only the chat agent can call it) expose `resume`, `set_threshold` (with optional TTL), `enable`/`disable`. Threshold overrides expire on schedule so a temporary expansion auto-reverts.
+
+**Notification routing**: each limit's `notify` block (per-limit `enabled` + `priority`) is delivered via the unified notification system. A top-level `notify_human` master-switch gates all human messaging (off by default in the seed config). Limit messages always log even when human notify is suppressed.
+
 ---
 
 ## Trust Boundaries
@@ -323,15 +347,19 @@ Recent conversation hints (last 3 titles and dates) are appended to the system p
 
 ### Reflective Meta-Cognition
 
-Cadenced self-reflection via cron, forming a compression chain:
+Self-reflection runs on a **daily cadence**, not per-arc completion. A cron emits `reflection.daily_tick` (default 04:00 UTC, configurable via `reflection.daily_cron`); the handler collects all root arcs that completed since the last tick — excluding reflection-pipeline meta-templates (`reflection`, `skill-kb-review`) so reflections never reflect on reflections — and batches them into `period` reflection arcs of at most `reflection.batch_size` (default 20) each.
 
-| Cadence | Input | Output |
-|---------|-------|--------|
-| Daily | Raw activity data (conversations, arcs, tools, errors) | Daily notes |
-| Weekly | Daily reflections + 7-day stats | Weekly patterns |
-| Monthly | Weekly reflections + 30-day stats + KB skill entries | Monthly insights |
+**Why cadenced rather than per-arc**: an earlier per-arc trigger (fire on every root-arc completion, filter on template name) formed an unbounded feedback loop — a reflection's actions wrote to `skills/`, which spawned a `skill-kb-review` root arc, whose completion re-triggered another reflection. A cadence that runs once/day over a bounded batch cannot loop regardless of what the reflection does.
 
-Each reflection creates a dedicated conversation, invokes the full chat agent with tool access, saves to the `reflections` table, and archives the conversation. An activity threshold skips API calls on quiet days. Opt-in via `reflection.enabled` config.
+A reflection's **subject** is a typed descriptor stored as JSON on the reflection parent arc's state, with three kinds:
+
+- `arcs` — one or more specific arcs (the legacy per-arc case is just `{kind: arcs, refs: [id]}`). KB path: `reflections/by-arc/{id}`.
+- `period` — everything that completed in a time window (the daily cadence batch). `refs` are the contributing arc ids; `window` carries `from`/`to`/`date`. KB path: `reflections/by-day/{date}`.
+- `theme` — a set of related updates under a KB path/slug. KB path: `reflections/by-theme/{slug}`.
+
+`get_subject()` synthesises an `arcs` subject from a legacy scalar `reflected_arc_id` when no typed subject is present, preserving backwards compatibility with existing reflection arcs.
+
+Each reflection runs the standard arc pipeline (gather → reflect → save → dispatch). The reflect step invokes a model with the gathered activity data as goal; `save-reflection` writes the result to the KB at the subject's path; `dispatch-actions` parses proposed actions out of the reflect step's output and spawns one child arc per action (capped at `reflection.max_actions_per_reflection`, default 5).
 
 ### Reflection Auto-Action
 
@@ -347,9 +375,10 @@ The platform communicates with the user through priority-routed channels:
 
 - **Chat** — system message in the active conversation. Always available.
 - **Email** — via SMTP credentials or a shell command receiving the message on stdin. Configurable, disabled by default.
+- **Signal** — via a local `signal-cli-rest-api` instance (`POST {base_url}/v2/send`). Configurable, disabled by default in the seed config; operators who run signal-cli enable it and fill in `bot_number` + `recipient`.
 - **Log** — `notifications` table audit trail. Always on.
 
-Routing by priority: `urgent` → chat + email, `normal` → chat if active session else email, `low` → email only, `fyi` → log only. Users can override routing per notification category. Notifications are batched within a configurable window to avoid spamming.
+Routing by priority: `urgent` → chat + email/signal, `normal` → chat if active session else email/signal, `low` → email/signal, `fyi` → log only. Users can override routing per notification category. Notifications are batched within a configurable window to avoid spamming.
 
 ---
 
