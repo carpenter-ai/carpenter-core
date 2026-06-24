@@ -470,6 +470,56 @@ def test_check_activation_no_matching_event():
     assert arc_manager.check_activation(arc_id) is False
 
 
+def test_check_activation_payload_arc_id_targets_specific_arc():
+    """An event whose payload carries arc_id only unblocks the matching arc."""
+    arc_a = arc_manager.create_arc("a")
+    arc_b = arc_manager.create_arc("b")
+
+    db = get_db()
+    try:
+        db.execute(
+            "INSERT INTO arc_activations (arc_id, event_type) VALUES (?, ?)",
+            (arc_a, "arc.manual_trigger"),
+        )
+        db.execute(
+            "INSERT INTO arc_activations (arc_id, event_type) VALUES (?, ?)",
+            (arc_b, "arc.manual_trigger"),
+        )
+        db.execute(
+            "INSERT INTO events (event_type, payload_json, processed) "
+            "VALUES (?, ?, ?)",
+            ("arc.manual_trigger", json.dumps({"arc_id": arc_a}), True),
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    assert arc_manager.check_activation(arc_a) is True
+    assert arc_manager.check_activation(arc_b) is False
+
+
+def test_check_activation_payload_without_arc_id_matches_broadly():
+    """Events without an arc_id field fall back to type-only matching."""
+    arc_id = arc_manager.create_arc("test")
+
+    db = get_db()
+    try:
+        db.execute(
+            "INSERT INTO arc_activations (arc_id, event_type) VALUES (?, ?)",
+            (arc_id, "webhook.received"),
+        )
+        db.execute(
+            "INSERT INTO events (event_type, payload_json, processed) "
+            "VALUES (?, ?, ?)",
+            ("webhook.received", json.dumps({"other": "data"}), True),
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    assert arc_manager.check_activation(arc_id) is True
+
+
 # ── model_policy helpers ──────────────────────────────────────────
 
 
