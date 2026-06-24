@@ -46,18 +46,20 @@ def absolutize_review_url(url: str) -> str:
 def recover_review_links():
     """Recover review links from arc_state after server restart.
 
-    Scans arcs that are in 'waiting' or 'active' status and have either
-    a stored ``review_id`` + ``diff`` (diff reviews) or a stored
-    ``review_arc_approval_data`` blob (arc-approval reviews).
-    Reconstructs the in-memory ``_review_links`` so that existing
-    review URLs continue to work.
+    Scans non-terminal arcs that have either a stored ``review_id`` +
+    ``diff`` (diff reviews) or a stored ``review_arc_approval_data``
+    blob (arc-approval reviews). Reconstructs the in-memory
+    ``_review_links`` so that existing review URLs continue to work.
+
+    Includes ``pending`` because ``db.startup_recovery()`` runs earlier
+    and resets ``active``/``waiting`` arcs to ``pending``.
     """
     with db_connection() as db:
         try:
             rows = db.execute(
                 "SELECT a.id as arc_id, a.status, a.name, a.goal "
                 "FROM arcs a "
-                "WHERE a.status IN ('waiting', 'active') "
+                "WHERE a.status NOT IN ('completed', 'failed', 'cancelled', 'escalated') "
                 "AND EXISTS ("
                 "  SELECT 1 FROM arc_state s "
                 "  WHERE s.arc_id = a.id "
