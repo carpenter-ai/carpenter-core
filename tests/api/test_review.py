@@ -703,3 +703,211 @@ def test_backfill_arc_approval_reviews_skips_terminal_arcs():
 
     count = review.backfill_arc_approval_reviews()
     assert count == 0
+
+
+# ── Absolute review URLs ────────────────────────────────────────────
+
+
+def test_absolutize_review_url_passes_through_absolute():
+    assert review.absolutize_review_url("https://x/api/review/abc") == \
+        "https://x/api/review/abc"
+    assert review.absolutize_review_url("http://x/api/review/abc") == \
+        "http://x/api/review/abc"
+
+
+def test_absolutize_review_url_passes_through_when_unset():
+    from carpenter import config as cfg
+    saved = cfg.CONFIG.get("public_base_url", "")
+    cfg.CONFIG["public_base_url"] = ""
+    try:
+        assert review.absolutize_review_url("/api/review/abc") == "/api/review/abc"
+    finally:
+        cfg.CONFIG["public_base_url"] = saved
+
+
+def test_absolutize_review_url_prefixes_relative():
+    from carpenter import config as cfg
+    saved = cfg.CONFIG.get("public_base_url", "")
+    cfg.CONFIG["public_base_url"] = "https://example.test/"
+    try:
+        assert review.absolutize_review_url("/api/review/abc") == \
+            "https://example.test/api/review/abc"
+    finally:
+        cfg.CONFIG["public_base_url"] = saved
+
+
+def test_create_diff_review_returns_absolute_when_public_base_url_set():
+    from carpenter import config as cfg
+
+    review.clear_reviews()
+    saved = cfg.CONFIG.get("public_base_url", "")
+    cfg.CONFIG["public_base_url"] = "https://example.test"
+    try:
+        out = review.create_diff_review(
+            diff_content="--- a\n+++ b\n",
+            title="t",
+        )
+    finally:
+        cfg.CONFIG["public_base_url"] = saved
+
+    assert out["url"].startswith("https://example.test/api/review/")
+    assert out["url"].endswith(out["review_id"])
+
+
+def test_create_diff_review_returns_relative_when_unset():
+    from carpenter import config as cfg
+
+    review.clear_reviews()
+    saved = cfg.CONFIG.get("public_base_url", "")
+    cfg.CONFIG["public_base_url"] = ""
+    try:
+        out = review.create_diff_review(
+            diff_content="--- a\n+++ b\n",
+            title="t",
+        )
+    finally:
+        cfg.CONFIG["public_base_url"] = saved
+
+    assert out["url"].startswith("/api/review/")
+
+
+def test_create_arc_approval_review_returns_absolute_when_public_base_url_set():
+    from carpenter import config as cfg
+    from carpenter.core.workflows._arc_state import get_arc_state
+
+    review.clear_reviews()
+    target_id = arc_manager.create_arc("target-action")
+    gate_id = arc_manager.add_child(target_id, "await-approval")
+
+    saved = cfg.CONFIG.get("public_base_url", "")
+    cfg.CONFIG["public_base_url"] = "https://example.test"
+    try:
+        out = review.create_arc_approval_review(
+            target_arc_id=target_id,
+            gate_arc_id=gate_id,
+            title="t",
+            action_description="d",
+        )
+    finally:
+        cfg.CONFIG["public_base_url"] = saved
+
+    assert out["url"].startswith("https://example.test/api/review/")
+    # Persisted review_url should also be absolute.
+    assert get_arc_state(target_id, "review_url") == out["url"]
+
+
+def test_create_arc_approval_review_returns_relative_when_unset():
+    from carpenter import config as cfg
+
+    review.clear_reviews()
+    target_id = arc_manager.create_arc("target-action")
+    gate_id = arc_manager.add_child(target_id, "await-approval")
+
+    saved = cfg.CONFIG.get("public_base_url", "")
+    cfg.CONFIG["public_base_url"] = ""
+    try:
+        out = review.create_arc_approval_review(
+            target_arc_id=target_id,
+            gate_arc_id=gate_id,
+            title="t",
+            action_description="d",
+        )
+    finally:
+        cfg.CONFIG["public_base_url"] = saved
+
+    assert out["url"].startswith("/api/review/")
+
+
+def test_migrate_review_urls_to_absolute_rewrites_relative():
+    from carpenter import config as cfg
+    from carpenter.core.workflows._arc_state import (
+        get_arc_state, set_arc_state,
+    )
+
+    arc_id = arc_manager.create_arc("migrate-target")
+    set_arc_state(arc_id, "review_url", "/api/review/abc-123")
+
+    saved = cfg.CONFIG.get("public_base_url", "")
+    cfg.CONFIG["public_base_url"] = "https://example.test"
+    try:
+        n = review.migrate_review_urls_to_absolute()
+    finally:
+        cfg.CONFIG["public_base_url"] = saved
+
+    assert n >= 1
+    assert get_arc_state(arc_id, "review_url") == \
+        "https://example.test/api/review/abc-123"
+
+
+def test_migrate_review_urls_to_absolute_is_idempotent():
+    from carpenter import config as cfg
+    from carpenter.core.workflows._arc_state import (
+        get_arc_state, set_arc_state,
+    )
+
+    arc_id = arc_manager.create_arc("migrate-already-absolute")
+    set_arc_state(
+        arc_id, "review_url", "https://example.test/api/review/already",
+    )
+
+    saved = cfg.CONFIG.get("public_base_url", "")
+    cfg.CONFIG["public_base_url"] = "https://example.test"
+    try:
+        review.migrate_review_urls_to_absolute()
+        n_second = review.migrate_review_urls_to_absolute()
+    finally:
+        cfg.CONFIG["public_base_url"] = saved
+
+    # The already-absolute arc contributes 0 to either run; second run
+    # should be a no-op for the whole table.
+    assert n_second == 0
+    assert get_arc_state(arc_id, "review_url") == \
+        "https://example.test/api/review/already"
+
+
+def test_migrate_review_urls_to_absolute_rewrites_nested_blob():
+    from carpenter import config as cfg
+    from carpenter.core.workflows._arc_state import (
+        get_arc_state, set_arc_state,
+    )
+
+    arc_id = arc_manager.create_arc("migrate-blob")
+    set_arc_state(arc_id, "review_arc_approval_data", {
+        "review_id": "rid",
+        "target_arc_id": arc_id,
+        "gate_arc_id": 0,
+        "review_url": "/api/review/rid",
+        "title": "t",
+        "action_description": "d",
+        "created_at": "x",
+    })
+
+    saved = cfg.CONFIG.get("public_base_url", "")
+    cfg.CONFIG["public_base_url"] = "https://example.test"
+    try:
+        review.migrate_review_urls_to_absolute()
+    finally:
+        cfg.CONFIG["public_base_url"] = saved
+
+    blob = get_arc_state(arc_id, "review_arc_approval_data")
+    assert blob["review_url"] == "https://example.test/api/review/rid"
+
+
+def test_migrate_review_urls_to_absolute_noop_when_unset():
+    from carpenter import config as cfg
+    from carpenter.core.workflows._arc_state import (
+        get_arc_state, set_arc_state,
+    )
+
+    arc_id = arc_manager.create_arc("migrate-noop")
+    set_arc_state(arc_id, "review_url", "/api/review/keep-relative")
+
+    saved = cfg.CONFIG.get("public_base_url", "")
+    cfg.CONFIG["public_base_url"] = ""
+    try:
+        review.migrate_review_urls_to_absolute()
+    finally:
+        cfg.CONFIG["public_base_url"] = saved
+
+    # absolutize_review_url is a no-op when unset; value unchanged.
+    assert get_arc_state(arc_id, "review_url") == "/api/review/keep-relative"

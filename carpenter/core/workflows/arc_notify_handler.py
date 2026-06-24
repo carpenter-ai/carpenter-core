@@ -8,32 +8,17 @@ is included in the LLM context but not rendered in the chat UI.
 
 import logging
 
-from ... import config
 from ..arcs import manager as arc_manager
 from ..arcs.dispatch_handler import _find_arc_conversation
 from ..workflows._arc_state import get_arc_state
 from ...agent import conversation, invocation
+from ...api.review import absolutize_review_url
 from ...db import db_connection
 from ... import thread_pools
 
 logger = logging.getLogger(__name__)
 
 RESULT_PREVIEW_MAX = 4000
-
-
-def _absolutize_review_url(url: str) -> str:
-    """Prefix a relative ``/api/review/...`` URL with the configured
-    ``public_base_url`` if set; otherwise return as-is.
-
-    Surfaces that ship the message to off-host channels (Signal, email)
-    need absolute URLs; the in-app chat UI is happy with relative ones.
-    """
-    if not url or url.startswith(("http://", "https://")):
-        return url
-    public_base = config.CONFIG.get("public_base_url", "")
-    if not public_base:
-        return url
-    return public_base.rstrip("/") + url
 
 
 def _collect_pending_reviews(parent_arc_id: int) -> list[str]:
@@ -64,7 +49,7 @@ def _collect_pending_reviews(parent_arc_id: int) -> list[str]:
         url = get_arc_state(row["id"], "review_url")
         if not url:
             continue
-        urls.append(_absolutize_review_url(url))
+        urls.append(absolutize_review_url(url))
     return urls
 
 

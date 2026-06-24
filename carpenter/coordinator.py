@@ -153,10 +153,12 @@ class Coordinator:
         """
         from .api.review import (
             backfill_arc_approval_reviews,
+            migrate_review_urls_to_absolute,
             recover_review_links,
         )
         recover_review_links()
         backfill_arc_approval_reviews()
+        migrate_review_urls_to_absolute()
 
     def _register_work_handlers(self) -> None:
         """Register all work-queue event handlers and heartbeat hooks."""

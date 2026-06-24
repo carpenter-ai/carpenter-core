@@ -16,7 +16,7 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse
 from starlette.routing import Route
 
-from .. import constants
+from .. import config, constants
 from ..db import get_db, db_connection, db_transaction
 from ..core.arcs import CODING_CHANGE_PREFIX, manager as arc_manager
 from ..core.workflows._arc_state import set_arc_state
@@ -26,6 +26,21 @@ logger = logging.getLogger(__name__)
 
 # In-memory store for review links (recovered from DB on startup)
 _review_links: dict[str, dict] = {}
+
+
+def absolutize_review_url(url: str) -> str:
+    """Prefix a relative ``/api/review/...`` URL with the configured
+    ``public_base_url`` if set; otherwise return as-is.
+
+    Idempotent: already-absolute (``http://`` or ``https://``) URLs are
+    returned unchanged so this is safe to call on read or on write.
+    """
+    if not url or url.startswith(("http://", "https://")):
+        return url
+    public_base = config.CONFIG.get("public_base_url", "")
+    if not public_base:
+        return url
+    return public_base.rstrip("/") + url
 
 
 def recover_review_links():
@@ -210,6 +225,75 @@ def backfill_arc_approval_reviews() -> int:
     return backfilled
 
 
+def migrate_review_urls_to_absolute() -> int:
+    """One-time migration: rewrite ``review_url`` arc_state values from
+    relative (``/api/review/...``) to absolute (``https://host/api/...``).
+
+    Also fixes the ``review_url`` field inside any
+    ``review_arc_approval_data`` JSON blob. Idempotent: already-absolute
+    values are skipped. No-op when ``public_base_url`` is unset (the
+    helper returns the input unchanged in that case).
+
+    Wired into the coordinator startup sequence so historical arcs (the
+    14 backfilled in PR #66, plus any future strays) get rewritten on
+    every restart.
+    """
+    migrated = 0
+    with db_connection() as db:
+        try:
+            rows = db.execute(
+                "SELECT arc_id, key, value_json FROM arc_state "
+                "WHERE key IN ('review_url', 'review_arc_approval_data')"
+            ).fetchall()
+        except (sqlite3.Error, OSError, ValueError) as e:
+            logger.warning("migrate_review_urls_to_absolute: scan failed: %s", e)
+            return 0
+
+    for row in rows:
+        try:
+            current = json.loads(row["value_json"])
+        except (json.JSONDecodeError, TypeError):
+            continue
+
+        if row["key"] == "review_url":
+            if not isinstance(current, str) or not current.startswith("/api/"):
+                continue
+            new_url = absolutize_review_url(current)
+            if new_url == current:
+                continue
+            try:
+                set_arc_state(row["arc_id"], "review_url", new_url)
+                migrated += 1
+            except (sqlite3.Error, OSError, ValueError):
+                logger.exception(
+                    "migrate_review_urls_to_absolute: failed to update "
+                    "review_url for arc %s", row["arc_id"],
+                )
+            continue
+
+        # review_arc_approval_data blob — rewrite nested review_url.
+        if not isinstance(current, dict):
+            continue
+        nested = current.get("review_url")
+        if not isinstance(nested, str) or not nested.startswith("/api/"):
+            continue
+        new_nested = absolutize_review_url(nested)
+        if new_nested == nested:
+            continue
+        current["review_url"] = new_nested
+        try:
+            set_arc_state(row["arc_id"], "review_arc_approval_data", current)
+            migrated += 1
+        except (sqlite3.Error, OSError, ValueError):
+            logger.exception(
+                "migrate_review_urls_to_absolute: failed to update "
+                "review_arc_approval_data for arc %s", row["arc_id"],
+            )
+
+    logger.info("migrate_review_urls_to_absolute: migrated %d", migrated)
+    return migrated
+
+
 @attrs.define
 class ReviewRequest:
     code_file_id: int
@@ -269,7 +353,7 @@ async def create_review_link(request: Request):
 
     return JSONResponse(content={
         "review_id": review_id,
-        "url": f"/api/review/{review_id}",
+        "url": absolutize_review_url(f"/api/review/{review_id}"),
     })
 
 
@@ -322,7 +406,7 @@ def create_diff_review(
 
     return {
         "review_id": review_id,
-        "url": f"/api/review/{review_id}",
+        "url": absolutize_review_url(f"/api/review/{review_id}"),
     }
 
 
@@ -372,7 +456,7 @@ def create_arc_approval_review(
     """
     review_id = str(uuid.uuid4())
     created_at = datetime.now(timezone.utc).isoformat()
-    url = f"/api/review/{review_id}"
+    url = absolutize_review_url(f"/api/review/{review_id}")
 
     _review_links[review_id] = {
         "review_type": "arc-approval",
