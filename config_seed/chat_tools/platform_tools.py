@@ -110,3 +110,55 @@ def list_schedules(tool_input, **kwargs):
         "entries": entries,
         "pipeline": "timer.fired -> subscription -> work_queue",
     })
+
+
+@chat_tool(
+    description=(
+        "List all currently outstanding human-approval reviews. Returns "
+        "gated arcs (typically reflection-spawned action arcs) that have "
+        "a review_url and are still waiting for the user to approve or "
+        "reject them. Use when the user asks what reviews are pending or "
+        "needs the review URLs."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {},
+        "required": [],
+    },
+    capabilities=["config_read"],
+)
+def list_pending_reviews(tool_input, **kwargs):
+    from carpenter.db import db_connection
+    from carpenter.core.arcs import manager as arc_manager
+    from carpenter.core.workflows._arc_state import get_arc_state
+    from carpenter.core.workflows.arc_notify_handler import (
+        _absolutize_review_url,
+    )
+
+    entries: list[dict] = []
+    with db_connection() as db:
+        rows = db.execute(
+            "SELECT a.id, a.name, a.status, a.parent_id, a.goal FROM arcs a "
+            "WHERE EXISTS ("
+            "  SELECT 1 FROM arc_state s "
+            "  WHERE s.arc_id = a.id AND s.key = 'review_url'"
+            ")"
+        ).fetchall()
+    for row in rows:
+        if row["status"] in arc_manager.FROZEN_STATUSES:
+            continue
+        if get_arc_state(row["id"], "_review_mode") != "human":
+            continue
+        url = get_arc_state(row["id"], "review_url")
+        if not url:
+            continue
+        description = row["goal"] or row["name"] or f"arc #{row['id']}"
+        entries.append({
+            "arc_id": row["id"],
+            "name": row["name"],
+            "status": row["status"],
+            "parent_arc_id": row["parent_id"],
+            "description": description,
+            "url": _absolutize_review_url(url),
+        })
+    return json.dumps({"pending_reviews": entries})
