@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import json
 import os
+import re
 import shutil
 
 import pytest
@@ -70,6 +72,50 @@ def _load_package_handlers(tmp_path):
     return step_handlers
 
 
+_BACKTICK_RE = re.compile(r"`([^`]+)`")
+_PATH_RE = re.compile(r"^[\w./\-]+\.[\w]+$")
+
+
+def _line_to_action(line: str) -> dict:
+    """Translate one ``- foo`` legacy-style line into a ProposedAction dict.
+
+    Extracts a backticked path-like token as ``target_path`` so the path/
+    category arms of ``_is_reflection_restricted`` are still exercised by
+    the legacy-shaped fixtures.
+    """
+    text = line.strip()
+    for prefix in ("- ", "* "):
+        if text.startswith(prefix):
+            text = text[len(prefix):]
+            break
+    target = None
+    for m in _BACKTICK_RE.finditer(text):
+        tok = m.group(1).strip()
+        if _PATH_RE.match(tok):
+            target = tok
+            break
+    return {"description": text, "target_path": target, "action_type": "other"}
+
+
+def _as_reflection_result_json(legacy: str | None) -> str | None:
+    """Wrap a legacy line-separated proposed-actions blob as a ReflectionResult JSON.
+
+    Keeps existing fixtures readable while exercising the new
+    ``ReflectionResult`` contract path through the handlers.
+    """
+    if legacy is None:
+        return None
+    if not legacy.strip():
+        return json.dumps({"summary": "", "proposed_actions": []})
+    actions = [
+        _line_to_action(line) for line in legacy.strip().split("\n") if line.strip()
+    ]
+    return json.dumps({
+        "summary": "test reflection",
+        "proposed_actions": actions,
+    })
+
+
 def _make_reflection_arc_tree(reflect_response: str | None):
     """Build a reflection arc tree via the actual template.
 
@@ -100,8 +146,9 @@ def _make_reflection_arc_tree(reflect_response: str | None):
 
     # Simulate reflect running to completion.
     arc_manager.update_status(reflect_id, "active")
-    if reflect_response is not None:
-        set_arc_state(reflect_id, "_agent_response", reflect_response)
+    payload = _as_reflection_result_json(reflect_response)
+    if payload is not None:
+        set_arc_state(reflect_id, "_agent_response", payload)
     arc_manager.update_status(reflect_id, "completed")
 
     # Make dispatch-actions active (as dispatch would).

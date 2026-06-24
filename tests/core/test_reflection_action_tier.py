@@ -20,7 +20,9 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import json
 import os
+import re
 import shutil
 
 import pytest
@@ -77,6 +79,39 @@ def _load_package_handlers(tmp_path):
     return step_handlers
 
 
+_BACKTICK_RE = re.compile(r"`([^`]+)`")
+_PATH_RE = re.compile(r"^[\w./\-]+\.[\w]+$")
+
+
+def _line_to_action(line: str) -> dict:
+    text = line.strip()
+    for prefix in ("- ", "* "):
+        if text.startswith(prefix):
+            text = text[len(prefix):]
+            break
+    target = None
+    for m in _BACKTICK_RE.finditer(text):
+        tok = m.group(1).strip()
+        if _PATH_RE.match(tok):
+            target = tok
+            break
+    return {"description": text, "target_path": target, "action_type": "other"}
+
+
+def _as_reflection_result_json(legacy: str | None) -> str | None:
+    if legacy is None:
+        return None
+    if not legacy.strip():
+        return json.dumps({"summary": "", "proposed_actions": []})
+    actions = [
+        _line_to_action(line) for line in legacy.strip().split("\n") if line.strip()
+    ]
+    return json.dumps({
+        "summary": "test reflection",
+        "proposed_actions": actions,
+    })
+
+
 def _make_reflection_arc_tree(reflect_response):
     tmpl = template_manager.get_template_by_name("reflection")
     assert tmpl is not None
@@ -97,8 +132,9 @@ def _make_reflection_arc_tree(reflect_response):
     dispatch_id = by_name["dispatch-actions"]
 
     arc_manager.update_status(reflect_id, "active")
-    if reflect_response is not None:
-        set_arc_state(reflect_id, "_agent_response", reflect_response)
+    payload = _as_reflection_result_json(reflect_response)
+    if payload is not None:
+        set_arc_state(reflect_id, "_agent_response", payload)
     arc_manager.update_status(reflect_id, "completed")
     arc_manager.update_status(by_name["gather-activity"], "active")
     arc_manager.update_status(by_name["gather-activity"], "completed")

@@ -13,20 +13,25 @@ capabilities:
 # that runs once/day over a bounded batch cannot loop.
 steps:
   - name: gather-activity
-    description: Build the reflect step's goal from the subject's arc trajectories
+    description: Build the gathered-activity contract for the reflect step
     role: prepare
     order: 0
+    output_contract: data_models.reflection:GatheredActivity
   - name: reflect
-    description: Analyse the completed arc and produce actionable reflection
+    description: Analyse the gathered activity and emit a ReflectionResult
     role: analyze
     order: 1
     agent_type: EXECUTOR
     agent_model: haiku
+    input_contract: data_models.reflection:GatheredActivity
+    output_contract: data_models.reflection:ReflectionResult
   - name: save-reflection
-    description: Persist the reflection to KB and run post-processing
+    description: Persist the reflection summary to KB
     role: persist
     order: 2
+    input_contract: data_models.reflection:ReflectionResult
   - name: dispatch-actions
     description: Fan out proposed actions from the reflect step into child action arcs
     role: dispatch
     order: 3
+    input_contract: data_models.reflection:ReflectionResult

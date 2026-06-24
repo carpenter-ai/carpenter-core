@@ -273,7 +273,7 @@ def instantiate_template(template_id: int, parent_arc_id: int) -> list[int]:
         extra_kwargs = {}
         for step_key in ("agent_type", "integrity_level", "output_type",
                          "model", "model_role", "agent_role", "arc_role",
-                         "agent_model", "model_policy_id"):
+                         "agent_model", "model_policy_id", "output_contract"):
             if step_key in step:
                 extra_kwargs[step_key] = step[step_key]
 
