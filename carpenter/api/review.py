@@ -19,6 +19,7 @@ from starlette.routing import Route
 from .. import constants
 from ..db import get_db, db_connection, db_transaction
 from ..core.arcs import CODING_CHANGE_PREFIX, manager as arc_manager
+from ..core.workflows._arc_state import set_arc_state
 from .static import read_asset, load_template
 
 logger = logging.getLogger(__name__)
@@ -30,24 +31,28 @@ _review_links: dict[str, dict] = {}
 def recover_review_links():
     """Recover review links from arc_state after server restart.
 
-    Scans arcs that are in 'waiting' or 'active' status and have a
-    stored review_id + diff. Reconstructs the in-memory _review_links
-    so that existing review URLs continue to work.
+    Scans arcs that are in 'waiting' or 'active' status and have either
+    a stored ``review_id`` + ``diff`` (diff reviews) or a stored
+    ``review_arc_approval_data`` blob (arc-approval reviews).
+    Reconstructs the in-memory ``_review_links`` so that existing
+    review URLs continue to work.
     """
     with db_connection() as db:
         try:
-            # Find arcs with review data that aren't yet resolved
             rows = db.execute(
                 "SELECT a.id as arc_id, a.status, a.name, a.goal "
                 "FROM arcs a "
                 "WHERE a.status IN ('waiting', 'active') "
-                "AND EXISTS (SELECT 1 FROM arc_state s WHERE s.arc_id = a.id AND s.key = 'review_id')"
+                "AND EXISTS ("
+                "  SELECT 1 FROM arc_state s "
+                "  WHERE s.arc_id = a.id "
+                "  AND s.key IN ('review_id', 'review_arc_approval_data')"
+                ")"
             ).fetchall()
 
             recovered = 0
             for row in rows:
                 arc_id = row["arc_id"]
-                # Get all state for this arc
                 state_rows = db.execute(
                     "SELECT key, value_json FROM arc_state WHERE arc_id = ?",
                     (arc_id,),
@@ -59,12 +64,33 @@ def recover_review_links():
                     except (json.JSONDecodeError, TypeError):
                         state[sr["key"]] = sr["value_json"]
 
+                # Arc-approval reviews: reconstruct from the atomic blob.
+                # Diff and arc-approval are mutually exclusive on a given
+                # arc, but prefer arc-approval when present.
+                approval = state.get("review_arc_approval_data")
+                if isinstance(approval, dict) and approval.get("review_id"):
+                    review_id = approval["review_id"]
+                    if review_id in _review_links:
+                        continue
+                    _review_links[review_id] = {
+                        "review_type": "arc-approval",
+                        "target_arc_id": approval.get("target_arc_id"),
+                        "gate_arc_id": approval.get("gate_arc_id"),
+                        "proposing_arc_id": approval.get("proposing_arc_id"),
+                        "title": approval.get("title", "Arc Approval"),
+                        "action_description": approval.get("action_description", ""),
+                        "reviewer": "user",
+                        "arc_id": approval.get("target_arc_id"),
+                        "created_at": approval.get("created_at", "(recovered)"),
+                        "used": False,
+                    }
+                    recovered += 1
+                    continue
+
                 review_id = state.get("review_id")
                 diff = state.get("diff")
                 if not review_id or not diff:
                     continue
-
-                # Skip if already in memory (shouldn't happen on fresh start)
                 if review_id in _review_links:
                     continue
 
@@ -84,6 +110,104 @@ def recover_review_links():
                 logger.info("Recovered %d review link(s) from database", recovered)
         except (sqlite3.Error, OSError, ValueError) as e:
             logger.warning("Failed to recover review links: %s", e)
+
+
+def backfill_arc_approval_reviews() -> int:
+    """One-shot backfill for arcs in human-review mode missing recovery data.
+
+    Scans arcs that are non-terminal, marked ``_review_mode='human'``, and
+    do NOT yet have a ``review_arc_approval_data`` blob. For each, clears
+    any stale ``review_id`` / ``review_url`` rows (left behind by botched
+    out-of-process backfills) and calls :func:`create_arc_approval_review`
+    so the in-memory entry AND the recovery blob are written together.
+
+    Idempotent: re-running is a no-op once every eligible arc has its
+    blob persisted.
+
+    Returns the count of arcs backfilled.
+    """
+    from ..core.workflows._arc_state import get_arc_state as _gas
+    frozen_placeholders = ",".join("?" * len(arc_manager.FROZEN_STATUSES))
+    candidates: list[dict] = []
+    with db_connection() as db:
+        try:
+            rows = db.execute(
+                "SELECT a.id as arc_id, a.parent_id, a.name, a.goal "
+                "FROM arcs a "
+                f"WHERE a.status NOT IN ({frozen_placeholders}) "
+                "AND EXISTS ("
+                "  SELECT 1 FROM arc_state s "
+                "  WHERE s.arc_id = a.id AND s.key = '_review_mode' "
+                "  AND s.value_json = ?"
+                ") "
+                "AND NOT EXISTS ("
+                "  SELECT 1 FROM arc_state s "
+                "  WHERE s.arc_id = a.id "
+                "  AND s.key = 'review_arc_approval_data'"
+                ")",
+                (*arc_manager.FROZEN_STATUSES, json.dumps("human")),
+            ).fetchall()
+            for row in rows:
+                candidates.append({
+                    "arc_id": row["arc_id"],
+                    "parent_id": row["parent_id"],
+                    "name": row["name"],
+                    "goal": row["goal"],
+                })
+        except (sqlite3.Error, OSError, ValueError) as e:
+            logger.warning("backfill_arc_approval_reviews: scan failed: %s", e)
+            return 0
+
+    if not candidates:
+        return 0
+
+    backfilled = 0
+    for cand in candidates:
+        arc_id = cand["arc_id"]
+        try:
+            # Locate the gate (await-approval child step). Skip arcs
+            # without one — they are not gated and don't need a review.
+            with db_connection() as db:
+                gate_row = db.execute(
+                    "SELECT id FROM arcs WHERE parent_id = ? "
+                    "AND name = 'await-approval'",
+                    (arc_id,),
+                ).fetchone()
+            if gate_row is None:
+                continue
+            gate_arc_id = gate_row["id"]
+
+            action_description = _gas(arc_id, "action_description") or ""
+            action_type = _gas(arc_id, "action_type") or "action"
+
+            # Clear stale review_id / review_url rows from the prior
+            # out-of-process backfill; the in-memory entries those
+            # referred to do not exist in this process.
+            with db_transaction() as db:
+                db.execute(
+                    "DELETE FROM arc_state WHERE arc_id = ? "
+                    "AND key IN ('review_id', 'review_url')",
+                    (arc_id,),
+                )
+
+            create_arc_approval_review(
+                target_arc_id=arc_id,
+                gate_arc_id=gate_arc_id,
+                title=f"Reflection-proposed {action_type} action",
+                action_description=action_description,
+                proposing_arc_id=cand["parent_id"],
+            )
+            backfilled += 1
+        except Exception:
+            logger.exception(
+                "backfill_arc_approval_reviews: failed for arc %d", arc_id,
+            )
+
+    if backfilled:
+        logger.info(
+            "backfill_arc_approval_reviews: backfilled %d arc(s)", backfilled,
+        )
+    return backfilled
 
 
 @attrs.define
@@ -247,6 +371,8 @@ def create_arc_approval_review(
     Returns dict with ``review_id`` and ``url``.
     """
     review_id = str(uuid.uuid4())
+    created_at = datetime.now(timezone.utc).isoformat()
+    url = f"/api/review/{review_id}"
 
     _review_links[review_id] = {
         "review_type": "arc-approval",
@@ -259,13 +385,36 @@ def create_arc_approval_review(
         # arc_id is set so submit_decision's existing arc-history logging
         # path attributes the review to the target arc.
         "arc_id": target_arc_id,
-        "created_at": datetime.now(timezone.utc).isoformat(),
+        "created_at": created_at,
         "used": False,
     }
 
+    # Persist recovery data on the target arc so daemon restarts can
+    # rebuild the in-memory entry. ``review_arc_approval_data`` is the
+    # atomic blob consumed by ``recover_review_links``. ``review_id`` /
+    # ``review_url`` mirror the diff-side state-key naming and let
+    # tooling (chat-notify, list-pending-reviews) read the URL directly.
+    try:
+        set_arc_state(target_arc_id, "review_id", review_id)
+        set_arc_state(target_arc_id, "review_url", url)
+        set_arc_state(target_arc_id, "review_arc_approval_data", {
+            "review_id": review_id,
+            "target_arc_id": target_arc_id,
+            "gate_arc_id": gate_arc_id,
+            "proposing_arc_id": proposing_arc_id,
+            "title": title,
+            "action_description": action_description,
+            "created_at": created_at,
+        })
+    except (sqlite3.Error, OSError, ValueError):
+        logger.exception(
+            "Failed to persist arc-approval review state for arc %s",
+            target_arc_id,
+        )
+
     return {
         "review_id": review_id,
-        "url": f"/api/review/{review_id}",
+        "url": url,
     }
 
 
