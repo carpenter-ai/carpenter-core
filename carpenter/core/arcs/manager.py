@@ -965,6 +965,10 @@ def freeze_arc(arc_id: int) -> None:
     any_failed = any(c["status"] == "failed" for c in children)
     all_frozen = all(c["status"] in FROZEN_STATUSES for c in children)
     if any_failed and all_frozen:
+        if arc and arc.get("agent_type") == "SUPERVISOR":
+            if arc["status"] == "active":
+                update_status(arc_id, "waiting")
+            return
         update_status(arc_id, "failed")
         return
 
@@ -981,6 +985,60 @@ def is_frozen(arc_id: int) -> bool:
 
 
 # ── Child failure notification ────────────────────────────────────
+
+
+def _notify_supervisor_parent(parent_id: int, failed_child: dict) -> None:
+    """Append a failure record to a SUPERVISOR parent's pending list and enqueue a wake.
+
+    Concurrent failures coalesce on idempotency_key ``supervisor_wake:<parent_id>``;
+    the wake handler reads-and-clears ``_pending_failures`` atomically so no records
+    are lost between the append and the dispatch.
+    """
+    from datetime import datetime, timezone
+    import json as _json
+
+    failure_record = {
+        "child_id": failed_child["id"],
+        "child_name": failed_child["name"],
+        "child_goal": failed_child.get("goal"),
+        "failed_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    with db_transaction() as db:
+        row = db.execute(
+            "SELECT value_json FROM arc_state WHERE arc_id = ? AND key = '_pending_failures'",
+            (parent_id,),
+        ).fetchone()
+        if row:
+            try:
+                pending = _json.loads(row["value_json"])
+                if not isinstance(pending, list):
+                    pending = []
+            except (ValueError, TypeError):
+                pending = []
+        else:
+            pending = []
+        pending.append(failure_record)
+        db.execute(
+            "INSERT INTO arc_state (arc_id, key, value_json) VALUES (?, ?, ?) "
+            "ON CONFLICT(arc_id, key) DO UPDATE SET value_json = excluded.value_json, "
+            "updated_at = CURRENT_TIMESTAMP",
+            (parent_id, "_pending_failures", _json.dumps(pending)),
+        )
+
+    try:
+        from ..engine import work_queue
+        work_queue.enqueue(
+            "arc.supervisor_wake",
+            {"parent_id": parent_id},
+            idempotency_key=f"supervisor_wake:{parent_id}",
+        )
+        from ..engine import main_loop
+        main_loop.wake_signal.set()
+    except (ImportError, sqlite3.Error):
+        logger.exception(
+            "Failed to enqueue supervisor_wake for arc %d", parent_id,
+        )
 
 
 def _notify_parent_of_failure(arc_id: int) -> None:
@@ -1005,6 +1063,10 @@ def _notify_parent_of_failure(arc_id: int) -> None:
 
     # Only notify if parent is waiting for children
     if parent["status"] != "waiting":
+        return
+
+    if parent["agent_type"] == "SUPERVISOR":
+        _notify_supervisor_parent(parent_id, arc)
         return
 
     # Template-managed parents are handled by the template handler

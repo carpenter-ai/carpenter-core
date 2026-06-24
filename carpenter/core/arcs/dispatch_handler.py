@@ -37,6 +37,7 @@ async def handle_arc_dispatch(work_id: int, payload: dict):
     arc_id = payload.get("arc_id")
     event_payload = payload.get("event_payload") or {}
     is_cron_triggered = "cron_id" in payload
+    supervisor_wake = bool(payload.get("supervisor_wake"))
 
     # When dispatched via cron, extract arc_id from nested event_payload
     if arc_id is None:
@@ -154,6 +155,16 @@ async def handle_arc_dispatch(work_id: int, payload: dict):
     _fallback_models = []  # list of SelectionResult, remaining alternatives
     _selected_model_id = None  # model_id of the model we're currently trying
 
+    if not supervisor_wake:
+        _agent_type_pre = (arc_info_early.get("agent_type") if arc_info_early else None) or "EXECUTOR"
+        if _agent_type_pre == "SUPERVISOR":
+            logger.info(
+                "Arc %d (SUPERVISOR): passive escalation handler, "
+                "skipping dispatch until supervisor_wake fires",
+                arc_id,
+            )
+            return
+
     try:
         result = arc_manager.dispatch_arc(arc_id)
         action = result.get("action")
@@ -198,8 +209,19 @@ async def handle_arc_dispatch(work_id: int, payload: dict):
             # Decide whether to invoke an agent:
             # - If arc has model_policy_id: invoke with that model
             # - If EXECUTOR without policy: invoke with default model (backward compat)
+            # - If SUPERVISOR being woken: invoke with default model (no policy needed)
             # - Otherwise (PLANNER/REVIEWER without policy): freeze immediately
-            should_invoke = agent_config is not None or policy_id is not None or agent_type == "EXECUTOR"
+            should_invoke = (
+                agent_config is not None
+                or policy_id is not None
+                or agent_type == "EXECUTOR"
+                or (agent_type == "SUPERVISOR" and supervisor_wake)
+            )
+
+            if agent_type == "SUPERVISOR" and supervisor_wake:
+                failure_summary = payload.get("failure_summary")
+                if failure_summary:
+                    goal = f"{goal}\n\n{failure_summary}"
 
             if should_invoke:
                 # The source conversation is only an output-routing target;
@@ -1079,6 +1101,7 @@ def scan_for_ready_arcs():
             "SELECT id, parent_id, priority FROM arcs "
             "WHERE status = 'pending' "
             f"AND (name IS NULL OR name NOT LIKE '{CODING_CHANGE_PREFIX}%') "
+            "AND (agent_type IS NULL OR agent_type != 'SUPERVISOR') "
             "AND (wait_until IS NULL OR wait_until <= datetime('now'))"
         ).fetchall()
 

@@ -177,6 +177,10 @@ class Coordinator:
         child_failure_handler.register_handlers(main_loop.register_handler)
         logger.info("Child failure handler registered")
 
+        from .core.arcs import supervisor_wake_handler
+        supervisor_wake_handler.register_handlers(main_loop.register_handler)
+        logger.info("Supervisor wake handler registered")
+
         from .core.arcs import dispatch_handler as arc_dispatch_handler
         arc_dispatch_handler.register_handlers(main_loop.register_handler)
 
