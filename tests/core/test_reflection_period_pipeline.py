@@ -293,24 +293,36 @@ def _run(handler, arc_id):
 
 
 def test_period_pipeline_gather_then_save(pkg):
-    """End-to-end: gather populates the reflect arc's goal with the batch
-    framing for the period; save enqueues a by-day KB write."""
+    """End-to-end: gather writes a typed GatheredActivity output and the
+    dispatch handler renders the reflect step's goal from it; save
+    enqueues a by-day KB write."""
+    from carpenter.core.arcs.dispatch_handler import (
+        _render_goal_from_sibling_output,
+    )
+
     a1 = _insert_arc("goal-1", goal="alpha work")
     a2 = _insert_arc("goal-2", goal="beta work")
     root_id, gather_id, reflect_id, save_id, dispatch_id = (
         _build_period_reflection_tree([a1, a2], date="2026-06-19"))
 
-    # gather-activity → reflect arc's goal gets the batch block.
+    # gather-activity → typed GatheredActivity output on the gather arc;
+    # the reflect arc's goal column stays as the static step description.
     arc_manager.update_status(gather_id, "active")
     _run(pkg.step_handlers.handle_gather_activity, gather_id)
 
+    # Dispatch-time goal rendering picks up the sibling's typed output.
+    rendered = _render_goal_from_sibling_output(reflect_id)
+    assert rendered is not None
+    assert "batch of completed arcs" in rendered
+    assert "arc count: 2" in rendered
+    assert f"#{a1}" in rendered and f"#{a2}" in rendered
+
+    # The reflect arc's goal column was NOT mutated by the gather handler.
     with db_connection() as db:
         reflect_goal = db.execute(
             "SELECT goal FROM arcs WHERE id = ?", (reflect_id,),
         ).fetchone()["goal"]
-    assert "batch of completed arcs" in reflect_goal
-    assert "arc count: 2" in reflect_goal
-    assert f"#{a1}" in reflect_goal and f"#{a2}" in reflect_goal
+    assert "batch of completed arcs" not in reflect_goal
 
     # reflect produces output, then save-reflection enqueues the KB write.
     set_arc_state(reflect_id, "_agent_response", "Lessons: keep tests small.")

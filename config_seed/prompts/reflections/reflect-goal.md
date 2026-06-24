@@ -38,4 +38,4 @@ backticks or prose.
 
 ## Activity to reflect on
 
-{{ activity_content }}
+{{ content }}

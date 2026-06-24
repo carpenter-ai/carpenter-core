@@ -25,6 +25,17 @@ steps:
     agent_model: haiku
     input_contract: data_models.reflection:GatheredActivity
     output_contract: data_models.reflection:ReflectionResult
+    # Render the reflect step's agent goal at dispatch time from the
+    # ``GatheredActivity`` produced by the preceding ``prepare`` sibling.
+    # The platform's dispatch handler reads the sibling output, renders
+    # ``reflect-goal.md`` against ``GatheredActivity.content``, and uses
+    # the rendered string as the agent's goal — replacing the obsolete
+    # SQL UPDATE on the sibling arc's goal column.
+    goal_template: reflect-goal
+    goal_template_subdir: reflections
+    goal_input_sibling_role: prepare
+    goal_input_output_name: gathered_activity
+    goal_input_field: content
   - name: save-reflection
     description: Persist the reflection summary to KB
     role: persist

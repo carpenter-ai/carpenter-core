@@ -166,27 +166,10 @@ async def handle_gather_activity(arc_id: int, arc_info: dict) -> None:
         arc_id, GATHERED_ACTIVITY_OUTPUT, cattrs.unstructure(gathered),
     )
 
-    reflect_arc_id = find_sibling_arc_id(arc_id, "analyze")
-    if reflect_arc_id is not None:
-        try:
-            reflect_goal = load_prompt_template(
-                "reflect-goal",
-                context={"activity_content": content},
-                subdirectory="reflections",
-            )
-        except FileNotFoundError:
-            reflect_goal = content
-        from carpenter.db import db_transaction
-        with db_transaction() as db:
-            db.execute(
-                "UPDATE arcs SET goal = ? WHERE id = ?",
-                (reflect_goal, reflect_arc_id),
-            )
-    else:
-        logger.warning(
-            "gather-activity arc %d: no sibling reflect arc (role=analyze)",
-            arc_id,
-        )
+    # The reflect step's goal is rendered at dispatch time from this
+    # typed output by ``dispatch_handler._render_goal_from_sibling_output``
+    # — see the ``goal_template`` block on the reflect step in
+    # ``reflection.yaml``. No direct write to the sibling arc is needed.
 
     arc_manager.update_status(arc_id, "completed")
     arc_manager.freeze_arc(arc_id)
@@ -195,8 +178,8 @@ async def handle_gather_activity(arc_id: int, arc_info: dict) -> None:
     _propagate_completion(arc_id)
 
     logger.info(
-        "gather-activity arc %d completed: %d chars of activity for reflect arc %s",
-        arc_id, len(content), reflect_arc_id,
+        "gather-activity arc %d completed: %d chars of activity",
+        arc_id, len(content),
     )
 
 
