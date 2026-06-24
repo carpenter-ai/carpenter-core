@@ -582,6 +582,30 @@ def test_create_arc_approval_review_persists_recovery_data():
     assert "created_at" in blob
 
 
+def test_recover_review_links_recovers_pending_arcs(client):
+    """db.startup_recovery() resets active/waiting arcs to pending before
+    recover_review_links runs, so pending arcs with arc-approval data
+    must also be recovered."""
+    target_id = arc_manager.create_arc("pending-target")
+    gate_id = arc_manager.add_child(target_id, "await-approval")
+    out = review.create_arc_approval_review(
+        target_arc_id=target_id,
+        gate_arc_id=gate_id,
+        title="Pending",
+        action_description="Pending action",
+    )
+    review_id = out["review_id"]
+
+    review.clear_reviews()
+    assert review.get_review(review_id) is None
+
+    review.recover_review_links()
+
+    recovered = review.get_review(review_id)
+    assert recovered is not None
+    assert recovered["review_type"] == "arc-approval"
+
+
 def test_recover_review_links_round_trip_arc_approval(client):
     """Round-trip: create arc-approval review, blow away in-memory store,
     call recover_review_links, confirm submit_decision still works."""
