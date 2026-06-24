@@ -144,9 +144,19 @@ class Coordinator:
             )
 
     def _recover_review_links(self) -> None:
-        """Recover review links from previous session."""
-        from .api.review import recover_review_links
+        """Recover review links from previous session.
+
+        Runs the in-memory recovery from ``arc_state`` first, then a
+        one-shot backfill that mints fresh arc-approval reviews for any
+        stranded ``_review_mode='human'`` arcs missing recovery data.
+        Both steps are idempotent.
+        """
+        from .api.review import (
+            backfill_arc_approval_reviews,
+            recover_review_links,
+        )
         recover_review_links()
+        backfill_arc_approval_reviews()
 
     def _register_work_handlers(self) -> None:
         """Register all work-queue event handlers and heartbeat hooks."""

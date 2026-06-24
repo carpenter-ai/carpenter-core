@@ -553,3 +553,153 @@ def test_arc_approval_approve_unblocks_gate_check_activation(client):
         )
 
     assert arc_manager.check_activation(gate_id) is True
+
+
+def test_create_arc_approval_review_persists_recovery_data():
+    """create_arc_approval_review writes review_arc_approval_data + review_id
+    + review_url to the target arc's state."""
+    from carpenter.core.workflows._arc_state import get_arc_state
+
+    review.clear_reviews()
+    target_id = arc_manager.create_arc("target-action")
+    gate_id = arc_manager.add_child(target_id, "await-approval")
+
+    out = review.create_arc_approval_review(
+        target_arc_id=target_id,
+        gate_arc_id=gate_id,
+        title="Persisted",
+        action_description="Persist me",
+    )
+
+    assert get_arc_state(target_id, "review_id") == out["review_id"]
+    assert get_arc_state(target_id, "review_url") == out["url"]
+    blob = get_arc_state(target_id, "review_arc_approval_data")
+    assert blob["review_id"] == out["review_id"]
+    assert blob["target_arc_id"] == target_id
+    assert blob["gate_arc_id"] == gate_id
+    assert blob["title"] == "Persisted"
+    assert blob["action_description"] == "Persist me"
+    assert "created_at" in blob
+
+
+def test_recover_review_links_round_trip_arc_approval(client):
+    """Round-trip: create arc-approval review, blow away in-memory store,
+    call recover_review_links, confirm submit_decision still works."""
+    target_id = arc_manager.create_arc("target-action")
+    gate_id = arc_manager.add_child(target_id, "await-approval")
+    arc_manager.update_status(target_id, "active")
+    arc_manager.update_status(target_id, "waiting")
+
+    out = review.create_arc_approval_review(
+        target_arc_id=target_id,
+        gate_arc_id=gate_id,
+        title="Recover me",
+        action_description="recovered action",
+    )
+    review_id = out["review_id"]
+
+    # Simulate daemon restart.
+    review.clear_reviews()
+    assert review.get_review(review_id) is None
+
+    review.recover_review_links()
+
+    recovered = review.get_review(review_id)
+    assert recovered is not None
+    assert recovered["review_type"] == "arc-approval"
+    assert recovered["target_arc_id"] == target_id
+    assert recovered["gate_arc_id"] == gate_id
+    assert recovered["used"] is False
+
+    # submit_decision works against the recovered entry.
+    resp = client.post(
+        f"/api/review/{review_id}/decide", json={"decision": "approve"}
+    )
+    assert resp.status_code == 200
+
+
+def test_backfill_arc_approval_reviews_picks_up_stranded_arc():
+    """backfill_arc_approval_reviews mints a review for an arc with
+    _review_mode='human', non-terminal, no review_arc_approval_data."""
+    from carpenter.core.workflows._arc_state import (
+        get_arc_state,
+        set_arc_state,
+    )
+
+    review.clear_reviews()
+    target_id = arc_manager.create_arc("target-action")
+    arc_manager.add_child(target_id, "await-approval")
+    arc_manager.update_status(target_id, "active")
+    arc_manager.update_status(target_id, "waiting")
+    set_arc_state(target_id, "_review_mode", "human")
+    set_arc_state(target_id, "action_description", "stranded action")
+    set_arc_state(target_id, "action_type", "kb")
+    # Stale state from a botched out-of-process backfill.
+    set_arc_state(target_id, "review_id", "stale-id")
+    set_arc_state(target_id, "review_url", "/api/review/stale-id")
+
+    count = review.backfill_arc_approval_reviews()
+    assert count == 1
+
+    new_review_id = get_arc_state(target_id, "review_id")
+    assert new_review_id != "stale-id"
+    assert review.get_review(new_review_id) is not None
+    blob = get_arc_state(target_id, "review_arc_approval_data")
+    assert blob["review_id"] == new_review_id
+    assert blob["action_description"] == "stranded action"
+
+
+def test_backfill_arc_approval_reviews_idempotent():
+    """Second backfill run is a no-op once the blob is persisted."""
+    from carpenter.core.workflows._arc_state import set_arc_state
+
+    review.clear_reviews()
+    target_id = arc_manager.create_arc("target-action")
+    arc_manager.add_child(target_id, "await-approval")
+    arc_manager.update_status(target_id, "active")
+    arc_manager.update_status(target_id, "waiting")
+    set_arc_state(target_id, "_review_mode", "human")
+    set_arc_state(target_id, "action_description", "d")
+
+    first = review.backfill_arc_approval_reviews()
+    assert first == 1
+    second = review.backfill_arc_approval_reviews()
+    assert second == 0
+
+
+def test_backfill_arc_approval_reviews_skips_already_backfilled():
+    """An arc with review_arc_approval_data is skipped even if it also
+    has _review_mode='human' and is non-terminal."""
+    from carpenter.core.workflows._arc_state import set_arc_state
+
+    review.clear_reviews()
+    target_id = arc_manager.create_arc("target-action")
+    gate_id = arc_manager.add_child(target_id, "await-approval")
+    arc_manager.update_status(target_id, "active")
+    arc_manager.update_status(target_id, "waiting")
+    set_arc_state(target_id, "_review_mode", "human")
+    # create_arc_approval_review writes review_arc_approval_data itself.
+    review.create_arc_approval_review(
+        target_arc_id=target_id,
+        gate_arc_id=gate_id,
+        title="t",
+        action_description="d",
+    )
+
+    count = review.backfill_arc_approval_reviews()
+    assert count == 0
+
+
+def test_backfill_arc_approval_reviews_skips_terminal_arcs():
+    """A cancelled / completed arc isn't backfilled."""
+    from carpenter.core.workflows._arc_state import set_arc_state
+
+    review.clear_reviews()
+    target_id = arc_manager.create_arc("target-action")
+    arc_manager.add_child(target_id, "await-approval")
+    set_arc_state(target_id, "_review_mode", "human")
+    set_arc_state(target_id, "action_description", "d")
+    arc_manager.update_status(target_id, "cancelled")
+
+    count = review.backfill_arc_approval_reviews()
+    assert count == 0
