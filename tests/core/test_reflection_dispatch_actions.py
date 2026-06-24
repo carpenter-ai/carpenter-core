@@ -2,9 +2,12 @@
 
 Covers the ``handle_dispatch_actions`` handler from
 ``config_seed/templates/reflection/step_handlers.py``: parsing proposed
-actions out of the sibling reflect arc's output, template selection by
-action type, fan-out cap, tainted-reflection gating, and no-op handling
-for empty proposed-actions payloads.
+actions out of the sibling reflect arc's typed ``ReflectionResult``
+output, action-type classification, the per-reflection action cap, and
+routing each proposed action through the platform's standard
+``invoke_coding_change`` entry point so the change-workflow selector
+picks the right pipeline (``coding-change`` / ``yaml-change`` /
+``kb-change``).
 """
 
 from __future__ import annotations
@@ -60,8 +63,6 @@ def _load_package_handlers(tmp_path):
     """Load templates + trigger the package's register_handlers hook."""
     dest = _copy_seed(tmp_path)
     template_manager.load_templates_from_dir(dest)
-    # Ensure the reflection package handlers are registered with our
-    # (reset) registry.
     step_handlers = importlib.import_module(
         "carpenter_template_packages.reflection.step_handlers",
     )
@@ -72,17 +73,43 @@ def _load_package_handlers(tmp_path):
     return step_handlers
 
 
+class _StubInvoke:
+    """Stub for ``handle_invoke_coding_change`` that creates a real arc row.
+
+    Returns the same ``{"arc_id": int}`` shape as the real backend, and
+    records each call so tests can assert on the dispatched params.
+    """
+
+    def __init__(self):
+        self.calls: list[dict] = []
+
+    def __call__(self, params: dict) -> dict:
+        self.calls.append(dict(params))
+        arc_id = arc_manager.create_arc(
+            name=f"coding-change: {params.get('prompt', '')[:30]}",
+            goal=params.get("prompt", ""),
+        )
+        return {"arc_id": arc_id}
+
+
+@pytest.fixture
+def stub_invoke(monkeypatch):
+    """Patch ``handle_invoke_coding_change`` so dispatch tests don't need
+    a fully-wired platform_server_dir / workspace_manager setup. The
+    invoke entry point is exhaustively covered by
+    ``tests/templates/test_workflow_selection.py``.
+    """
+    from carpenter.tool_backends import arc as arc_backend
+    stub = _StubInvoke()
+    monkeypatch.setattr(arc_backend, "handle_invoke_coding_change", stub)
+    return stub
+
+
 _BACKTICK_RE = re.compile(r"`([^`]+)`")
 _PATH_RE = re.compile(r"^[\w./\-]+\.[\w]+$")
 
 
 def _line_to_action(line: str) -> dict:
-    """Translate one ``- foo`` legacy-style line into a ProposedAction dict.
-
-    Extracts a backticked path-like token as ``target_path`` so the path/
-    category arms of ``_is_reflection_restricted`` are still exercised by
-    the legacy-shaped fixtures.
-    """
     text = line.strip()
     for prefix in ("- ", "* "):
         if text.startswith(prefix):
@@ -98,11 +125,6 @@ def _line_to_action(line: str) -> dict:
 
 
 def _as_reflection_result_json(legacy: str | None) -> str | None:
-    """Wrap a legacy line-separated proposed-actions blob as a ReflectionResult JSON.
-
-    Keeps existing fixtures readable while exercising the new
-    ``ReflectionResult`` contract path through the handlers.
-    """
     if legacy is None:
         return None
     if not legacy.strip():
@@ -117,12 +139,7 @@ def _as_reflection_result_json(legacy: str | None) -> str | None:
 
 
 def _make_reflection_arc_tree(reflect_response: str | None):
-    """Build a reflection arc tree via the actual template.
-
-    Creates a parent ``reflection`` arc and instantiates the template so
-    children carry the right ``role`` / ``name`` / ``step_order`` for
-    sibling-by-role lookup to work the same way it does in prod.
-    """
+    """Build a reflection arc tree via the actual template."""
     tmpl = template_manager.get_template_by_name("reflection")
     assert tmpl is not None, "reflection template not loaded"
 
@@ -131,8 +148,7 @@ def _make_reflection_arc_tree(reflect_response: str | None):
     )
     arc_manager.update_status(root_id, "active")
 
-    child_ids = template_manager.instantiate_template(tmpl["id"], root_id)
-    # Map by step name.
+    template_manager.instantiate_template(tmpl["id"], root_id)
     from carpenter.db import db_connection
     with db_connection() as db:
         rows = db.execute(
@@ -144,14 +160,12 @@ def _make_reflection_arc_tree(reflect_response: str | None):
     reflect_id = by_name["reflect"]
     dispatch_id = by_name["dispatch-actions"]
 
-    # Simulate reflect running to completion.
     arc_manager.update_status(reflect_id, "active")
     payload = _as_reflection_result_json(reflect_response)
     if payload is not None:
         set_arc_state(reflect_id, "_agent_response", payload)
     arc_manager.update_status(reflect_id, "completed")
 
-    # Make dispatch-actions active (as dispatch would).
     arc_manager.update_status(by_name["gather-activity"], "active")
     arc_manager.update_status(by_name["gather-activity"], "completed")
     arc_manager.update_status(by_name["save-reflection"], "active")
@@ -168,7 +182,7 @@ def _run(handler, arc_id):
 # ── Unit tests ──────────────────────────────────────────────────────
 
 
-def test_no_proposed_actions_is_noop(tmp_path):
+def test_no_proposed_actions_is_noop(tmp_path, stub_invoke):
     """Empty/absent reflect output → no children spawned, no error."""
     step_handlers = _load_package_handlers(tmp_path)
 
@@ -178,23 +192,15 @@ def test_no_proposed_actions_is_noop(tmp_path):
 
     _run(step_handlers.handle_dispatch_actions, dispatch_id)
 
-    # Dispatch arc completed with an empty spawn list.
     resp = get_arc_state(dispatch_id, "_agent_response")
     assert resp is not None
     assert resp["spawned_arcs"] == []
     assert resp["total_proposed"] == 0
-
-    # Only the 4 template steps; no spawned action children.
-    from carpenter.db import db_connection
-    with db_connection() as db:
-        rows = db.execute(
-            "SELECT id FROM arcs WHERE parent_id = ?", (root_id,),
-        ).fetchall()
-    assert len(rows) == 4  # gather-activity, reflect, save-reflection, dispatch-actions
+    assert stub_invoke.calls == []
 
 
-def test_three_proposed_actions_spawn_three_arcs(tmp_path):
-    """Three plain-text actions → three spawned arcs with correct goals."""
+def test_three_proposed_actions_spawn_three_arcs(tmp_path, stub_invoke):
+    """Three plain-text actions → three invoke_coding_change calls."""
     step_handlers = _load_package_handlers(tmp_path)
 
     reflect_output = (
@@ -210,14 +216,15 @@ def test_three_proposed_actions_spawn_three_arcs(tmp_path):
     assert len(resp["spawned_arcs"]) == 3
     assert resp["total_proposed"] == 3
     assert resp["truncated"] == 0
+    assert len(stub_invoke.calls) == 3
 
-    # Verify each spawned arc has the expected action metadata.
-    for i, spawned_id in enumerate(resp["spawned_arcs"]):
+    for spawned_id in resp["spawned_arcs"]:
         assert get_arc_state(spawned_id, "action_type") is not None
         assert get_arc_state(spawned_id, "action_description")
+        assert get_arc_state(spawned_id, "reflection_parent_arc_id") == root_id
 
 
-def test_ten_actions_truncated_to_cap(tmp_path, monkeypatch):
+def test_ten_actions_truncated_to_cap(tmp_path, monkeypatch, stub_invoke):
     """10 proposed actions with cap=5 → exactly 5 spawned."""
     step_handlers = _load_package_handlers(tmp_path)
 
@@ -237,10 +244,11 @@ def test_ten_actions_truncated_to_cap(tmp_path, monkeypatch):
     assert len(resp["spawned_arcs"]) == 5
     assert resp["total_proposed"] == 10
     assert resp["truncated"] == 5
+    assert len(stub_invoke.calls) == 5
 
 
-def test_action_type_classification_routes_to_correct_template(tmp_path):
-    """KB-keyword action → reflection-kb-action; code-keyword → reflection-code-action."""
+def test_action_type_classification_records_type(tmp_path, stub_invoke):
+    """KB-keyword action → action_type 'kb'; code-keyword → 'code'."""
     step_handlers = _load_package_handlers(tmp_path)
 
     reflect_output = (
@@ -254,235 +262,69 @@ def test_action_type_classification_routes_to_correct_template(tmp_path):
     resp = get_arc_state(dispatch_id, "_agent_response")
     assert resp["action_types"] == ["kb", "code"]
 
-    kb_arc_id, code_arc_id = resp["spawned_arcs"]
 
-    # The spawned arcs should carry the originating template id; look it
-    # up to confirm the routing.
-    kb_template = template_manager.get_template_by_name(
-        "reflection-kb-action",
-    )
-    code_template = template_manager.get_template_by_name(
-        "reflection-code-action",
-    )
-    assert kb_template is not None
-    assert code_template is not None
-
-    kb_arc = arc_manager.get_arc(kb_arc_id)
-    code_arc = arc_manager.get_arc(code_arc_id)
-    assert kb_arc["template_id"] == kb_template["id"]
-    assert code_arc["template_id"] == code_template["id"]
-
-
-def test_config_and_other_route_to_kb_template(tmp_path):
-    """'config'/'other' action types fall through to the kb template."""
+def test_target_path_passed_as_affected_paths(tmp_path, stub_invoke):
+    """When a proposed action has a target_path, it is forwarded to
+    invoke_coding_change as ``affected_paths`` so the standard
+    workflow selector routes to the right pipeline."""
     step_handlers = _load_package_handlers(tmp_path)
+
+    reflect_output = "- update the doc at `docs/foo.md`\n"
+    root_id, _, dispatch_id = _make_reflection_arc_tree(reflect_output)
+
+    _run(step_handlers.handle_dispatch_actions, dispatch_id)
+
+    assert len(stub_invoke.calls) == 1
+    call = stub_invoke.calls[0]
+    assert call["source_dir"] == "platform"
+    assert call["prompt"] == "update the doc at `docs/foo.md`"
+    assert call["affected_paths"] == ["docs/foo.md"]
+
+
+def test_action_with_no_target_path_omits_affected_paths(tmp_path, stub_invoke):
+    """Actions without a target_path do not pass ``affected_paths`` —
+    the standard backend then emits a default_pending_classification
+    audit and uses coding-change as the fallback."""
+    step_handlers = _load_package_handlers(tmp_path)
+
+    reflect_output = "- some vague idea\n"
+    root_id, _, dispatch_id = _make_reflection_arc_tree(reflect_output)
+
+    _run(step_handlers.handle_dispatch_actions, dispatch_id)
+
+    assert len(stub_invoke.calls) == 1
+    assert "affected_paths" not in stub_invoke.calls[0]
+
+
+def test_invoke_failure_skips_action_continues_with_others(tmp_path, monkeypatch):
+    """A failing invoke_coding_change call skips that action but does
+    not abort the dispatch — remaining actions still spawn."""
+    step_handlers = _load_package_handlers(tmp_path)
+
+    from carpenter.tool_backends import arc as arc_backend
+
+    call_count = {"n": 0}
+
+    def flaky_invoke(params):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise RuntimeError("simulated invoke failure")
+        arc_id = arc_manager.create_arc(name="ok", goal=params.get("prompt", ""))
+        return {"arc_id": arc_id}
+
+    monkeypatch.setattr(arc_backend, "handle_invoke_coding_change", flaky_invoke)
 
     reflect_output = (
-        "- enable some setting threshold\n"   # → config
-        "- something totally unclassifiable\n"  # → other
+        "- first action that will fail\n"
+        "- second action that will succeed\n"
     )
     root_id, _, dispatch_id = _make_reflection_arc_tree(reflect_output)
 
     _run(step_handlers.handle_dispatch_actions, dispatch_id)
 
     resp = get_arc_state(dispatch_id, "_agent_response")
-    assert set(resp["action_types"]) <= {"config", "other"}
-
-    kb_template = template_manager.get_template_by_name(
-        "reflection-kb-action",
-    )
-    for spawned_id in resp["spawned_arcs"]:
-        arc = arc_manager.get_arc(spawned_id)
-        assert arc["template_id"] == kb_template["id"]
-
-
-def test_tainted_reflected_arc_marks_spawned_arcs_for_review(tmp_path):
-    """If the reflected arc is non-trusted, spawned arcs get _review_mode=human."""
-    step_handlers = _load_package_handlers(tmp_path)
-
-    # Create a non-trusted reflected arc whose id we'll thread through
-    # the reflection's parent arc_state. Use the unchecked _insert_arc
-    # since the public create_arc rejects bare untrusted creation.
-    tainted_id = arc_manager._insert_arc(
-        name="user-goal-tainted", goal="something tainted",
-        integrity_level="untrusted",
-    )
-
-    reflect_output = "- create kb entry on the issue\n"
-    root_id, _, dispatch_id = _make_reflection_arc_tree(reflect_output)
-    set_arc_state(root_id, "reflected_arc_id", tainted_id)
-
-    _run(step_handlers.handle_dispatch_actions, dispatch_id)
-
-    resp = get_arc_state(dispatch_id, "_agent_response")
-    assert resp["tainted"] is True
-    for spawned_id in resp["spawned_arcs"]:
-        assert get_arc_state(spawned_id, "_review_mode") == "human"
-
-
-def test_tainted_reflection_spawns_gated_template(tmp_path):
-    """Tainted reflection → kb action uses reflection-kb-action-gated;
-    code action uses reflection-code-action-gated. Each spawned action arc
-    has a blocking ``await-approval`` child with ``arc.manual_trigger``
-    activation before the ``execute-action`` child."""
-    step_handlers = _load_package_handlers(tmp_path)
-
-    tainted_id = arc_manager._insert_arc(
-        name="user-goal-tainted", goal="something tainted",
-        integrity_level="untrusted",
-    )
-
-    reflect_output = (
-        "- create kb entry on error budgets\n"
-        "- implement code fix for the login bug\n"
-    )
-    root_id, _, dispatch_id = _make_reflection_arc_tree(reflect_output)
-    set_arc_state(root_id, "reflected_arc_id", tainted_id)
-
-    _run(step_handlers.handle_dispatch_actions, dispatch_id)
-
-    resp = get_arc_state(dispatch_id, "_agent_response")
-    assert resp["tainted"] is True
-    assert resp["action_types"] == ["kb", "code"]
-
-    kb_gated = template_manager.get_template_by_name(
-        "reflection-kb-action-gated",
-    )
-    code_gated = template_manager.get_template_by_name(
-        "reflection-code-action-gated",
-    )
-    assert kb_gated is not None, "reflection-kb-action-gated not loaded"
-    assert code_gated is not None, "reflection-code-action-gated not loaded"
-
-    kb_arc_id, code_arc_id = resp["spawned_arcs"]
-
-    # Both spawned action arcs must point at the gated template variants.
-    kb_arc = arc_manager.get_arc(kb_arc_id)
-    code_arc = arc_manager.get_arc(code_arc_id)
-    assert kb_arc["template_id"] == kb_gated["id"]
-    assert code_arc["template_id"] == code_gated["id"]
-
-    # Each spawned action arc has a first-step ``await-approval`` child
-    # gated on ``arc.manual_trigger``. The gate step sits at step_order 0
-    # so it blocks the ``execute-action`` step at step_order 1.
-    from carpenter.db import db_connection
-    for action_arc_id in (kb_arc_id, code_arc_id):
-        with db_connection() as db:
-            steps = db.execute(
-                "SELECT id, name, step_order FROM arcs WHERE parent_id = ? "
-                "ORDER BY step_order",
-                (action_arc_id,),
-            ).fetchall()
-        names = [s["name"] for s in steps]
-        assert names == ["await-approval", "execute-action"]
-
-        gate_arc_id = steps[0]["id"]
-        with db_connection() as db:
-            rows = db.execute(
-                "SELECT event_type FROM arc_activations WHERE arc_id = ?",
-                (gate_arc_id,),
-            ).fetchall()
-        assert len(rows) == 1
-        assert rows[0]["event_type"] == "arc.manual_trigger"
-
-        # The action arc is gated: check_activation on the gate child
-        # returns False until an ``arc.manual_trigger`` event is recorded
-        # and marked processed.
-        assert arc_manager.check_activation(gate_arc_id) is False
-
-
-def test_clean_reflection_spawns_auto_template(tmp_path):
-    """Regression guard: a clean (trusted) reflected arc still routes to
-    the single-step auto templates — gated routing must not fire when
-    the reflected arc has no taint."""
-    step_handlers = _load_package_handlers(tmp_path)
-
-    # Trusted reflected arc (the default integrity_level).
-    trusted_id = arc_manager.create_arc(
-        name="user-goal-trusted", goal="clean reflection source",
-    )
-
-    reflect_output = (
-        "- create kb entry on error budgets\n"
-        "- implement code fix for the login bug\n"
-    )
-    root_id, _, dispatch_id = _make_reflection_arc_tree(reflect_output)
-    set_arc_state(root_id, "reflected_arc_id", trusted_id)
-
-    _run(step_handlers.handle_dispatch_actions, dispatch_id)
-
-    resp = get_arc_state(dispatch_id, "_agent_response")
-    assert resp["tainted"] is False
-    assert resp["action_types"] == ["kb", "code"]
-
-    kb_auto = template_manager.get_template_by_name("reflection-kb-action")
-    code_auto = template_manager.get_template_by_name("reflection-code-action")
-    assert kb_auto is not None
-    assert code_auto is not None
-
-    kb_arc_id, code_arc_id = resp["spawned_arcs"]
-    kb_arc = arc_manager.get_arc(kb_arc_id)
-    code_arc = arc_manager.get_arc(code_arc_id)
-    assert kb_arc["template_id"] == kb_auto["id"]
-    assert code_arc["template_id"] == code_auto["id"]
-
-    # No ``_review_mode`` on clean-path spawned arcs; no gate step.
-    for action_arc_id in (kb_arc_id, code_arc_id):
-        assert get_arc_state(action_arc_id, "_review_mode") is None
-        from carpenter.db import db_connection
-        with db_connection() as db:
-            steps = db.execute(
-                "SELECT name FROM arcs WHERE parent_id = ? ORDER BY step_order",
-                (action_arc_id,),
-            ).fetchall()
-        names = [s["name"] for s in steps]
-        assert names == ["execute-action"]
-
-
-def test_manual_trigger_unblocks_gated_action_arc(tmp_path):
-    """Once an ``arc.manual_trigger`` event is recorded and processed,
-    ``check_activation`` on the gated action arc's gate step returns True
-    — confirming the gate pattern is actually wired to the activation
-    table in the shape we expect."""
-    import json as _json
-
-    step_handlers = _load_package_handlers(tmp_path)
-
-    tainted_id = arc_manager._insert_arc(
-        name="user-goal-tainted", goal="something tainted",
-        integrity_level="untrusted",
-    )
-    reflect_output = "- create kb entry on the issue\n"
-    root_id, _, dispatch_id = _make_reflection_arc_tree(reflect_output)
-    set_arc_state(root_id, "reflected_arc_id", tainted_id)
-
-    _run(step_handlers.handle_dispatch_actions, dispatch_id)
-
-    resp = get_arc_state(dispatch_id, "_agent_response")
-    spawned_id = resp["spawned_arcs"][0]
-
-    from carpenter.db import db_connection, db_transaction
-    with db_connection() as db:
-        gate = db.execute(
-            "SELECT id FROM arcs WHERE parent_id = ? AND name = 'await-approval'",
-            (spawned_id,),
-        ).fetchone()
-    assert gate is not None
-    gate_id = gate["id"]
-
-    # Pre-gate: dispatch blocked.
-    assert arc_manager.check_activation(gate_id) is False
-
-    # Emit and mark processed — the minimal "operator trips the gate" step.
-    with db_transaction() as db:
-        db.execute(
-            "INSERT INTO events (event_type, payload_json, processed) "
-            "VALUES (?, ?, TRUE)",
-            ("arc.manual_trigger", _json.dumps({"arc_id": gate_id})),
-        )
-
-    # Post-gate: dispatch unblocked.
-    assert arc_manager.check_activation(gate_id) is True
+    assert resp["total_proposed"] == 2
+    assert len(resp["spawned_arcs"]) == 1
 
 
 # ── Template + handler registration smoke ───────────────────────────
@@ -501,61 +343,3 @@ def test_reflection_template_declares_dispatch_step(tmp_path):
         "reflection", "dispatch-actions",
     )
     assert handler is not None
-
-
-def test_gated_template_variants_are_loadable(tmp_path):
-    """Both gated-action templates load from config_seed and declare the
-    expected two-step shape with ``arc.manual_trigger`` on the gate."""
-    _load_package_handlers(tmp_path)
-
-    for name in ("reflection-kb-action-gated", "reflection-code-action-gated"):
-        tmpl = template_manager.get_template_by_name(name)
-        assert tmpl is not None, f"template {name!r} not loaded"
-        step_names = [s["name"] for s in tmpl["steps"]]
-        assert step_names == ["await-approval", "execute-action"]
-        gate_step = tmpl["steps"][0]
-        assert gate_step.get("activation_event") == "arc.manual_trigger"
-
-
-def test_tainted_reflection_spawns_review_url_on_gated_arc(tmp_path):
-    """Each tainted-spawned action arc has a ``review_url`` + ``review_id``
-    in its arc_state, and the stored review is wired to its
-    ``await-approval`` gate child so approving it would emit
-    ``arc.manual_trigger``."""
-    from carpenter.api import review as review_api
-    from carpenter.db import db_connection
-
-    step_handlers = _load_package_handlers(tmp_path)
-    review_api.clear_reviews()
-
-    tainted_id = arc_manager._insert_arc(
-        name="user-goal-tainted", goal="something tainted",
-        integrity_level="untrusted",
-    )
-    reflect_output = "- create kb entry on the issue\n"
-    root_id, _, dispatch_id = _make_reflection_arc_tree(reflect_output)
-    set_arc_state(root_id, "reflected_arc_id", tainted_id)
-
-    _run(step_handlers.handle_dispatch_actions, dispatch_id)
-
-    resp = get_arc_state(dispatch_id, "_agent_response")
-    spawned_id = resp["spawned_arcs"][0]
-
-    review_url = get_arc_state(spawned_id, "review_url")
-    review_id = get_arc_state(spawned_id, "review_id")
-    assert review_url and review_url.startswith("/api/review/")
-    assert review_id
-
-    stored = review_api.get_review(review_id)
-    assert stored is not None
-    assert stored["review_type"] == "arc-approval"
-    assert stored["target_arc_id"] == spawned_id
-
-    # Stored gate_arc_id must point at the spawned arc's await-approval child.
-    with db_connection() as db:
-        gate_row = db.execute(
-            "SELECT id FROM arcs WHERE parent_id = ? AND name = 'await-approval'",
-            (spawned_id,),
-        ).fetchone()
-    assert gate_row is not None
-    assert stored["gate_arc_id"] == gate_row["id"]

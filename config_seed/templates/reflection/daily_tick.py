@@ -91,6 +91,7 @@ async def handle_reflection_tick(work_id: int, payload: dict) -> None:
             origin_kind="reflection",
             origin_ref=json.dumps({"cadence": "daily", "batch": idx + 1}),
             priority=1000,
+            agent_type="SUPERVISOR",
         )
         set_arc_state(arc_id, "reflection_subject", subject)
         template_manager.instantiate_template(reflection_tmpl["id"], arc_id)

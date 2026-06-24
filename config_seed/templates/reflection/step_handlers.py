@@ -16,11 +16,12 @@ Three Python-only steps ship in this package:
 
 - :func:`handle_dispatch_actions` — post-save step. Reads the sibling
   ``reflect`` arc's ``ReflectionResult``, iterates its structured
-  ``proposed_actions``, applies the ``_is_batch_restricted`` predicate
-  (taint roll-up: any non-trusted arc in the batch routes the *whole
-  batch's* actions through the gated human-review templates), and
-  spawns one child arc per action up to
-  ``reflection.max_actions_per_reflection`` (default 5).
+  ``proposed_actions``, and dispatches each one through the platform's
+  standard ``invoke_coding_change`` entry point. The change-workflow
+  selector (``select_workflow_for_paths``) routes to
+  ``coding-change`` / ``yaml-change`` / ``kb-change`` based on the
+  action's ``target_path``, and the standard force-human gate handles
+  T1/T0 paths uniformly with all other coding changes.
 
 All three are registered in ``__init__.py`` via :func:`register_handlers`.
 Reflection is driven by a daily cron (see :mod:`.daily_tick`).
@@ -47,7 +48,6 @@ from carpenter.core.workflows._arc_state import (
 from carpenter.db import db_connection
 from carpenter.agent import conversation as conv_module
 from carpenter.agent import model_resolver
-from carpenter.prompts import load_prompt_template
 
 from .proposed_action_parser import classify_action
 from .reflection_storage import save_reflection
@@ -60,24 +60,6 @@ REFLECTION_RESULT_OUTPUT = "reflection_result"
 
 _GATHERED_ACTIVITY_CONTRACT = "data_models.reflection:GatheredActivity"
 _REFLECTION_RESULT_CONTRACT = "data_models.reflection:ReflectionResult"
-
-
-# (action_type, review_mode) → (template_name, prompt_name).
-#
-# ``review_mode`` is ``"auto"`` for clean reflections and ``"human"`` when
-# the reflected arc (or any descendant) was non-trusted — the latter
-# routes to the gated template variants, which add an ``await-approval``
-# step gated on ``arc.manual_trigger`` ahead of ``execute-action``.
-_ACTION_TYPE_TO_TEMPLATE = {
-    ("kb", "auto"): ("reflection-kb-action", "action-kb"),
-    ("code", "auto"): ("reflection-code-action", "action-code"),
-    ("config", "auto"): ("reflection-kb-action", "action-kb"),
-    ("other", "auto"): ("reflection-kb-action", "action-kb"),
-    ("kb", "human"): ("reflection-kb-action-gated", "action-kb"),
-    ("code", "human"): ("reflection-code-action-gated", "action-code"),
-    ("config", "human"): ("reflection-kb-action-gated", "action-kb"),
-    ("other", "human"): ("reflection-kb-action-gated", "action-kb"),
-}
 
 
 def _read_reflection_result(reflect_arc_id: int):
@@ -237,132 +219,19 @@ async def handle_save_reflection(arc_id: int, arc_info: dict) -> None:
     )
 
 
-def _is_batch_restricted(arc_ids: list[int], proposed_action: dict | None) -> bool:
-    """A batch is restricted if *any* arc in it would be restricted."""
-    if not arc_ids:
-        return _is_reflection_restricted(None, proposed_action)
-    return any(_is_reflection_restricted(aid, proposed_action) for aid in arc_ids)
-
-
-def _is_reflection_restricted(
-    reflected_arc_id: int | None,
-    proposed_action: dict | None = None,
-) -> bool:
-    """Return True if the reflection should route to the gated template.
-
-    Three arms:
-
-    1. **Taint** — if the reflected arc (or any descendant) is non-trusted,
-       the reflection drew from tainted inputs.
-    2. **Path tier** — if a ``proposed_action`` carries a target filesystem
-       path, classify it via :func:`platform_paths.path_tier`. T1 or T0
-       targets force human review.
-    3. **Change category** — until category-specific workflows exist,
-       python/unknown targets fall back to human review.
-    """
-    if reflected_arc_id is not None:
-        try:
-            with db_connection() as db:
-                row = db.execute(
-                    "SELECT integrity_level FROM arcs WHERE id = ?",
-                    (reflected_arc_id,),
-                ).fetchone()
-                if (
-                    row
-                    and row["integrity_level"]
-                    and row["integrity_level"] != "trusted"
-                ):
-                    _audit_reflection_restricted(reflected_arc_id, "taint")
-                    return True
-                descendant_rows = db.execute(
-                    "WITH RECURSIVE descendants(id) AS ("
-                    "  SELECT id FROM arcs WHERE parent_id = ? "
-                    "  UNION ALL "
-                    "  SELECT a.id FROM arcs a "
-                    "  JOIN descendants d ON a.parent_id = d.id"
-                    ") "
-                    "SELECT a.integrity_level FROM arcs a "
-                    "JOIN descendants d ON a.id = d.id "
-                    "WHERE a.integrity_level IS NOT NULL "
-                    "  AND a.integrity_level != 'trusted' "
-                    "LIMIT 1",
-                    (reflected_arc_id,),
-                ).fetchall()
-                if descendant_rows:
-                    _audit_reflection_restricted(reflected_arc_id, "taint")
-                    return True
-        except Exception:
-            logger.exception(
-                "taint check failed for reflected arc %s; defaulting to untainted",
-                reflected_arc_id,
-            )
-
-    if proposed_action is not None and isinstance(proposed_action, dict):
-        target = proposed_action.get("target_path")
-        if isinstance(target, str) and target:
-            try:
-                from carpenter.security.platform_paths import (
-                    PATH_TIER_T0,
-                    PATH_TIER_T1,
-                    change_category,
-                    path_tier,
-                )
-                tier = path_tier(target)
-                if tier in (PATH_TIER_T0, PATH_TIER_T1):
-                    _audit_reflection_restricted(reflected_arc_id, "tier")
-                    return True
-                cat = change_category(target)
-                if cat in ("python", "unknown"):
-                    _audit_reflection_restricted(reflected_arc_id, "category")
-                    return True
-            except Exception:
-                logger.exception(
-                    "path/category check failed for reflected arc %s "
-                    "target=%r; defaulting to unrestricted",
-                    reflected_arc_id, target,
-                )
-
-    return False
-
-
-def _audit_reflection_restricted(
-    reflected_arc_id: int | None,
-    reason: str,
-) -> None:
-    """Record an integrity audit row for a restricted reflection."""
-    try:
-        from carpenter.security.platform_paths import audit_path_decision
-        audit_path_decision(
-            None,
-            "reflection_action_restricted",
-            "",
-            {"reflected_arc_id": reflected_arc_id, "reason": reason},
-        )
-    except Exception:
-        logger.warning(
-            "audit of reflection_action_restricted failed "
-            "(reflected_arc_id=%s, reason=%s)",
-            reflected_arc_id, reason, exc_info=True,
-        )
-
-
-def _is_reflected_arc_tainted(reflected_arc_id: int | None) -> bool:
-    """Backward-compat alias for :func:`_is_reflection_restricted`."""
-    return _is_reflection_restricted(reflected_arc_id, None)
-
-
 async def handle_dispatch_actions(arc_id: int, arc_info: dict) -> None:
-    """Fan out reflection-proposed actions into one child arc per action."""
-    from carpenter.core.engine import template_manager
+    """Fan out reflection-proposed actions through the standard coding-change pipeline.
 
+    Each proposed action is routed to ``handle_invoke_coding_change``,
+    which picks the appropriate workflow template
+    (``coding-change`` / ``yaml-change`` / ``kb-change``) via
+    :func:`select_workflow_for_paths` and applies the standard force-human
+    gate for T1/T0 paths — the same path every other coding change takes.
+    """
     if arc_info.get("status") == "pending":
         arc_manager.update_status(arc_id, "active")
 
-    from ._subject import get_subject, subject_arc_ids
-
     parent_id = arc_info["parent_id"]
-    subject = get_subject(parent_id)
-    subject_ids = subject_arc_ids(subject)
 
     reflect_arc_id = find_sibling_arc_id(arc_id, "analyze")
     result = None
@@ -401,9 +270,10 @@ async def handle_dispatch_actions(arc_id: int, arc_info: dict) -> None:
     truncated_count = max(0, total_proposed - cap)
     proposed = proposed[:cap]
 
+    from carpenter.tool_backends import arc as arc_backend
+
     spawned_arcs: list[int] = []
     action_types: list[str] = []
-    any_restricted = False
 
     for i, action in enumerate(proposed):
         action_desc = (action.description or "").strip()
@@ -411,51 +281,19 @@ async def handle_dispatch_actions(arc_id: int, arc_info: dict) -> None:
         if not action_desc:
             continue
 
-        action_dict = {
-            "description": action_desc,
-            "target_path": action_target,
-        }
-        restricted = _is_batch_restricted(subject_ids, action_dict)
-        if restricted:
-            any_restricted = True
-        review_mode = "human" if restricted else "auto"
-
         action_type = action.action_type or "other"
         if action_type == "other":
             action_type = classify_action(action_desc)
-        template_name, prompt_name = _ACTION_TYPE_TO_TEMPLATE.get(
-            (action_type, review_mode),
-            _ACTION_TYPE_TO_TEMPLATE[("other", review_mode)],
-        )
 
-        template = template_manager.get_template_by_name(template_name)
-        if template is None:
-            logger.warning(
-                "dispatch-actions arc %d: template %r not found; skipping action %d",
-                arc_id, template_name, i,
-            )
-            continue
-
-        prompt_context = {"description": action_desc}
+        invoke_params: dict = {
+            "source_dir": "platform",
+            "prompt": action_desc,
+        }
         if action_target:
-            prompt_context["target_path"] = action_target
-        try:
-            rendered_goal = load_prompt_template(
-                prompt_name,
-                context=prompt_context,
-                subdirectory="reflections",
-            )
-        except FileNotFoundError:
-            rendered_goal = action_desc
+            invoke_params["affected_paths"] = [action_target]
 
         try:
-            child_arc_id = arc_manager.add_child(
-                parent_id=parent_id,
-                name=f"reflection-action-{i}",
-                goal=rendered_goal,
-                template_id=template["id"],
-            )
-            template_manager.instantiate_template(template["id"], child_arc_id)
+            invoke_result = arc_backend.handle_invoke_coding_change(invoke_params)
         except Exception:
             logger.exception(
                 "dispatch-actions arc %d: failed to spawn action %d (type=%s)",
@@ -463,47 +301,30 @@ async def handle_dispatch_actions(arc_id: int, arc_info: dict) -> None:
             )
             continue
 
+        if not isinstance(invoke_result, dict) or "arc_id" not in invoke_result:
+            logger.warning(
+                "dispatch-actions arc %d: invoke_coding_change returned no arc_id "
+                "for action %d: %r",
+                arc_id, i, invoke_result,
+            )
+            continue
+
+        child_arc_id = invoke_result["arc_id"]
+
         set_arc_state(child_arc_id, "action_type", action_type)
         set_arc_state(child_arc_id, "action_description", action_desc)
         if action_target:
             set_arc_state(child_arc_id, "action_target_path", action_target)
-        if restricted:
-            set_arc_state(child_arc_id, "_review_mode", "human")
-            try:
-                from carpenter.api.review import create_arc_approval_review
-                with db_connection() as db:
-                    gate_row = db.execute(
-                        "SELECT id FROM arcs WHERE parent_id = ? "
-                        "AND name = 'await-approval'",
-                        (child_arc_id,),
-                    ).fetchone()
-                if gate_row is not None:
-                    review = create_arc_approval_review(
-                        target_arc_id=child_arc_id,
-                        gate_arc_id=gate_row["id"],
-                        title=f"Reflection-proposed {action_type} action",
-                        action_description=action_desc,
-                        proposing_arc_id=parent_id,
-                    )
-                    set_arc_state(child_arc_id, "review_id", review["review_id"])
-                    set_arc_state(child_arc_id, "review_url", review["url"])
-            except Exception:
-                logger.exception(
-                    "dispatch-actions arc %d: failed to create arc-approval "
-                    "review for child arc %d", arc_id, child_arc_id,
-                )
+        set_arc_state(child_arc_id, "reflection_parent_arc_id", parent_id)
 
         spawned_arcs.append(child_arc_id)
         action_types.append(action_type)
-
-    is_tainted = any_restricted
 
     set_arc_state(arc_id, "_agent_response", {
         "spawned_arcs": spawned_arcs,
         "action_types": action_types,
         "total_proposed": total_proposed,
         "truncated": truncated_count,
-        "tainted": is_tainted,
     })
 
     arc_manager.update_status(arc_id, "completed")
@@ -514,7 +335,6 @@ async def handle_dispatch_actions(arc_id: int, arc_info: dict) -> None:
 
     logger.info(
         "dispatch-actions arc %d: spawned %d child arcs from %d proposed "
-        "actions (%d truncated by cap=%d, tainted=%s)",
+        "actions (%d truncated by cap=%d)",
         arc_id, len(spawned_arcs), total_proposed, truncated_count, cap,
-        is_tainted,
     )
