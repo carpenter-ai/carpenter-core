@@ -293,24 +293,36 @@ def _run(handler, arc_id):
 
 
 def test_period_pipeline_gather_then_save(pkg):
-    """End-to-end: gather populates the reflect arc's goal with the batch
-    framing for the period; save enqueues a by-day KB write."""
+    """End-to-end: gather writes a typed GatheredActivity output and the
+    dispatch handler renders the reflect step's goal from it; save
+    enqueues a by-day KB write."""
+    from carpenter.core.arcs.dispatch_handler import (
+        _render_goal_from_sibling_output,
+    )
+
     a1 = _insert_arc("goal-1", goal="alpha work")
     a2 = _insert_arc("goal-2", goal="beta work")
     root_id, gather_id, reflect_id, save_id, dispatch_id = (
         _build_period_reflection_tree([a1, a2], date="2026-06-19"))
 
-    # gather-activity → reflect arc's goal gets the batch block.
+    # gather-activity → typed GatheredActivity output on the gather arc;
+    # the reflect arc's goal column stays as the static step description.
     arc_manager.update_status(gather_id, "active")
     _run(pkg.step_handlers.handle_gather_activity, gather_id)
 
+    # Dispatch-time goal rendering picks up the sibling's typed output.
+    rendered = _render_goal_from_sibling_output(reflect_id)
+    assert rendered is not None
+    assert "batch of completed arcs" in rendered
+    assert "arc count: 2" in rendered
+    assert f"#{a1}" in rendered and f"#{a2}" in rendered
+
+    # The reflect arc's goal column was NOT mutated by the gather handler.
     with db_connection() as db:
         reflect_goal = db.execute(
             "SELECT goal FROM arcs WHERE id = ?", (reflect_id,),
         ).fetchone()["goal"]
-    assert "batch of completed arcs" in reflect_goal
-    assert "arc count: 2" in reflect_goal
-    assert f"#{a1}" in reflect_goal and f"#{a2}" in reflect_goal
+    assert "batch of completed arcs" not in reflect_goal
 
     # reflect produces output, then save-reflection enqueues the KB write.
     set_arc_state(reflect_id, "_agent_response", "Lessons: keep tests small.")
@@ -353,3 +365,105 @@ def test_period_pipeline_dispatch_actions_noop_completes(pkg):
             "SELECT status FROM arcs WHERE id = ?", (dispatch_id,),
         ).fetchone()["status"]
     assert status == "completed"
+
+
+# ── typed contract round-trip ───────────────────────────────────────
+
+
+def test_gather_activity_writes_typed_output(pkg):
+    """gather-activity writes a GatheredActivity retrievable via typed read."""
+    from carpenter.core.arcs.data_model_validation import validate_contract
+    from carpenter.core.engine.arc_outputs import get_arc_output
+
+    a1 = _insert_arc("goal-1", goal="alpha work")
+    a2 = _insert_arc("goal-2", goal="beta work")
+    root_id, gather_id, reflect_id, _, _ = (
+        _build_period_reflection_tree([a1, a2], date="2026-06-19"))
+
+    arc_manager.update_status(gather_id, "active")
+    _run(pkg.step_handlers.handle_gather_activity, gather_id)
+
+    raw = get_arc_output(gather_id, "gathered_activity")
+    assert raw is not None, "gather-activity did not write its typed output"
+
+    model = validate_contract(raw, "data_models.reflection:GatheredActivity")
+    assert model.subject_kind == "period"
+    assert sorted(model.source_arc_ids) == sorted([a1, a2])
+    assert model.window and model.window.get("date") == "2026-06-19"
+    assert "batch of completed arcs" in model.content
+
+
+def test_dispatch_reads_structured_proposed_actions(pkg):
+    """dispatch-actions reads the typed ReflectionResult from the reflect arc."""
+    a1 = _insert_arc("goal-1")
+    a2 = _insert_arc("goal-2")
+    _, _, reflect_id, _, dispatch_id = (
+        _build_period_reflection_tree([a1, a2]))
+
+    payload = json.dumps({
+        "summary": "noticed a recurring login regression",
+        "proposed_actions": [
+            {
+                "description": "Document the LRU caching pattern",
+                "target_path": None,
+                "action_type": "kb",
+            },
+            {
+                "description": "Tighten the login retry loop",
+                "target_path": None,
+                "action_type": "code",
+            },
+        ],
+    })
+    set_arc_state(reflect_id, "_agent_response", payload)
+    arc_manager.update_status(reflect_id, "active")
+    arc_manager.update_status(reflect_id, "completed")
+    arc_manager.update_status(dispatch_id, "active")
+
+    _run(pkg.step_handlers.handle_dispatch_actions, dispatch_id)
+
+    resp = get_arc_state(dispatch_id, "_agent_response")
+    assert resp["total_proposed"] == 2
+    assert resp["action_types"] == ["kb", "code"]
+    assert len(resp["spawned_arcs"]) == 2
+
+
+def test_end_to_end_typed_contracts(pkg):
+    """The full pipeline runs with typed contracts: gather → reflect → save → dispatch."""
+    a1 = _insert_arc("goal-1", goal="alpha work")
+    a2 = _insert_arc("goal-2", goal="beta work")
+    root_id, gather_id, reflect_id, save_id, dispatch_id = (
+        _build_period_reflection_tree([a1, a2], date="2026-06-20"))
+
+    arc_manager.update_status(gather_id, "active")
+    _run(pkg.step_handlers.handle_gather_activity, gather_id)
+
+    payload = json.dumps({
+        "summary": "the two arcs shared a flaky-test pattern",
+        "proposed_actions": [
+            {
+                "description": "create kb entry on flaky-test triage",
+                "target_path": None,
+                "action_type": "kb",
+            },
+        ],
+    })
+    set_arc_state(reflect_id, "_agent_response", payload)
+    arc_manager.update_status(reflect_id, "active")
+    arc_manager.update_status(reflect_id, "completed")
+
+    arc_manager.update_status(save_id, "active")
+    _run(pkg.step_handlers.handle_save_reflection, save_id)
+
+    payloads = _enqueued_kb_writes()
+    assert any(p["kb_path"] == "reflections/by-day/2026-06-20" for p in payloads)
+    by_day = next(p for p in payloads if p["kb_path"].startswith("reflections/by-day"))
+    assert "shared a flaky-test pattern" in by_day["content"]
+
+    arc_manager.update_status(dispatch_id, "active")
+    _run(pkg.step_handlers.handle_dispatch_actions, dispatch_id)
+
+    resp = get_arc_state(dispatch_id, "_agent_response")
+    assert resp["total_proposed"] == 1
+    assert resp["action_types"] == ["kb"]
+    assert len(resp["spawned_arcs"]) == 1

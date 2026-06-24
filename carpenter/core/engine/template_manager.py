@@ -273,7 +273,7 @@ def instantiate_template(template_id: int, parent_arc_id: int) -> list[int]:
         extra_kwargs = {}
         for step_key in ("agent_type", "integrity_level", "output_type",
                          "model", "model_role", "agent_role", "arc_role",
-                         "agent_model", "model_policy_id"):
+                         "agent_model", "model_policy_id", "output_contract"):
             if step_key in step:
                 extra_kwargs[step_key] = step[step_key]
 
@@ -353,6 +353,28 @@ def instantiate_template(template_id: int, parent_arc_id: int) -> list[int]:
                     "INSERT OR REPLACE INTO arc_state (arc_id, key, value_json) "
                     "VALUES (?, ?, ?)",
                     (arc_id, "_required_pass", json.dumps(True)),
+                )
+
+        # Persist dispatch-time goal-rendering config. When set, the arc
+        # dispatch handler renders ``goal_template`` against the named
+        # output of a preceding sibling arc (resolved by step role) and
+        # uses the rendered string as the agent goal — replacing the
+        # arc row's ``goal`` column only for the duration of the agent
+        # invocation. See ``dispatch_handler.handle_arc_dispatch``.
+        goal_template = step.get("goal_template")
+        if goal_template:
+            goal_cfg = {
+                "template": goal_template,
+                "subdir": step.get("goal_template_subdir", ""),
+                "sibling_role": step.get("goal_input_sibling_role"),
+                "output_name": step.get("goal_input_output_name"),
+                "input_field": step.get("goal_input_field"),
+            }
+            with db_transaction() as db:
+                db.execute(
+                    "INSERT OR REPLACE INTO arc_state (arc_id, key, value_json) "
+                    "VALUES (?, ?, ?)",
+                    (arc_id, "_goal_template_config", json.dumps(goal_cfg)),
                 )
 
         activation_event = step.get("activation_event")

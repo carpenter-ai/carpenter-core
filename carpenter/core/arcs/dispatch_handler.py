@@ -175,6 +175,17 @@ async def handle_arc_dispatch(work_id: int, payload: dict):
             goal = (arc_info.get("goal") or arc_info.get("name") or f"Arc #{arc_id}") if arc_info else f"Arc #{arc_id}"
             policy_id = arc_info.get("model_policy_id") if arc_info else None
 
+            # Dispatch-time goal rendering from a sibling's typed output.
+            # When a template step declares ``goal_template`` (see
+            # template_manager.instantiate_template), the engine reads
+            # the named output of the configured sibling and renders the
+            # prompt template at invocation time. This replaces the
+            # legacy pattern of UPDATE-ing the sibling arc's goal column
+            # from a preceding step's handler.
+            rendered_goal = _render_goal_from_sibling_output(arc_id)
+            if rendered_goal is not None:
+                goal = rendered_goal
+
             # JUDGE arcs: run deterministic platform code, not LLM agents
             if agent_type == "JUDGE":
                 await _run_judge_checks(arc_id)
@@ -752,6 +763,75 @@ def _try_inject_fetched_content(reviewer_arc_id: int) -> bool:
         reviewer_arc_id, len(result), review_target,
     )
     return True
+
+
+def _render_goal_from_sibling_output(arc_id: int) -> str | None:
+    """Render an arc's agent goal from a sibling arc's typed output.
+
+    Reads the ``_goal_template_config`` arc_state row written at
+    template instantiation time. When present, the config names a
+    prompt template, a sibling step role to read from, and the output
+    name + optional field on that sibling whose value is passed as the
+    template context. Returns the rendered string, or ``None`` when
+    the arc has no config or any required piece is missing.
+
+    The lookup is intentionally tolerant: if the sibling output is not
+    yet present, or the prompt template cannot be loaded, the function
+    returns None so the caller falls back to the arc's static goal
+    column.
+    """
+    from ..engine.arc_outputs import get_sibling_output
+    from ..workflows._arc_state import get_arc_state
+    from ...prompts import load_prompt_template
+
+    cfg = get_arc_state(arc_id, "_goal_template_config")
+    if not cfg:
+        return None
+
+    template_name = cfg.get("template")
+    sibling_role = cfg.get("sibling_role")
+    output_name = cfg.get("output_name")
+    if not template_name or not sibling_role or not output_name:
+        return None
+
+    sibling_output = get_sibling_output(arc_id, sibling_role, output_name)
+    if sibling_output is None:
+        logger.debug(
+            "arc %d goal-template: sibling output %r on role %r not found",
+            arc_id, output_name, sibling_role,
+        )
+        return None
+
+    input_field = cfg.get("input_field")
+    if input_field:
+        if isinstance(sibling_output, dict):
+            field_value = sibling_output.get(input_field)
+        else:
+            field_value = getattr(sibling_output, input_field, None)
+        if field_value is None:
+            logger.debug(
+                "arc %d goal-template: field %r not on sibling output",
+                arc_id, input_field,
+            )
+            return None
+        context = {input_field: field_value}
+    else:
+        context = (
+            dict(sibling_output) if isinstance(sibling_output, dict)
+            else {"value": sibling_output}
+        )
+
+    subdir = cfg.get("subdir", "") or ""
+    try:
+        return load_prompt_template(
+            template_name, context=context, subdirectory=subdir,
+        )
+    except FileNotFoundError:
+        logger.warning(
+            "arc %d goal-template: template %r not found in subdir %r",
+            arc_id, template_name, subdir,
+        )
+        return None
 
 
 def _find_arc_conversation(arc_id: int, _depth: int = 0) -> int | None:
