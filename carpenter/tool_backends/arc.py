@@ -674,6 +674,11 @@ def handle_invoke_coding_change(params: dict) -> dict:
     prompt = params.get("prompt", "")
     conversation_id = params.get("conversation_id")
     coding_agent = params.get("coding_agent")
+    # Optional: place the new change arc INSIDE an existing arc tree so
+    # failures escalate up the ancestor chain (e.g. reflection-spawned
+    # actions live under the reflection SUPERVISOR root). Absent/None
+    # preserves the original ROOT behavior for all other callers.
+    parent_id = params.get("parent_id")
     affected_paths = params.get("affected_paths") or []
     if not isinstance(affected_paths, list):
         affected_paths = []
@@ -742,6 +747,7 @@ def handle_invoke_coding_change(params: dict) -> dict:
     arc_id = arc_manager.create_arc(
         name=arc_name,
         goal=prompt,
+        parent_id=parent_id,
         model_policy_id=policy_id,  # Apply context-aware model policy
         template_id=template_id     # Link to workflow template
     )

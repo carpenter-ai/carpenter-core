@@ -37,8 +37,8 @@ def test_load_writing_repo_template(tmp_path):
 def test_load_templates_from_dir(tmp_path):
     templates_dir = _copy_templates(tmp_path)
     count = template_manager.load_templates_from_dir(templates_dir)
-    # 12 pre-existing + yaml-change + kb-change (PR 5)
-    assert count == 14
+    # 10 standard templates after removing the 4 reflection-action variants.
+    assert count == 10
     templates = template_manager.list_templates()
     names = [t["name"] for t in templates]
     assert "writing-repo-change" in names
@@ -47,16 +47,16 @@ def test_load_templates_from_dir(tmp_path):
     assert "external-coding-change" in names
     assert "pr-review" in names
     assert "reflection" in names
-    assert "reflection-kb-action" in names
-    assert "reflection-code-action" in names
-    # Gated variants spawned for tainted reflections
-    assert "reflection-kb-action-gated" in names
-    assert "reflection-code-action-gated" in names
-    # skill-kb-review now ships as a template package (phase E2)
     assert "skill-kb-review" in names
-    # PR 5: yaml-change and kb-change templates
     assert "yaml-change" in names
     assert "kb-change" in names
+    for removed in (
+        "reflection-kb-action",
+        "reflection-code-action",
+        "reflection-kb-action-gated",
+        "reflection-code-action-gated",
+    ):
+        assert removed not in names
 
 
 def test_find_template_for_resource(tmp_path):

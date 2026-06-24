@@ -8,7 +8,6 @@ the *period* path proper:
 
 - ``activity_gatherer.gather_from_subject`` batch / single-arc / theme
   framing.
-- ``step_handlers._is_batch_restricted`` taint roll-up over a list of arcs.
 - ``reflection_storage.save_reflection`` KB keying for a period subject
   (vs. the legacy int-arg form).
 - An end-to-end run of the three Python step handlers against a real DB
@@ -102,6 +101,27 @@ def pkg(tmp_path):
     handler_registry.clear_registry()
 
 
+@pytest.fixture
+def stub_invoke(monkeypatch):
+    """Stub ``handle_invoke_coding_change`` so dispatch tests don't need a
+    fully-wired platform_server_dir + workspace_manager setup. The invoke
+    entry point is covered by ``tests/templates/test_workflow_selection.py``.
+    """
+    from carpenter.tool_backends import arc as arc_backend
+
+    calls: list[dict] = []
+
+    def fake_invoke(params: dict) -> dict:
+        calls.append(dict(params))
+        arc_id = arc_manager.create_arc(
+            name="coding-change-stub", goal=params.get("prompt", ""),
+        )
+        return {"arc_id": arc_id}
+
+    monkeypatch.setattr(arc_backend, "handle_invoke_coding_change", fake_invoke)
+    return calls
+
+
 def _insert_arc(name, *, status="completed", parent_id=None, goal=None,
                 integrity_level="trusted"):
     """Insert an arc row directly with a recent ISO timestamp."""
@@ -191,31 +211,6 @@ def test_gather_from_subject_theme_lists_kb_updates(pkg):
     assert "## Updates" in block
     assert "skills/caching/lru" in block
     assert "(none found under this prefix)" not in block
-
-
-# ── step_handlers._is_batch_restricted ──────────────────────────────
-
-
-def test_is_batch_restricted_true_when_any_arc_non_trusted(pkg):
-    """One non-trusted arc in the batch restricts the whole batch."""
-    clean = _insert_arc("clean", integrity_level="trusted")
-    tainted = _insert_arc("tainted", integrity_level="untrusted")
-
-    assert pkg.step_handlers._is_batch_restricted([clean, tainted], None) is True
-
-
-def test_is_batch_restricted_false_when_all_trusted(pkg):
-    """All-trusted batch is unrestricted."""
-    a1 = _insert_arc("a", integrity_level="trusted")
-    a2 = _insert_arc("b", integrity_level="trusted")
-
-    assert pkg.step_handlers._is_batch_restricted([a1, a2], None) is False
-
-
-def test_is_batch_restricted_empty_list_falls_back(pkg):
-    """An empty arc list falls back to the path/category arm via
-    ``_is_reflection_restricted(None, ...)`` — with no action, unrestricted."""
-    assert pkg.step_handlers._is_batch_restricted([], None) is False
 
 
 # ── reflection_storage.save_reflection ──────────────────────────────
@@ -393,7 +388,7 @@ def test_gather_activity_writes_typed_output(pkg):
     assert "batch of completed arcs" in model.content
 
 
-def test_dispatch_reads_structured_proposed_actions(pkg):
+def test_dispatch_reads_structured_proposed_actions(pkg, stub_invoke):
     """dispatch-actions reads the typed ReflectionResult from the reflect arc."""
     a1 = _insert_arc("goal-1")
     a2 = _insert_arc("goal-2")
@@ -428,7 +423,7 @@ def test_dispatch_reads_structured_proposed_actions(pkg):
     assert len(resp["spawned_arcs"]) == 2
 
 
-def test_end_to_end_typed_contracts(pkg):
+def test_end_to_end_typed_contracts(pkg, stub_invoke):
     """The full pipeline runs with typed contracts: gather → reflect → save → dispatch."""
     a1 = _insert_arc("goal-1", goal="alpha work")
     a2 = _insert_arc("goal-2", goal="beta work")
