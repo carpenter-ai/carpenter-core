@@ -285,9 +285,14 @@ async def handle_dispatch_actions(arc_id: int, arc_info: dict) -> None:
         if action_type == "other":
             action_type = classify_action(action_desc)
 
+        # Parent the spawned change arc under THIS dispatch-actions arc so
+        # the action lives inside the reflection tree. When the action fails,
+        # _notify_parent_of_failure walks ancestors and finds the reflection
+        # SUPERVISOR root (dispatch-actions's parent), waking it.
         invoke_params: dict = {
             "source_dir": "platform",
             "prompt": action_desc,
+            "parent_id": arc_id,
         }
         if action_target:
             invoke_params["affected_paths"] = [action_target]

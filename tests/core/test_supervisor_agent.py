@@ -295,3 +295,79 @@ def test_supervisor_capability_present():
 def test_validate_agent_type_accepts_supervisor():
     from carpenter.core.trust.types import validate_agent_type
     assert validate_agent_type("SUPERVISOR") == "SUPERVISOR"
+
+
+# ── Chain escalation: grandchild fails → SUPERVISOR grandparent wakes ──
+
+
+def test_grandchild_failure_wakes_supervisor_ancestor():
+    """When a grandchild fails and its direct parent is NOT a SUPERVISOR,
+    the wake should still fire on a SUPERVISOR ancestor further up the tree.
+    This is the case for reflection-spawned action arcs: parent is the
+    (frozen) dispatch-actions template step, grandparent is the reflection
+    SUPERVISOR root which must wake.
+    """
+    sup = arc_manager.create_arc("reflection-root", agent_type="SUPERVISOR")
+    arc_manager.update_status(sup, "active")
+    # Intermediate parent: a worker step that completes BEFORE the
+    # grandchild fails (mirroring dispatch-actions which freezes after
+    # spawning its action arcs).
+    intermediate = arc_manager.add_child(sup, "dispatch-actions", goal="spawn")
+    arc_manager.update_status(sup, "waiting")
+    arc_manager.update_status(intermediate, "active")
+    # Grandchild: created as a child of the intermediate (not via add_child,
+    # since that rejects frozen parents — but create_arc with parent_id is
+    # the path handle_invoke_coding_change now uses).
+    grandchild = arc_manager.create_arc(
+        "action", goal="risky action", parent_id=intermediate,
+    )
+    arc_manager.update_status(intermediate, "completed")
+    arc_manager.freeze_arc(intermediate)
+
+    arc_manager.update_status(grandchild, "active")
+    arc_manager.update_status(grandchild, "failed")
+
+    wakes = _work_items("arc.supervisor_wake")
+    assert len(wakes) == 1
+    payload = json.loads(wakes[0]["payload_json"])
+    assert payload["parent_id"] == sup
+
+    failures = _arc_state(sup, "_pending_failures")
+    assert failures is not None and len(failures) == 1
+    assert failures[0]["child_id"] == grandchild
+    assert failures[0]["child_name"] == "action"
+
+
+def test_chain_escalation_no_double_notify_when_direct_parent_is_supervisor():
+    """When the direct parent IS a SUPERVISOR ancestor, the wake fires
+    exactly once — the chain-walk branch must skip to avoid double-notify."""
+    sup = arc_manager.create_arc("sup", agent_type="SUPERVISOR")
+    arc_manager.update_status(sup, "active")
+    child = arc_manager.add_child(sup, "child", goal="risky")
+    arc_manager.update_status(sup, "waiting")
+    arc_manager.update_status(child, "active")
+    arc_manager.update_status(child, "failed")
+
+    wakes = _work_items("arc.supervisor_wake")
+    assert len(wakes) == 1
+    failures = _arc_state(sup, "_pending_failures")
+    assert failures is not None and len(failures) == 1
+
+
+def test_no_supervisor_ancestor_no_wake():
+    """Without a SUPERVISOR ancestor anywhere, no wake is enqueued (the
+    existing replan/fail/human/escalate policy paths are unaffected)."""
+    root = arc_manager.create_arc("root")
+    arc_manager.update_status(root, "active")
+    intermediate = arc_manager.add_child(root, "step", goal="work")
+    arc_manager.update_status(root, "waiting")
+    arc_manager.update_status(intermediate, "active")
+    grandchild = arc_manager.create_arc(
+        "leaf", goal="leaf", parent_id=intermediate,
+    )
+    arc_manager.update_status(intermediate, "completed")
+    arc_manager.freeze_arc(intermediate)
+    arc_manager.update_status(grandchild, "active")
+    arc_manager.update_status(grandchild, "failed")
+
+    assert _work_items("arc.supervisor_wake") == []

@@ -1041,12 +1041,39 @@ def _notify_supervisor_parent(parent_id: int, failed_child: dict) -> None:
         )
 
 
+def _find_supervisor_ancestor(start_arc_id: int) -> int | None:
+    """Walk up the parent chain from ``start_arc_id`` (exclusive) and return
+    the id of the nearest ancestor with ``agent_type='SUPERVISOR'`` whose
+    status is ``waiting``. Returns None if no such ancestor exists.
+
+    Used by failure-escalation to chain past terminal/template intermediate
+    parents (e.g. a frozen ``dispatch-actions`` template step) so a passive
+    SUPERVISOR root still wakes when its grandchildren fail.
+    """
+    arc = get_arc(start_arc_id)
+    if arc is None:
+        return None
+    cur_parent_id = arc["parent_id"]
+    while cur_parent_id is not None:
+        ancestor = get_arc(cur_parent_id)
+        if ancestor is None:
+            return None
+        if ancestor["agent_type"] == "SUPERVISOR" and ancestor["status"] == "waiting":
+            return cur_parent_id
+        cur_parent_id = ancestor["parent_id"]
+    return None
+
+
 def _notify_parent_of_failure(arc_id: int) -> None:
     """Notify the parent arc when a child fails.
 
     Called from update_status() after a child transitions to 'failed'.
     Enqueues an 'arc.child_failed' work item so the parent can be
     re-invoked to create alternatives or propagate failure.
+
+    Failures also chain to the nearest SUPERVISOR ancestor (if any) so a
+    passive SUPERVISOR root wakes even when the failing arc's immediate
+    parent is a terminal/template step that cannot itself replan.
     """
     arc = get_arc(arc_id)
     if arc is None:
@@ -1061,7 +1088,16 @@ def _notify_parent_of_failure(arc_id: int) -> None:
     if parent is None:
         return
 
-    # Only notify if parent is waiting for children
+    # Chain escalation: if a SUPERVISOR ancestor exists in 'waiting',
+    # notify it regardless of what the direct parent does below. The
+    # direct-parent SUPERVISOR case is handled by the dedicated branch
+    # further down, so skip the walk for that case to avoid double-notify.
+    if not (parent["agent_type"] == "SUPERVISOR" and parent["status"] == "waiting"):
+        sup_ancestor = _find_supervisor_ancestor(arc_id)
+        if sup_ancestor is not None:
+            _notify_supervisor_parent(sup_ancestor, arc)
+
+    # Only notify direct parent if it is waiting for children
     if parent["status"] != "waiting":
         return
 

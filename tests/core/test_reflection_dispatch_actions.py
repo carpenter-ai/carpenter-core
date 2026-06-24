@@ -88,6 +88,7 @@ class _StubInvoke:
         arc_id = arc_manager.create_arc(
             name=f"coding-change: {params.get('prompt', '')[:30]}",
             goal=params.get("prompt", ""),
+            parent_id=params.get("parent_id"),
         )
         return {"arc_id": arc_id}
 
@@ -222,6 +223,14 @@ def test_three_proposed_actions_spawn_three_arcs(tmp_path, stub_invoke):
         assert get_arc_state(spawned_id, "action_type") is not None
         assert get_arc_state(spawned_id, "action_description")
         assert get_arc_state(spawned_id, "reflection_parent_arc_id") == root_id
+        # Action arcs are children of the dispatch-actions arc, NOT roots,
+        # so failure escalation can chain up to the reflection SUPERVISOR.
+        spawned = arc_manager.get_arc(spawned_id)
+        assert spawned["parent_id"] == dispatch_id
+
+    # And each spawned arc forwarded parent_id in the invoke params.
+    for call in stub_invoke.calls:
+        assert call["parent_id"] == dispatch_id
 
 
 def test_ten_actions_truncated_to_cap(tmp_path, monkeypatch, stub_invoke):
@@ -309,7 +318,11 @@ def test_invoke_failure_skips_action_continues_with_others(tmp_path, monkeypatch
         call_count["n"] += 1
         if call_count["n"] == 1:
             raise RuntimeError("simulated invoke failure")
-        arc_id = arc_manager.create_arc(name="ok", goal=params.get("prompt", ""))
+        arc_id = arc_manager.create_arc(
+            name="ok",
+            goal=params.get("prompt", ""),
+            parent_id=params.get("parent_id"),
+        )
         return {"arc_id": arc_id}
 
     monkeypatch.setattr(arc_backend, "handle_invoke_coding_change", flaky_invoke)
