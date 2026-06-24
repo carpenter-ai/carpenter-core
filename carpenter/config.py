@@ -431,8 +431,13 @@ DEFAULTS = {
     # registered by the reflection template package emits ``reflection.daily_tick``;
     # the handler batches arcs completed since the last tick into ``period``
     # reflections of at most ``batch_size`` arcs each.
+    #
+    # The cadence model replaces a per-arc trigger that could form an
+    # unbounded feedback loop (reflection → skill-kb-review → reflection → …).
+    # ``daily_cron`` is evaluated in UTC; a fixed UTC expression drifts an
+    # hour seasonally for local-time observers in DST zones.
     "reflection": {
-        "daily_cron": "0 4 * * *",          # 04:00 daily
+        "daily_cron": "0 4 * * *",          # 04:00 UTC daily
         "batch_size": 20,                    # arcs per period reflection
         "max_actions_per_reflection": 5,     # fan-out cap for proposed actions
     },

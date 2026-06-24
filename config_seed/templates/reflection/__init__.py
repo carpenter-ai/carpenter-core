@@ -1,18 +1,22 @@
 """Reflection workflow template package.
 
 Ships the ``reflection`` template alongside its Python step handlers and
-the per-arc activity gatherer. The engine's template loader imports this
-module at startup and calls :func:`register_handlers`, which wires the
-three Python-only step roles (``prepare``, ``persist``, ``dispatch``)
-into the handler registry so dispatch routes them here instead of
-invoking an LLM agent.
+the activity gatherer. The engine's template loader imports this module
+at startup and calls :func:`register_handlers`, which wires the three
+Python-only step roles (``prepare``, ``persist``, ``dispatch``) into the
+handler registry so dispatch routes them here instead of invoking an LLM
+agent. :func:`register_handlers` also calls :func:`_register_cadence` to
+install the daily cron that drives the pipeline.
 
-Reflection triggers on ``arc.status_changed`` events for root arcs
-reaching ``completed`` status; the subscription that fires it is
-declared in ``reflection.yaml`` under ``triggers:`` and loaded at
-startup by ``template_manager.load_template_triggers``. There is no
-longer any cadence-based timer and no coordinator-side wiring: the
-template is fully self-contained.
+Reflection is driven by a **daily cadence**, NOT per-arc completion. A
+cron (default ``0 4 * * *``, overridable via ``reflection.daily_cron``)
+emits ``reflection.daily_tick``; :func:`daily_tick.handle_reflection_tick`
+batches the root arcs that completed since the last tick into ``period``
+reflection arcs. This replaces an earlier ``arc.status_changed`` trigger
+that could form an unbounded feedback loop: a reflection's actions
+writing to ``skills/`` spawned a ``skill-kb-review`` root arc, whose
+completion re-triggered the reflection, and so on. A cadence that runs
+once/day over a bounded batch cannot loop.
 """
 
 from __future__ import annotations
