@@ -25,6 +25,7 @@ class AgentType(str, Enum):
     REVIEWER = "REVIEWER"
     JUDGE = "JUDGE"
     CHAT = "CHAT"
+    SUPERVISOR = "SUPERVISOR"
 
 
 # Hardcoded fallback defaults — overridable via config["agent_capabilities"].
@@ -97,6 +98,19 @@ _DEFAULT_AGENT_CAPABILITIES = {
     AgentType.CHAT: {
         "can_create_untrusted_arcs": True,
         "allowed_tools": None,  # all tools via normal chat dispatch
+    },
+    AgentType.SUPERVISOR: {
+        "can_create_untrusted_arcs": True,
+        "allowed_tools": frozenset({
+            "arc.create", "arc.add_child", "arc.cancel", "arc.update_status",
+            "arc.get", "arc.get_children", "arc.get_history",
+            "arc.get_plan", "arc.get_children_plan",
+            "state.get", "state.list",
+            "messaging.send", "messaging.ask",
+            "resource.create",
+            "resource.write",
+            "web.fetch_webpage_to_resource",
+        }),
     },
 }
 

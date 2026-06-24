@@ -69,7 +69,7 @@ _VALID_STEP_KEYS = frozenset({
 })
 
 _VALID_AGENT_TYPES = frozenset({
-    "PLANNER", "EXECUTOR", "REVIEWER", "JUDGE", "CHAT",
+    "PLANNER", "EXECUTOR", "REVIEWER", "JUDGE", "CHAT", "SUPERVISOR",
 })
 
 _VALID_INTEGRITY_LEVELS = frozenset({
