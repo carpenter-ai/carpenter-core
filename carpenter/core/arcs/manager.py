@@ -988,6 +988,12 @@ def is_frozen(arc_id: int) -> bool:
 
 
 def _notify_supervisor_parent(parent_id: int, failed_child: dict) -> None:
+    """Append a failure record to a SUPERVISOR parent's pending list and enqueue a wake.
+
+    Concurrent failures coalesce on idempotency_key ``supervisor_wake:<parent_id>``;
+    the wake handler reads-and-clears ``_pending_failures`` atomically so no records
+    are lost between the append and the dispatch.
+    """
     from datetime import datetime, timezone
     import json as _json
 

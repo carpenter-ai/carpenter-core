@@ -38,9 +38,6 @@ def _format_failure_summary(failures: list) -> str:
         goal = f.get("child_goal")
         if goal:
             lines.append(f"   Goal: {goal}")
-        err = f.get("error_info")
-        if err:
-            lines.append(f"   Error: {err}")
     return "\n".join(lines)
 
 
