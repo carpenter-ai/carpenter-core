@@ -486,3 +486,131 @@ async def test_handler_invokes_chat_with_correct_params():
     assert kwargs["conversation_id"] == conv_id
     assert kwargs["_message_already_saved"] is True
     assert kwargs["_system_triggered"] is True
+
+
+# ── Pending-review URL surfacing ─────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_handler_appends_pending_review_urls():
+    """When a completed arc has gated children with review_url in arc_state,
+    the notification message lists those URLs under 'Pending reviews:'."""
+    parent_id = arc_manager.create_arc("reflection-root")
+    arc_manager.update_status(parent_id, "active")
+    set_arc_state(parent_id, "_agent_response", "reflection done")
+
+    # Gated child with a stored review URL
+    child_id = arc_manager.add_child(parent_id, "reflection-action-0")
+    set_arc_state(child_id, "_review_mode", "human")
+    set_arc_state(child_id, "review_url", "/api/review/abc-123")
+
+    arc_manager.update_status(parent_id, "completed")
+
+    conv_id = conversation.get_or_create_conversation()
+    db = get_db()
+    try:
+        db.execute(
+            "INSERT INTO conversation_arcs (conversation_id, arc_id) VALUES (?, ?)",
+            (conv_id, parent_id),
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    mock_run = AsyncMock()
+    with patch(
+        "carpenter.core.workflows.arc_notify_handler.thread_pools.run_in_work_pool",
+        mock_run,
+    ):
+        await handle_arc_chat_notify(1, {"arc_id": parent_id})
+
+    msgs = conversation.get_messages(conv_id)
+    system_msgs = [m for m in msgs if m["role"] == "system"]
+    assert len(system_msgs) == 1
+    content = system_msgs[0]["content"]
+    assert "Pending reviews:" in content
+    assert "/api/review/abc-123" in content
+
+
+@pytest.mark.asyncio
+async def test_handler_absolutizes_review_urls_when_public_base_url_set():
+    """When config.public_base_url is set, relative review URLs are
+    prefixed for off-host delivery (e.g. Signal)."""
+    from carpenter import config as cfg
+
+    parent_id = arc_manager.create_arc("reflection-root")
+    arc_manager.update_status(parent_id, "active")
+    set_arc_state(parent_id, "_agent_response", "ok")
+
+    child_id = arc_manager.add_child(parent_id, "reflection-action-0")
+    set_arc_state(child_id, "_review_mode", "human")
+    set_arc_state(child_id, "review_url", "/api/review/xyz-789")
+
+    arc_manager.update_status(parent_id, "completed")
+
+    conv_id = conversation.get_or_create_conversation()
+    db = get_db()
+    try:
+        db.execute(
+            "INSERT INTO conversation_arcs (conversation_id, arc_id) VALUES (?, ?)",
+            (conv_id, parent_id),
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    saved = cfg.CONFIG.get("public_base_url", "")
+    cfg.CONFIG["public_base_url"] = "https://example.test"
+    try:
+        mock_run = AsyncMock()
+        with patch(
+            "carpenter.core.workflows.arc_notify_handler.thread_pools.run_in_work_pool",
+            mock_run,
+        ):
+            await handle_arc_chat_notify(1, {"arc_id": parent_id})
+    finally:
+        cfg.CONFIG["public_base_url"] = saved
+
+    msgs = conversation.get_messages(conv_id)
+    system_msgs = [m for m in msgs if m["role"] == "system"]
+    assert "https://example.test/api/review/xyz-789" in system_msgs[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_handler_skips_review_url_for_terminal_children():
+    """Pending-review children that are already cancelled/completed/failed
+    should NOT be surfaced — they're no longer actionable."""
+    parent_id = arc_manager.create_arc("reflection-root")
+    arc_manager.update_status(parent_id, "active")
+    set_arc_state(parent_id, "_agent_response", "ok")
+
+    child_id = arc_manager.add_child(parent_id, "reflection-action-0")
+    set_arc_state(child_id, "_review_mode", "human")
+    set_arc_state(child_id, "review_url", "/api/review/abc-123")
+    # Child went terminal (e.g. user already rejected)
+    arc_manager.update_status(child_id, "active")
+    arc_manager.update_status(child_id, "cancelled")
+
+    arc_manager.update_status(parent_id, "completed")
+
+    conv_id = conversation.get_or_create_conversation()
+    db = get_db()
+    try:
+        db.execute(
+            "INSERT INTO conversation_arcs (conversation_id, arc_id) VALUES (?, ?)",
+            (conv_id, parent_id),
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    mock_run = AsyncMock()
+    with patch(
+        "carpenter.core.workflows.arc_notify_handler.thread_pools.run_in_work_pool",
+        mock_run,
+    ):
+        await handle_arc_chat_notify(1, {"arc_id": parent_id})
+
+    msgs = conversation.get_messages(conv_id)
+    system_msgs = [m for m in msgs if m["role"] == "system"]
+    assert "Pending reviews:" not in system_msgs[0]["content"]

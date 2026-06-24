@@ -379,3 +379,177 @@ def test_create_review_missing_required_field():
         json={"reviewer": "someone"},
     )
     assert response.status_code == 500
+
+
+# ── Arc-approval reviews ────────────────────────────────────────────
+
+
+def test_create_arc_approval_review_returns_url():
+    """create_arc_approval_review returns review_id + URL and stores the
+    target/gate/proposing arc ids."""
+    review.clear_reviews()
+    target_id = arc_manager.create_arc("target-action")
+    gate_id = arc_manager.add_child(target_id, "await-approval")
+    proposing_id = arc_manager.create_arc("reflection-root")
+
+    out = review.create_arc_approval_review(
+        target_arc_id=target_id,
+        gate_arc_id=gate_id,
+        title="Test approval",
+        action_description="Do the thing",
+        proposing_arc_id=proposing_id,
+    )
+
+    assert out["url"].startswith("/api/review/")
+    stored = review.get_review(out["review_id"])
+    assert stored["review_type"] == "arc-approval"
+    assert stored["target_arc_id"] == target_id
+    assert stored["gate_arc_id"] == gate_id
+    assert stored["proposing_arc_id"] == proposing_id
+    assert stored["action_description"] == "Do the thing"
+
+
+def test_view_arc_approval_renders_html(client):
+    """The arc-approval page renders title, description, Approve, Reject."""
+    target_id = arc_manager.create_arc("target-action")
+    gate_id = arc_manager.add_child(target_id, "await-approval")
+    proposing_id = arc_manager.create_arc("reflection-root")
+
+    out = review.create_arc_approval_review(
+        target_arc_id=target_id,
+        gate_arc_id=gate_id,
+        title="Approve this reflection action",
+        action_description="Add a config knob for foo",
+        proposing_arc_id=proposing_id,
+    )
+
+    resp = client.get(out["url"])
+    assert resp.status_code == 200
+    assert "text/html" in resp.headers["content-type"]
+    assert "Approve this reflection action" in resp.text
+    assert "Add a config knob for foo" in resp.text
+    assert ">Approve<" in resp.text
+    assert ">Reject<" in resp.text
+    # No "Revise" button — arc-approval is binary.
+    assert ">Revise<" not in resp.text
+
+
+def test_arc_approval_approve_emits_manual_trigger(client):
+    """Approving an arc-approval review records an arc.manual_trigger
+    event whose payload references the gate arc id."""
+    import json as _json
+
+    target_id = arc_manager.create_arc("target-action")
+    gate_id = arc_manager.add_child(target_id, "await-approval")
+
+    out = review.create_arc_approval_review(
+        target_arc_id=target_id,
+        gate_arc_id=gate_id,
+        title="t",
+        action_description="d",
+    )
+    review_id = out["review_id"]
+
+    decide_resp = client.post(
+        f"/api/review/{review_id}/decide",
+        json={"decision": "approve"},
+    )
+    assert decide_resp.status_code == 200
+
+    db = get_db()
+    try:
+        rows = db.execute(
+            "SELECT payload_json FROM events WHERE event_type = ?",
+            ("arc.manual_trigger",),
+        ).fetchall()
+    finally:
+        db.close()
+    assert len(rows) == 1
+    payload = _json.loads(rows[0]["payload_json"])
+    assert payload["arc_id"] == gate_id
+    assert payload["target_arc_id"] == target_id
+
+
+def test_arc_approval_reject_cancels_target_arc(client):
+    """Rejecting an arc-approval review cancels the target action arc."""
+    target_id = arc_manager.create_arc("target-action")
+    arc_manager.add_child(target_id, "await-approval")
+
+    out = review.create_arc_approval_review(
+        target_arc_id=target_id,
+        gate_arc_id=999999,  # irrelevant for reject path
+        title="t",
+        action_description="d",
+    )
+    review_id = out["review_id"]
+
+    decide_resp = client.post(
+        f"/api/review/{review_id}/decide",
+        json={"decision": "reject"},
+    )
+    assert decide_resp.status_code == 200
+
+    target = arc_manager.get_arc(target_id)
+    assert target["status"] == "cancelled"
+
+
+def test_arc_approval_review_one_shot(client):
+    """A second decision on the same arc-approval review returns 410."""
+    target_id = arc_manager.create_arc("target-action")
+    gate_id = arc_manager.add_child(target_id, "await-approval")
+
+    out = review.create_arc_approval_review(
+        target_arc_id=target_id,
+        gate_arc_id=gate_id,
+        title="t",
+        action_description="d",
+    )
+    review_id = out["review_id"]
+
+    client.post(f"/api/review/{review_id}/decide", json={"decision": "approve"})
+    resp2 = client.post(
+        f"/api/review/{review_id}/decide", json={"decision": "reject"}
+    )
+    assert resp2.status_code == 410
+
+
+def test_arc_approval_approve_unblocks_gate_check_activation(client):
+    """End-to-end: approve → recorded arc.manual_trigger event → mark
+    processed → gate's check_activation returns True."""
+    from carpenter.db import db_transaction
+
+    target_id = arc_manager.create_arc("target-action")
+    gate_id = arc_manager.add_child(target_id, "await-approval")
+
+    # Register the gate's activation requirement on arc.manual_trigger,
+    # mirroring what the gated reflection template instantiation does.
+    db = get_db()
+    try:
+        db.execute(
+            "INSERT INTO arc_activations (arc_id, event_type) VALUES (?, ?)",
+            (gate_id, "arc.manual_trigger"),
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    out = review.create_arc_approval_review(
+        target_arc_id=target_id,
+        gate_arc_id=gate_id,
+        title="t",
+        action_description="d",
+    )
+
+    # Gate is blocked before approval.
+    assert arc_manager.check_activation(gate_id) is False
+
+    client.post(f"/api/review/{out['review_id']}/decide", json={"decision": "approve"})
+
+    # The event was recorded; mark it processed so check_activation sees it.
+    with db_transaction() as db:
+        db.execute(
+            "UPDATE events SET processed = TRUE WHERE event_type = ?",
+            ("arc.manual_trigger",),
+        )
+
+    assert arc_manager.check_activation(gate_id) is True

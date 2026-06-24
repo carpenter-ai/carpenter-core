@@ -217,6 +217,58 @@ async def create_diff_review_endpoint(request: Request):
     ))
 
 
+def create_arc_approval_review(
+    target_arc_id: int,
+    gate_arc_id: int,
+    title: str,
+    action_description: str,
+    proposing_arc_id: int | None = None,
+    reviewer: str = "user",
+) -> dict:
+    """Create a one-time arc-approval review link.
+
+    Used when a reflection arc spawns a tainted child action arc whose
+    first step is an ``await-approval`` gate blocked on
+    ``arc.manual_trigger``. The link lets the human approve (emit the
+    trigger) or reject (cancel the target arc).
+
+    Args:
+        target_arc_id: The action arc whose dispatch is being gated. On
+            reject, this arc is cancelled.
+        gate_arc_id: The ``await-approval`` step arc whose activation
+            event we'll emit on approve.
+        title: Short title for the review page.
+        action_description: Human-readable description of the proposed
+            action (typically the parsed proposed-action text).
+        proposing_arc_id: The reflection arc that proposed this action
+            (shown for context).
+        reviewer: Reviewer name/ID for audit logging.
+
+    Returns dict with ``review_id`` and ``url``.
+    """
+    review_id = str(uuid.uuid4())
+
+    _review_links[review_id] = {
+        "review_type": "arc-approval",
+        "target_arc_id": target_arc_id,
+        "gate_arc_id": gate_arc_id,
+        "proposing_arc_id": proposing_arc_id,
+        "title": title,
+        "action_description": action_description,
+        "reviewer": reviewer,
+        # arc_id is set so submit_decision's existing arc-history logging
+        # path attributes the review to the target arc.
+        "arc_id": target_arc_id,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "used": False,
+    }
+
+    return {
+        "review_id": review_id,
+        "url": f"/api/review/{review_id}",
+    }
+
+
 def _render_diff_html(diff_content: str) -> str:
     """Render a unified diff as HTML with green/red line coloring."""
     lines = []
@@ -257,6 +309,8 @@ async def view_review(request: Request):
 
     if review_type == "diff":
         return _render_diff_review_page(review_id, review)
+    elif review_type == "arc-approval":
+        return _render_arc_approval_page(review_id, review)
     else:
         return _render_code_review_page(review_id, review)
 
@@ -329,6 +383,98 @@ def _render_qqr_block(qqr_signal: object) -> str:
         'the user request. It does NOT see chat history.'
         '</div></div></div>'
     )
+
+
+def _render_arc_approval_page(review_id: str, review: dict) -> HTMLResponse:
+    """Render the arc-approval review page (Approve / Reject)."""
+    title = review.get("title", "Arc Approval")
+    action_description = review.get("action_description", "")
+    target_arc_id = review.get("target_arc_id")
+    proposing_arc_id = review.get("proposing_arc_id")
+
+    # Pull proposing arc name for context, if available.
+    proposing_name = None
+    if proposing_arc_id is not None:
+        try:
+            proposing = arc_manager.get_arc(proposing_arc_id)
+            if proposing:
+                proposing_name = proposing.get("name") or f"#{proposing_arc_id}"
+        except (sqlite3.Error, ValueError, KeyError):
+            proposing_name = f"#{proposing_arc_id}"
+
+    def _esc(s: str) -> str:
+        return (
+            s.replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;").replace('"', "&quot;")
+        )
+
+    desc_html = _esc(action_description).replace("\n", "<br>")
+    context_bits = []
+    if proposing_name:
+        context_bits.append(
+            f"<div><strong>Proposed by reflection arc:</strong> "
+            f"<code>{_esc(proposing_name)}</code> "
+            f"(#{proposing_arc_id})</div>"
+        )
+    if target_arc_id is not None:
+        context_bits.append(
+            f"<div><strong>Target arc (gated, will be dispatched on approve):</strong> "
+            f"#{target_arc_id}</div>"
+        )
+    context_html = "".join(context_bits)
+
+    decide_url = f"/api/review/{review_id}/decide"
+    html = (
+        "<!DOCTYPE html><html><head>"
+        f"<title>Arc Approval - {review_id[:8]}</title>"
+        "<style>"
+        "body { font-family: monospace; background: #272822; color: #f8f8f2; "
+        "margin: 0; padding: 20px; }"
+        ".header { background: #3e3d32; padding: 10px 20px; margin: -20px -20px 20px; }"
+        ".header h2 { margin: 0; color: #a6e22e; }"
+        ".subtitle { color: #75715e; font-size: 14px; }"
+        ".context { margin: 15px 0; padding: 12px; background: #1e1e1e; "
+        "border-radius: 4px; border-left: 3px solid #66d9ef; }"
+        ".context div { margin: 4px 0; }"
+        ".description { margin: 15px 0; padding: 16px; background: #1e1e1e; "
+        "border-radius: 4px; border-left: 3px solid #e6db74; "
+        "white-space: pre-wrap; line-height: 1.4; }"
+        ".actions { margin-top: 20px; display: flex; gap: 10px; }"
+        ".btn { padding: 12px 24px; border: none; border-radius: 4px; "
+        "cursor: pointer; font-size: 16px; font-weight: bold; }"
+        ".btn-approve { background: #a6e22e; color: #272822; }"
+        ".btn-reject { background: #f92672; color: white; }"
+        ".btn:hover { opacity: 0.8; }"
+        "</style></head><body>"
+        "<div class=\"header\">"
+        f"<h2>Arc Approval</h2>"
+        f"<div class=\"subtitle\">{_esc(title)}</div>"
+        "</div>"
+        f"<div class=\"context\">{context_html}</div>"
+        "<h3 style=\"color: #66d9ef;\">Proposed action</h3>"
+        f"<div class=\"description\">{desc_html}</div>"
+        "<div class=\"actions\">"
+        "<button class=\"btn btn-approve\" onclick=\"decide('approve')\">Approve</button>"
+        "<button class=\"btn btn-reject\" onclick=\"decide('reject')\">Reject</button>"
+        "</div>"
+        "<script>"
+        "function decide(decision) {"
+        f"  fetch('{decide_url}', {{"
+        "    method: 'POST',"
+        "    headers: {'Content-Type': 'application/json'},"
+        "    body: JSON.stringify({decision: decision})"
+        "  }).then(function(r) { return r.json(); }).then(function(data) {"
+        "    var colors = {approve: '#a6e22e', reject: '#f92672'};"
+        "    document.body.innerHTML = '<div style=\"padding:40px;text-align:center;\">' +"
+        "      '<h2 style=\"color:' + (colors[decision] || '#f8f8f2') + '\">' +"
+        "      decision.toUpperCase() + '</h2>' +"
+        "      '<p>Decision recorded.</p></div>';"
+        "  }).catch(function(err) { alert('Error: ' + err); });"
+        "}"
+        "</script></body></html>"
+    )
+
+    return HTMLResponse(content=html)
 
 
 def _render_diff_review_page(review_id: str, review: dict) -> HTMLResponse:
@@ -516,6 +662,37 @@ async def submit_decision(request: Request):
                 },
             )
             wake_signal.set()
+
+        # For arc-approval reviews, either emit the gate's activation
+        # event (approve) or cancel the target arc (reject).
+        if review_type == "arc-approval":
+            from ..core.engine import event_bus
+            from ..core.engine.main_loop import wake_signal
+            gate_arc_id = review.get("gate_arc_id")
+            target_arc_id = review.get("target_arc_id")
+            if decision.decision == "approve":
+                event_bus.record_event(
+                    "arc.manual_trigger",
+                    {
+                        "arc_id": gate_arc_id,
+                        "target_arc_id": target_arc_id,
+                        "review_id": review_id,
+                    },
+                    source="human-review",
+                )
+                wake_signal.set()
+            elif decision.decision == "reject":
+                # Cancel the target action arc; manager cascades to its
+                # children (including the gate step).
+                try:
+                    target = arc_manager.get_arc(target_arc_id)
+                    if target and target["status"] not in arc_manager.FROZEN_STATUSES:
+                        arc_manager.update_status(target_arc_id, "cancelled")
+                except (sqlite3.Error, ValueError, KeyError) as exc:
+                    logger.warning(
+                        "Failed to cancel target arc %s on reject: %s",
+                        target_arc_id, exc,
+                    )
 
     # Optional: trigger a follow-up PLANNER arc when approving with a
     # follow-up goal. The review screen is trusted human input, so the new

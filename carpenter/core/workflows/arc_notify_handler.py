@@ -8,15 +8,64 @@ is included in the LLM context but not rendered in the chat UI.
 
 import logging
 
+from ... import config
 from ..arcs import manager as arc_manager
 from ..arcs.dispatch_handler import _find_arc_conversation
 from ..workflows._arc_state import get_arc_state
 from ...agent import conversation, invocation
+from ...db import db_connection
 from ... import thread_pools
 
 logger = logging.getLogger(__name__)
 
 RESULT_PREVIEW_MAX = 4000
+
+
+def _absolutize_review_url(url: str) -> str:
+    """Prefix a relative ``/api/review/...`` URL with the configured
+    ``public_base_url`` if set; otherwise return as-is.
+
+    Surfaces that ship the message to off-host channels (Signal, email)
+    need absolute URLs; the in-app chat UI is happy with relative ones.
+    """
+    if not url or url.startswith(("http://", "https://")):
+        return url
+    public_base = config.CONFIG.get("public_base_url", "")
+    if not public_base:
+        return url
+    return public_base.rstrip("/") + url
+
+
+def _collect_pending_reviews(parent_arc_id: int) -> list[str]:
+    """Return absolute review URLs for any pending-review children of
+    ``parent_arc_id``.
+
+    A "pending review" child is an arc with both a ``review_url`` and a
+    ``_review_mode='human'`` state key whose status is not yet terminal.
+    Used to embed actionable links in arc-completion notifications when
+    the completed (reflection) arc spawned gated children.
+    """
+    urls: list[str] = []
+    with db_connection() as db:
+        rows = db.execute(
+            "SELECT a.id, a.status FROM arcs a "
+            "WHERE a.parent_id = ? "
+            "AND EXISTS ("
+            "  SELECT 1 FROM arc_state s "
+            "  WHERE s.arc_id = a.id AND s.key = 'review_url'"
+            ")",
+            (parent_arc_id,),
+        ).fetchall()
+    for row in rows:
+        if row["status"] in arc_manager.FROZEN_STATUSES:
+            continue
+        if get_arc_state(row["id"], "_review_mode") != "human":
+            continue
+        url = get_arc_state(row["id"], "review_url")
+        if not url:
+            continue
+        urls.append(_absolutize_review_url(url))
+    return urls
 
 
 def _build_resource_preview(arc_id: int, arc_name: str) -> str | None:
@@ -190,6 +239,14 @@ async def handle_arc_chat_notify(work_id: int, payload: dict) -> None:
                 msg = f'[Arc "{name}" completed.]'
     else:
         msg = f'[Arc "{name}" failed.]'
+
+    # Append any pending human-approval reviews spawned as children of
+    # this arc (e.g. reflection-spawned gated action arcs). Without this
+    # the chat agent had no way to give the user an actionable URL.
+    pending_review_urls = _collect_pending_reviews(arc_id)
+    if pending_review_urls:
+        review_lines = "\n".join(f"- {u}" for u in pending_review_urls)
+        msg += f"\n[Pending reviews:\n{review_lines}\n]"
 
     # Inject system message as hidden — included in LLM context but
     # not rendered in the chat UI.  The chat agent will relay the

@@ -468,3 +468,47 @@ def test_gated_template_variants_are_loadable(tmp_path):
         assert step_names == ["await-approval", "execute-action"]
         gate_step = tmpl["steps"][0]
         assert gate_step.get("activation_event") == "arc.manual_trigger"
+
+
+def test_tainted_reflection_spawns_review_url_on_gated_arc(tmp_path):
+    """Each tainted-spawned action arc has a ``review_url`` + ``review_id``
+    in its arc_state, and the stored review is wired to its
+    ``await-approval`` gate child so approving it would emit
+    ``arc.manual_trigger``."""
+    from carpenter.api import review as review_api
+    from carpenter.db import db_connection
+
+    step_handlers = _load_package_handlers(tmp_path)
+    review_api.clear_reviews()
+
+    tainted_id = arc_manager._insert_arc(
+        name="user-goal-tainted", goal="something tainted",
+        integrity_level="untrusted",
+    )
+    reflect_output = "- create kb entry on the issue\n"
+    root_id, _, dispatch_id = _make_reflection_arc_tree(reflect_output)
+    set_arc_state(root_id, "reflected_arc_id", tainted_id)
+
+    _run(step_handlers.handle_dispatch_actions, dispatch_id)
+
+    resp = get_arc_state(dispatch_id, "_agent_response")
+    spawned_id = resp["spawned_arcs"][0]
+
+    review_url = get_arc_state(spawned_id, "review_url")
+    review_id = get_arc_state(spawned_id, "review_id")
+    assert review_url and review_url.startswith("/api/review/")
+    assert review_id
+
+    stored = review_api.get_review(review_id)
+    assert stored is not None
+    assert stored["review_type"] == "arc-approval"
+    assert stored["target_arc_id"] == spawned_id
+
+    # Stored gate_arc_id must point at the spawned arc's await-approval child.
+    with db_connection() as db:
+        gate_row = db.execute(
+            "SELECT id FROM arcs WHERE parent_id = ? AND name = 'await-approval'",
+            (spawned_id,),
+        ).fetchone()
+    assert gate_row is not None
+    assert stored["gate_arc_id"] == gate_row["id"]
