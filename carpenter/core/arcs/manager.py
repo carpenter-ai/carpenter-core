@@ -860,6 +860,11 @@ def check_activation(arc_id: int) -> bool:
 
     If no activations registered, returns True.
     If activations registered, checks for matching processed events.
+
+    Payload-aware matching: when an event's payload carries an ``arc_id``
+    field, it only unblocks the arc whose id matches that field. Events
+    whose payloads omit ``arc_id`` continue to match by event_type alone
+    (backwards-compatible behavior for broadcast-style events).
     """
     with db_connection() as db:
         activations = db.execute(
@@ -874,8 +879,10 @@ def check_activation(arc_id: int) -> bool:
             match = db.execute(
                 "SELECT id FROM events "
                 "WHERE event_type = ? AND processed = TRUE "
+                "AND (json_extract(payload_json, '$.arc_id') IS NULL "
+                "     OR json_extract(payload_json, '$.arc_id') = ?) "
                 "LIMIT 1",
-                (activation["event_type"],),
+                (activation["event_type"], arc_id),
             ).fetchone()
             if match is not None:
                 return True

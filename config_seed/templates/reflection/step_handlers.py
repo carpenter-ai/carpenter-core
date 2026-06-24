@@ -499,6 +499,34 @@ async def handle_dispatch_actions(arc_id: int, arc_info: dict) -> None:
             set_arc_state(child_arc_id, "action_target_path", action_target)
         if restricted:
             set_arc_state(child_arc_id, "_review_mode", "human")
+            # Locate the ``await-approval`` gate step (step_order=0) that the
+            # gated template just instantiated, and mint a human-review URL
+            # that emits the gate's activation event on approve. Storing the
+            # URL on the spawned arc makes it available to the chat-notify
+            # path so the user can act on it.
+            try:
+                from carpenter.api.review import create_arc_approval_review
+                with db_connection() as db:
+                    gate_row = db.execute(
+                        "SELECT id FROM arcs WHERE parent_id = ? "
+                        "AND name = 'await-approval'",
+                        (child_arc_id,),
+                    ).fetchone()
+                if gate_row is not None:
+                    review = create_arc_approval_review(
+                        target_arc_id=child_arc_id,
+                        gate_arc_id=gate_row["id"],
+                        title=f"Reflection-proposed {action_type} action",
+                        action_description=action_desc,
+                        proposing_arc_id=parent_id,
+                    )
+                    set_arc_state(child_arc_id, "review_id", review["review_id"])
+                    set_arc_state(child_arc_id, "review_url", review["url"])
+            except Exception:
+                logger.exception(
+                    "dispatch-actions arc %d: failed to create arc-approval "
+                    "review for child arc %d", arc_id, child_arc_id,
+                )
 
         spawned_arcs.append(child_arc_id)
         action_types.append(action_type)
