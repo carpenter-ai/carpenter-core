@@ -107,8 +107,23 @@ async def test_dispatch_skips_passive_supervisor_no_wake_flag():
         await arc_dispatch_handler.handle_arc_dispatch(work_id=1, payload={"arc_id": sup})
 
     mock_run.assert_not_called()
-    # Arc stays pending — dispatch was skipped before the state transition.
-    assert arc_manager.get_arc(sup)["status"] == "pending"
+    # Arc stays in its born-waiting state — dispatch was skipped before any transition.
+    assert arc_manager.get_arc(sup)["status"] == "waiting"
+
+
+def test_supervisor_root_born_waiting():
+    """SUPERVISOR arcs enter 'waiting' immediately so the escalation walk
+    matches them without needing dispatch_arc() to transition status."""
+    sup = arc_manager.create_arc("sup", agent_type="SUPERVISOR")
+    assert arc_manager.get_arc(sup)["status"] == "waiting"
+
+
+def test_non_supervisor_arc_still_born_pending():
+    """Default initial status is unchanged for non-SUPERVISOR arcs."""
+    planner = arc_manager.create_arc("p", agent_type="PLANNER")
+    executor = arc_manager.create_arc("e", agent_type="EXECUTOR")
+    assert arc_manager.get_arc(planner)["status"] == "pending"
+    assert arc_manager.get_arc(executor)["status"] == "pending"
 
 
 # ── Failure: single child fails → wake enqueued once ────────
@@ -352,6 +367,32 @@ def test_chain_escalation_no_double_notify_when_direct_parent_is_supervisor():
     assert len(wakes) == 1
     failures = _arc_state(sup, "_pending_failures")
     assert failures is not None and len(failures) == 1
+
+
+def test_grandchild_failure_without_manual_status_transitions():
+    """Live-scenario regression: a SUPERVISOR root created by the reflection
+    tick is never manually transitioned through 'pending'/'active'. The
+    escalation walk must still match it on a deep failure."""
+    # Root SUPERVISOR — born 'waiting' per the create_arc contract.
+    sup = arc_manager.create_arc("reflection-root", agent_type="SUPERVISOR")
+    assert arc_manager.get_arc(sup)["status"] == "waiting"
+
+    # An intermediate, template-style step (frozen after dispatch).
+    intermediate = arc_manager.add_child(sup, "dispatch-actions", goal="spawn")
+    arc_manager.update_status(intermediate, "active")
+    grandchild = arc_manager.create_arc(
+        "action", goal="risky action", parent_id=intermediate,
+    )
+    arc_manager.update_status(intermediate, "completed")
+    arc_manager.freeze_arc(intermediate)
+
+    arc_manager.update_status(grandchild, "active")
+    arc_manager.update_status(grandchild, "failed")
+
+    wakes = _work_items("arc.supervisor_wake")
+    assert len(wakes) == 1
+    payload = json.loads(wakes[0]["payload_json"])
+    assert payload["parent_id"] == sup
 
 
 def test_no_supervisor_ancestor_no_wake():
