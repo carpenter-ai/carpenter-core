@@ -20,7 +20,6 @@ from __future__ import annotations
 import importlib
 import logging
 import sqlite3
-import sys
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -70,11 +69,15 @@ def _get_output_contract(arc_id: int) -> str | None:
 
 
 def _load_model_class(contract: str) -> Any:
-    """Load a Pydantic model class from a 'module:ClassName' contract string.
+    """Load an attrs model class from a 'module:ClassName' contract string.
 
     The module is resolved relative to the data_models_dir directory.
     E.g. 'dark_factory:DevelopmentSpec' loads DevelopmentSpec from
     config_seed/data_models/dark_factory.py (seed) or {base_dir}/config/data_models/.
+
+    The data_models_dir parent is added to ``sys.path`` at platform startup
+    by ``Coordinator._install_data_models_syspath`` (PR #73), so no lazy
+    sys.path mutation is needed here.
     """
     if ":" not in contract:
         logger.debug("Invalid output_contract format (no ':'): %s", contract)
@@ -86,15 +89,6 @@ def _load_model_class(contract: str) -> Any:
     full_module = f"data_models.{module_name}" if not module_name.startswith("data_models") else module_name
 
     try:
-        # Ensure data_models_dir is on sys.path
-        from .. import config as config_mod
-        data_models_dir = config_mod.CONFIG.get("data_models_dir", "")
-        if data_models_dir:
-            import os
-            parent = os.path.dirname(data_models_dir.rstrip("/"))
-            if parent and parent not in sys.path:
-                sys.path.insert(0, parent)
-
         mod = importlib.import_module(full_module)
         cls = getattr(mod, class_name, None)
         if cls is None:
