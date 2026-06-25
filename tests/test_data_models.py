@@ -101,3 +101,53 @@ class TestContractValidation:
 # and does not need PYTHONPATH injection.
 
 
+# ── Coordinator data_models sys.path injection ─────────────────────
+
+class TestDataModelsSyspath:
+    """Coordinator must install data_models_dir's parent on sys.path so handler
+    code can `from data_models.X import Y` directly, without relying on the
+    lazy injection in verify/_schema._load_model_class."""
+
+    def test_install_data_models_syspath_adds_parent(self, tmp_path, monkeypatch):
+        import sys
+        from carpenter import config as config_mod
+        from carpenter.coordinator import Coordinator
+
+        # Seed a fake data_models dir and isolate sys.path.
+        data_models_dir = tmp_path / "config" / "data_models"
+        (data_models_dir).mkdir(parents=True)
+        (data_models_dir / "__init__.py").write_text("")
+        (data_models_dir / "fake_module.py").write_text("MARKER = 'ok'\n")
+
+        parent = str(tmp_path / "config")
+        monkeypatch.setitem(config_mod.CONFIG, "data_models_dir", str(data_models_dir))
+        if parent in sys.path:
+            sys.path.remove(parent)
+        # Drop any cached imports from prior tests.
+        for cached in [k for k in list(sys.modules) if k == "data_models" or k.startswith("data_models.")]:
+            del sys.modules[cached]
+
+        try:
+            Coordinator()._install_data_models_syspath()
+            assert parent in sys.path
+            # And the import works without further path manipulation.
+            import importlib
+            mod = importlib.import_module("data_models.fake_module")
+            assert mod.MARKER == "ok"
+        finally:
+            for cached in [k for k in list(sys.modules) if k == "data_models" or k.startswith("data_models.")]:
+                del sys.modules[cached]
+            if parent in sys.path:
+                sys.path.remove(parent)
+
+    def test_install_data_models_syspath_noop_when_unset(self, monkeypatch):
+        import sys
+        from carpenter import config as config_mod
+        from carpenter.coordinator import Coordinator
+
+        monkeypatch.setitem(config_mod.CONFIG, "data_models_dir", "")
+        before = list(sys.path)
+        Coordinator()._install_data_models_syspath()
+        assert sys.path == before
+
+

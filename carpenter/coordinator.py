@@ -8,6 +8,7 @@ import asyncio
 import logging
 import os
 import sqlite3
+import sys
 from pathlib import Path
 
 from . import config
@@ -443,6 +444,8 @@ class Coordinator:
 
         results = install_config_seed(base_dir, overrides=overrides)
 
+        self._install_data_models_syspath()
+
         # Preserve the prior per-target log messages.
         log_labels = {
             "prompts": "Prompt defaults installed: %d files",
@@ -455,6 +458,17 @@ class Coordinator:
                 logger.info(log_labels.get(name, name + ": %d files"), result["copied"])
 
         return results
+
+    def _install_data_models_syspath(self) -> None:
+        # data_models is a top-level package on disk; its parent dir must be on
+        # sys.path so handler code can `from data_models.X import Y` directly,
+        # not just via the lazy path in verify/_schema._load_model_class.
+        data_models_dir = config.CONFIG.get("data_models_dir", "")
+        if not data_models_dir:
+            return
+        parent = os.path.dirname(data_models_dir.rstrip("/"))
+        if parent and parent not in sys.path:
+            sys.path.insert(0, parent)
 
     def _install_coding_tool_defaults(self, base_dir: str) -> None:
         """Install coding tool defaults (not part of config_seed/ manifest).
