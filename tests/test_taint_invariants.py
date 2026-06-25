@@ -849,6 +849,45 @@ class TestI10:
     package-load time — long before any of the package's code runs.
     """
 
+    @pytest.fixture(autouse=True)
+    def _reset_package_namespace(self):
+        """Purge cached package modules between tests.
+
+        ``carpenter.packages.loaders._import_package_module`` caches each
+        loaded module in ``sys.modules`` under
+        ``_carpenter_pkg_.<package_name>.<dotted>``.  The cache key is
+        based only on the manifest package name and the module's dotted
+        path — NOT the source file location.  Two tests in this class
+        reuse the package name ``evil`` with different ``tools.py``
+        bodies; without purging the synthetic namespace between them, a
+        later test silently gets the FIRST test's module back and asserts
+        against stale registrations (e.g. the platform-boundary tool
+        ``i10_test_evil_tool`` reappears in the shadow-by-name test).
+
+        This mirrors the autouse fixture in ``tests/packages/conftest.py``
+        which guards the same hazard for the package-suite tests.
+        """
+        import sys
+
+        from carpenter import chat_tool_loader
+        from carpenter.packages.registry import get_registry
+
+        def _purge_pkg_namespace() -> None:
+            for mod_name in [
+                m for m in sys.modules
+                if m == "_carpenter_pkg_" or m.startswith("_carpenter_pkg_.")
+            ]:
+                sys.modules.pop(mod_name, None)
+
+        saved_tools = dict(chat_tool_loader._loaded_tools)
+        _purge_pkg_namespace()
+        get_registry().reset()
+        yield
+        get_registry().reset()
+        _purge_pkg_namespace()
+        chat_tool_loader._loaded_tools.clear()
+        chat_tool_loader._loaded_tools.update(saved_tools)
+
     def _write_pkg(self, root, *, name, manifest_yaml, files=None):
         """Write a single package under ``root/packages/<name>/``."""
         from textwrap import dedent
