@@ -759,16 +759,21 @@ class TestScripts:
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
 
+        # carpenter-gmail v0.7+ refactored away from the Label() wrapper
+        # and consolidated raw-Resource persistence into the single
+        # ``resource.write`` verb (which serializes + writes + finalizes
+        # in one trusted RPC).  Scripts now invoke dispatch as
+        # ``dispatch("name", {...})`` directly.
         allowed = {
             "state.get", "state.set", "web.get", "web.post",
-            "files.write", "resource.finalize",
+            "resource.write",
         }
         for script_name in (
             "GMAIL_FETCH_SCRIPT", "GMAIL_SEND_SCRIPT", "GMAIL_SEARCH_SCRIPT",
         ):
             script = getattr(module, script_name)
             calls = re.findall(
-                r'dispatch\(\s*Label\("([a-z_.]+)"\)', script,
+                r'dispatch\(\s*"([a-z_.]+)"', script,
             )
             assert calls, f"{script_name} contains no dispatch calls"
             unexpected = set(calls) - allowed
@@ -1092,10 +1097,12 @@ class TestPhase15ModifyTools:
     ):
         """The Phase 1.5 v2 EXECUTOR scripts may only call the dispatch
         labels the EXECUTOR is allowed to use.  v0.3.0 expanded the
-        allowlist to include ``files.write`` and ``resource.finalize``
-        because every write script now persists a structured JSON
-        receipt to a raw Resource on disk so the REVIEWER + JUDGE can
-        graduate a typed EmailXxxResult."""
+        allowlist to include receipt persistence; v0.7+ consolidated
+        the previous ``files.write`` + ``resource.finalize`` pair into
+        a single trusted ``resource.write`` verb that serializes,
+        writes, and finalizes in one call.  v0.7+ also dropped the
+        ``Label()`` wrapper, so dispatch is invoked as
+        ``dispatch("name", {...})`` directly."""
         import importlib.util
         import re
 
@@ -1105,11 +1112,10 @@ class TestPhase15ModifyTools:
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
 
-        # v0.3.0 allowlist: receipt-Resource persistence requires
-        # files.write + resource.finalize.
+        # v0.7+ allowlist: receipt-Resource persistence is one verb.
         allowed = {
             "state.get", "state.set", "web.get", "web.post",
-            "files.write", "resource.finalize",
+            "resource.write",
         }
         for script_name in (
             "GMAIL_ARCHIVE_SCRIPT",
@@ -1119,7 +1125,7 @@ class TestPhase15ModifyTools:
             script = getattr(module, script_name, None)
             assert script is not None, f"missing {script_name}"
             calls = set(re.findall(
-                r'dispatch\(\s*Label\("([a-z_.]+)"\)', script,
+                r'dispatch\(\s*"([a-z_.]+)"', script,
             ))
             assert calls, f"{script_name} contains no dispatch calls"
             unexpected = calls - allowed
@@ -1128,12 +1134,12 @@ class TestPhase15ModifyTools:
                 f"{unexpected} (allowed for Phase 1.5 v2 modify scripts: "
                 f"{allowed})"
             )
-            # Every v0.3.0 modify script must persist the receipt.
-            assert "files.write" in calls, (
+            # Every v0.7+ modify script must persist the receipt via
+            # the consolidated resource.write verb (which serializes,
+            # writes, and finalizes in one trusted RPC; the separate
+            # resource.finalize verb no longer exists).
+            assert "resource.write" in calls, (
                 f"{script_name} must write the receipt to a raw Resource"
-            )
-            assert "resource.finalize" in calls, (
-                f"{script_name} must finalize the receipt Resource"
             )
 
     def test_phase15_scripts_do_expected_account_check_before_modify(

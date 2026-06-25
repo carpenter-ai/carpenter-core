@@ -115,15 +115,12 @@ def email_allowlist():
 
 class TestTriageManifest:
     def test_manifest_version_at_least_0_5_0(self, triage_pkg: Path):
+        from packaging.version import Version
+
         from carpenter.packages.manifest import load_manifest
 
-        # Phase 3a bumped to 0.4.0; Phase 3b (attachment metadata) bumps
-        # to 0.5.0; Phase 4 (semantic resource index) bumps to 0.6.0;
-        # 0.7.0 renames the package carpenter-email -> carpenter-gmail.
-        # The triage shape itself is unchanged in 3b/4/0.7.0 except for
-        # the Phase 3b ``attachments`` field on EmailTriageExtract.
         m = load_manifest(triage_pkg / "manifest.yaml")
-        assert m.version in {"0.5.0", "0.6.0", "0.7.0"}, m.version
+        assert Version(m.version) >= Version("0.5.0"), m.version
 
     def test_manifest_declares_email_triage_template(self, triage_pkg: Path):
         from carpenter.packages.manifest import load_manifest
