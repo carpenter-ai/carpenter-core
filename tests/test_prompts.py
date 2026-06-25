@@ -46,9 +46,18 @@ class TestInstallPromptDefaults:
         assert result["copied"] > 0
         assert os.path.isdir(prompts_dir)
 
-    def test_skips_existing_dir(self, tmp_path):
+    def test_upserts_into_empty_existing_dir(self, tmp_path):
+        """A pre-existing but empty target receives seed files (per-file upsert)."""
         prompts_dir = str(tmp_path / "empty_prompts")
         os.makedirs(prompts_dir)
+        result = install_prompt_defaults(prompts_dir)
+        assert result["status"] == "installed"
+        assert result["copied"] > 0
+
+    def test_second_install_is_noop(self, tmp_path):
+        """Re-installing after a complete install copies nothing."""
+        prompts_dir = str(tmp_path / "prompts")
+        install_prompt_defaults(prompts_dir)
         result = install_prompt_defaults(prompts_dir)
         assert result["status"] == "exists"
         assert result["copied"] == 0

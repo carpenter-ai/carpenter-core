@@ -86,23 +86,44 @@ SEED_MANIFEST: tuple[SeedTarget, ...] = (
 
 
 def _install_one(seed_dir: Path, target_dir: Path, label: str, count_glob: str) -> dict:
-    """Copy ``seed_dir`` to ``target_dir`` iff the target doesn't already exist.
+    """Per-file upsert: copy any seed file missing from ``target_dir``.
+
+    Existing files are never overwritten — user customizations are preserved.
+    New files added to a seed subdirectory propagate to existing installs on
+    the next startup, so additions in ``config_seed/`` don't require manual
+    intervention.
 
     Returns a status dict:
-        {"status": "installed" | "exists" | "no_defaults" | "error", "copied": int}
+        {"status": "installed" | "exists" | "no_defaults" | "error",
+         "copied": int  # new files copied this call
+        }
     """
-    if target_dir.is_dir():
-        return {"status": "exists", "copied": 0}
-
     if not seed_dir.is_dir():
         logger.warning("%s seed directory not found: %s", label, seed_dir)
         return {"status": "no_defaults", "copied": 0}
 
     try:
-        shutil.copytree(str(seed_dir), str(target_dir))
-        count = sum(1 for _ in target_dir.rglob(count_glob))
-        logger.info("Installed %s defaults: %d files to %s", label, count, target_dir)
-        return {"status": "installed", "copied": count}
+        target_dir.mkdir(parents=True, exist_ok=True)
+        copied = 0
+        for src in seed_dir.rglob("*"):
+            if not src.is_file():
+                continue
+            rel = src.relative_to(seed_dir)
+            dst = target_dir / rel
+            if dst.exists():
+                continue
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(str(src), str(dst))
+            copied += 1
+
+        status = "installed" if copied > 0 else "exists"
+        if copied > 0:
+            logger.info(
+                "Installed %s defaults: %d new file(s) to %s (matching %s: %d)",
+                label, copied, target_dir, count_glob,
+                sum(1 for _ in target_dir.rglob(count_glob)),
+            )
+        return {"status": status, "copied": copied}
     except OSError as exc:
         logger.error("Failed to install %s defaults: %s", label, exc)
         return {"status": "error", "error": str(exc), "copied": 0}

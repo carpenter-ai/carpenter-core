@@ -286,18 +286,23 @@ def _insert_arc(
             )
 
         now = datetime.now(timezone.utc).isoformat()
+        # SUPERVISORs are passive escalation handlers — they enter 'waiting'
+        # at birth so the failure-escalation walk (_find_supervisor_ancestor)
+        # can match them without depending on a dispatch_arc() side-effect
+        # they intentionally skip.
+        initial_status = "waiting" if agent_type == "SUPERVISOR" else "pending"
         cursor = db.execute(
             "INSERT INTO arcs "
             "(name, goal, parent_id, code_file_id, template_id, step_role, "
             " from_template, template_mutable, timeout_minutes, step_order, depth, "
-            " integrity_level, output_type, agent_type, model_policy_id, "
+            " integrity_level, output_type, agent_type, model_policy_id, status, "
             " wait_until, output_contract, arc_role, verification_target_id, priority, "
             " origin_kind, origin_ref, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 name, goal, parent_id, code_file_id, template_id, step_role,
                 from_template, template_mutable, timeout_minutes, step_order, depth,
-                integrity_level, output_type, agent_type, model_policy_id,
+                integrity_level, output_type, agent_type, model_policy_id, initial_status,
                 wait_until, output_contract, arc_role, verification_target_id, resolved_priority,
                 origin_kind, origin_ref, now,
             ),
