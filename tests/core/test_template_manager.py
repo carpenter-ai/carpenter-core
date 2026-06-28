@@ -344,3 +344,52 @@ def test_load_templates_from_dir(tmp_path):
     assert len(templates) == 2
     names = {t["name"] for t in templates}
     assert names == {"test-workflow", "other-workflow"}
+
+
+# ── step-owned prompt_template knob ────────────────────────────────
+
+SAMPLE_YAML_WITH_PROMPT_TEMPLATE = """\
+name: prompt-template-workflow
+description: A workflow exercising the step-owned prompt_template knob
+steps:
+  - name: with-prompt
+    description: Step that supplies its own wrapper prompt
+    order: 0
+    prompt_template: custom-wrapper
+    prompt_template_subdir: my-subdir
+  - name: without-prompt
+    description: Step that uses the agent-type default wrapper
+    order: 1
+"""
+
+
+def test_instantiate_template_persists_prompt_template_config(tmp_path):
+    """Steps that declare prompt_template get _prompt_template_config arc_state;
+    steps that omit it do not."""
+    yaml_file = tmp_path / "wf.yaml"
+    yaml_file.write_text(SAMPLE_YAML_WITH_PROMPT_TEMPLATE)
+    tid = template_manager.load_template(str(yaml_file))
+
+    parent_id = arc_manager.create_arc("parent-arc", template_id=tid)
+    arc_ids = template_manager.instantiate_template(tid, parent_id)
+    with_prompt_id, without_prompt_id = arc_ids
+
+    db = get_db()
+    try:
+        row = db.execute(
+            "SELECT value_json FROM arc_state "
+            "WHERE arc_id = ? AND key = '_prompt_template_config'",
+            (with_prompt_id,),
+        ).fetchone()
+        assert row is not None
+        cfg = json.loads(row["value_json"])
+        assert cfg == {"template": "custom-wrapper", "subdir": "my-subdir"}
+
+        row = db.execute(
+            "SELECT 1 FROM arc_state "
+            "WHERE arc_id = ? AND key = '_prompt_template_config'",
+            (without_prompt_id,),
+        ).fetchone()
+        assert row is None
+    finally:
+        db.close()
