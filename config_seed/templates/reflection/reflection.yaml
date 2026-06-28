@@ -36,6 +36,12 @@ steps:
     goal_input_sibling_role: prepare
     goal_input_output_name: gathered_activity
     goal_input_field: content
+    # Step-owned wrapper for the agent's first user message. The default
+    # ``arc_execute`` wrapper forces ``submit_code``, which defeats the
+    # JSON-output contract in ``reflect-goal.md``. This wrapper tells the
+    # EXECUTOR to reply directly with JSON instead.
+    prompt_template: reflect-step
+    prompt_template_subdir: reflections
   - name: save-reflection
     description: Persist the reflection summary to KB
     role: persist

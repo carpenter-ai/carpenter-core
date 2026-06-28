@@ -945,21 +945,46 @@ async def _run_arc_agent(
         arc_conv_id, f"[Arc #{arc_id}] {goal[:50]}"
     )
 
-    # REVIEWER arc-step agents read their inputs with read tools and emit
-    # their typed extract via the ``submit_extract`` tool — they do NOT write
-    # code. The default ``arc_execute`` prompt is submit_code-centric (and
-    # forbids reading files), which actively confuses a REVIEWER. Select an
-    # agent-type-appropriate prompt: REVIEWERs get the read+submit_extract
-    # template; EXECUTOR/PLANNER keep the submit_code template.
+    # Prompt selection (first hit wins):
+    # 1. Step-owned prompt — when the step's YAML config sets
+    #    ``prompt_template``, the named template fully owns the first
+    #    user message. Lets a step express any workflow (e.g. force a
+    #    JSON response instead of submit_code) without inventing a new
+    #    agent_type.
+    # 2. Agent-type default — REVIEWERs read inputs and emit via
+    #    ``submit_extract``, so they get the read+submit_extract wrapper.
+    #    EXECUTOR/PLANNER fall back to the submit_code-centric default.
+    from ..workflows._arc_state import get_arc_state as _get_arc_state_for_prompt
     _arc_info = arc_manager.get_arc(arc_id)
     _agent_type = (_arc_info.get("agent_type") if _arc_info else None) or "EXECUTOR"
-    _template = "arc_execute_reviewer" if _agent_type == "REVIEWER" else "arc_execute"
-    message = templates.render(
-        _template,
-        arc_id=arc_id,
-        goal=goal,
-        source_conv_id=source_conv_id or 0,
-    )
+    _prompt_cfg = _get_arc_state_for_prompt(arc_id, "_prompt_template_config")
+    message: str | None = None
+    if isinstance(_prompt_cfg, dict) and _prompt_cfg.get("template"):
+        from ...prompts import load_prompt_template
+        try:
+            message = load_prompt_template(
+                _prompt_cfg["template"],
+                context={
+                    "arc_id": arc_id,
+                    "goal": goal,
+                    "source_conv_id": source_conv_id or 0,
+                },
+                subdirectory=_prompt_cfg.get("subdir") or "",
+            )
+        except FileNotFoundError:
+            logger.warning(
+                "arc %d: prompt_template %r (subdir=%r) not found; "
+                "falling back to agent-type default",
+                arc_id, _prompt_cfg.get("template"), _prompt_cfg.get("subdir"),
+            )
+    if message is None:
+        _template = "arc_execute_reviewer" if _agent_type == "REVIEWER" else "arc_execute"
+        message = templates.render(
+            _template,
+            arc_id=arc_id,
+            goal=goal,
+            source_conv_id=source_conv_id or 0,
+        )
     conv_module.add_message(arc_conv_id, "user", message)
 
     # Extract model override from agent config

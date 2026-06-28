@@ -377,6 +377,24 @@ def instantiate_template(template_id: int, parent_arc_id: int) -> list[int]:
                     (arc_id, "_goal_template_config", json.dumps(goal_cfg)),
                 )
 
+        # Persist step-owned prompt-template config. When set, the arc
+        # dispatch handler renders the named template (with the standard
+        # arc_id/goal/source_conv_id context) instead of the agent-type
+        # default wrapper. Lets a step fully own its first user message —
+        # e.g. forcing a structured-output response instead of submit_code.
+        prompt_template = step.get("prompt_template")
+        if prompt_template:
+            prompt_cfg = {
+                "template": prompt_template,
+                "subdir": step.get("prompt_template_subdir", ""),
+            }
+            with db_transaction() as db:
+                db.execute(
+                    "INSERT OR REPLACE INTO arc_state (arc_id, key, value_json) "
+                    "VALUES (?, ?, ?)",
+                    (arc_id, "_prompt_template_config", json.dumps(prompt_cfg)),
+                )
+
         activation_event = step.get("activation_event")
         if activation_event:
             with db_transaction() as db:
