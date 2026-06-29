@@ -20,6 +20,15 @@ triggers:
       template_name: skill-kb-review
       arc_name: skill-kb-review
       arc_goal: "Review skill KB modification"
+      # SUPERVISOR root: all real work happens in the three step handlers
+      # (classify-source, text-review/intent-review, human-escalation).
+      # The root itself never invokes an LLM. SUPERVISOR is the right
+      # pattern because the human-escalation step parks the arc in
+      # ``waiting`` while it blocks on a human reply; without SUPERVISOR,
+      # ``_recover_on_startup`` would reset the root to ``pending`` on
+      # daemon restarts and dispatch it as a generic EXECUTOR, completing
+      # the root out from under its still-blocking child.
+      agent_type: SUPERVISOR
       initial_arc_state:
         kb_path: "{event.payload.path}"
         content_hash: "{event.payload.content_hash}"

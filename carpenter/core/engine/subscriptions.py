@@ -359,6 +359,9 @@ def handle_subscription_create_arc(payload: dict) -> int | None:
 
     - ``priority``: integer passed through to ``arc_manager.create_arc``
       (lower = more urgent, Unix-nice style).
+    - ``agent_type``: agent type for the root arc (e.g. ``SUPERVISOR``
+      for passive coordinator roots whose work is entirely carried out
+      by template step handlers). Defaults to ``EXECUTOR``.
     - ``initial_arc_state``: dict of ``key -> value`` pairs written to
       ``arc_state`` on the parent arc after creation. Values may contain
       ``{event.payload.KEY}`` placeholders, substituted from the
@@ -389,11 +392,14 @@ def handle_subscription_create_arc(payload: dict) -> int | None:
     arc_name = payload.get("arc_name") or template_name or "subscription-arc"
     arc_goal = payload.get("arc_goal")
     priority = payload.get("priority")
+    agent_type = payload.get("agent_type")
     event_payload = payload.get("_event_payload", {}) or {}
 
     create_kwargs = {}
     if priority is not None:
         create_kwargs["priority"] = priority
+    if agent_type is not None:
+        create_kwargs["agent_type"] = agent_type
 
     # Provenance: this root arc was spawned by a trigger/event subscription.
     # The whole tree inherits this origin via create_arc.

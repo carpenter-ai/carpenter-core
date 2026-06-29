@@ -211,3 +211,33 @@ def test_handle_create_arc_default_name_from_template(template_id):
     })
     parent = arc_manager.get_arc(parent_id)
     assert parent["name"] == "demo-workflow"
+
+
+def test_handle_create_arc_passes_agent_type_to_root(template_id):
+    """``agent_type`` in subscription action config is honored on the root arc.
+
+    Lets a template declare its root as a passive SUPERVISOR coordinator
+    (skill-kb-review, reflection) rather than the default EXECUTOR.
+    Without this, ``_recover_on_startup`` resets the root to ``pending``
+    on restart and dispatches it as a generic LLM agent, completing the
+    root out from under still-blocking children.
+    """
+    parent_id = subscriptions.handle_subscription_create_arc({
+        "template_id": template_id,
+        "template_name": "demo-workflow",
+        "agent_type": "SUPERVISOR",
+    })
+    parent = arc_manager.get_arc(parent_id)
+    assert parent["agent_type"] == "SUPERVISOR"
+    # SUPERVISORs are born ``waiting`` — see arcs.manager.create_arc.
+    assert parent["status"] == "waiting"
+
+
+def test_handle_create_arc_defaults_to_executor_when_agent_type_omitted(template_id):
+    """Without explicit ``agent_type``, the root keeps the default."""
+    parent_id = subscriptions.handle_subscription_create_arc({
+        "template_id": template_id,
+        "template_name": "demo-workflow",
+    })
+    parent = arc_manager.get_arc(parent_id)
+    assert parent["agent_type"] == "EXECUTOR"
