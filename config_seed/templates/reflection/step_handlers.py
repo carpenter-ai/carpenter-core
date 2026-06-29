@@ -49,7 +49,6 @@ from carpenter.db import db_connection
 from carpenter.agent import conversation as conv_module
 from carpenter.agent import model_resolver
 
-from .proposed_action_parser import classify_action
 from .reflection_storage import save_reflection
 
 logger = logging.getLogger(__name__)
@@ -282,8 +281,6 @@ async def handle_dispatch_actions(arc_id: int, arc_info: dict) -> None:
             continue
 
         action_type = action.action_type or "other"
-        if action_type == "other":
-            action_type = classify_action(action_desc)
 
         # Parent the spawned change arc under THIS dispatch-actions arc so
         # the action lives inside the reflection tree. When the action fails,

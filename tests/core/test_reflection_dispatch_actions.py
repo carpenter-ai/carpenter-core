@@ -3,11 +3,10 @@
 Covers the ``handle_dispatch_actions`` handler from
 ``config_seed/templates/reflection/step_handlers.py``: parsing proposed
 actions out of the sibling reflect arc's typed ``ReflectionResult``
-output, action-type classification, the per-reflection action cap, and
-routing each proposed action through the platform's standard
-``invoke_coding_change`` entry point so the change-workflow selector
-picks the right pipeline (``coding-change`` / ``yaml-change`` /
-``kb-change``).
+output, the per-reflection action cap, and routing each proposed action
+through the platform's standard ``invoke_coding_change`` entry point so
+the change-workflow selector picks the right pipeline
+(``coding-change`` / ``yaml-change`` / ``kb-change``).
 """
 
 from __future__ import annotations
@@ -254,22 +253,6 @@ def test_ten_actions_truncated_to_cap(tmp_path, monkeypatch, stub_invoke):
     assert resp["total_proposed"] == 10
     assert resp["truncated"] == 5
     assert len(stub_invoke.calls) == 5
-
-
-def test_action_type_classification_records_type(tmp_path, stub_invoke):
-    """KB-keyword action → action_type 'kb'; code-keyword → 'code'."""
-    step_handlers = _load_package_handlers(tmp_path)
-
-    reflect_output = (
-        "- create kb entry on error budgets\n"
-        "- implement code fix for the login bug\n"
-    )
-    root_id, _, dispatch_id = _make_reflection_arc_tree(reflect_output)
-
-    _run(step_handlers.handle_dispatch_actions, dispatch_id)
-
-    resp = get_arc_state(dispatch_id, "_agent_response")
-    assert resp["action_types"] == ["kb", "code"]
 
 
 def test_target_path_passed_as_affected_paths(tmp_path, stub_invoke):
