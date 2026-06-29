@@ -1,9 +1,8 @@
-"""Proposed-action classification + parsing for the dispatch-actions step.
+"""Proposed-action parsing for the dispatch-actions step.
 
-Two stateless helpers imported by :mod:`step_handlers`. Feature-specific;
+Stateless helper imported by :mod:`step_handlers`. Feature-specific;
 lives inside the template package.
 
-- :func:`classify_action` — heuristic type inference (kb/code/config/other).
 - :func:`parse_proposed_actions` — JSON-or-lines parser returning structured
   dicts ``{"description": str, "target_path": str | None}``.
 """
@@ -15,42 +14,6 @@ import logging
 import re
 
 logger = logging.getLogger(__name__)
-
-# Keywords used for classification heuristics.
-_KB_KEYWORDS = [
-    "knowledge base", "kb entry", "update kb", "create kb entry",
-    "modify knowledge", "new kb entry", "SKILL.md", "skill",
-]
-_CODE_KEYWORDS = [
-    "code", "implement", "fix bug", "refactor", "write code",
-    "modify code", "update code", "patch", "function", "module",
-]
-_CONFIG_KEYWORDS = [
-    "config", "configuration", "setting", "parameter",
-    "enable", "disable", "threshold", "limit",
-]
-
-
-def classify_action(description: str) -> str:
-    """Classify an action description into a type.
-
-    Returns one of: ``kb``, ``code``, ``config``, ``other``.
-    """
-    lower = description.lower()
-
-    for kw in _KB_KEYWORDS:
-        if kw in lower:
-            return "kb"
-
-    for kw in _CODE_KEYWORDS:
-        if kw in lower:
-            return "code"
-
-    for kw in _CONFIG_KEYWORDS:
-        if kw in lower:
-            return "config"
-
-    return "other"
 
 
 # A "path-like" token: contains a dot followed by an extension, may contain
