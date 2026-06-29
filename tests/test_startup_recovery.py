@@ -134,6 +134,82 @@ def test_recover_logs_arc_history(test_db):
     db.close()
 
 
+def test_recover_resets_retry_waiting_arcs_to_pending(test_db):
+    """Retry-backoff waiting arcs (have ``_retry_count``) get reset to pending."""
+    from carpenter.db import get_db, _recover_on_startup
+
+    db = get_db()
+    db.execute(
+        "INSERT INTO arcs (name, goal, status) VALUES ('retry-arc', 'goal', 'waiting')"
+    )
+    arc_id = db.execute("SELECT id FROM arcs WHERE name='retry-arc'").fetchone()["id"]
+    db.execute(
+        "INSERT INTO arc_state (arc_id, key, value_json) VALUES (?, '_retry_count', '2')",
+        (arc_id,),
+    )
+    db.commit()
+
+    _recover_on_startup(db)
+
+    row = db.execute("SELECT status FROM arcs WHERE name='retry-arc'").fetchone()
+    assert row["status"] == "pending"
+    db.close()
+
+
+def test_recover_preserves_passive_waiting_supervisor(test_db):
+    """SUPERVISOR arcs (born ``waiting``, no ``_retry_count``) must stay ``waiting``.
+
+    Regression: the previous indiscriminate reset would flip these to
+    ``pending`` and re-dispatch them, completing the root out from
+    under still-blocking children (the skill-kb-review / human-
+    escalation failure mode).
+    """
+    from carpenter.db import get_db, _recover_on_startup
+
+    db = get_db()
+    db.execute(
+        "INSERT INTO arcs (name, goal, status, agent_type) "
+        "VALUES ('supervisor-root', 'coordinate', 'waiting', 'SUPERVISOR')"
+    )
+    db.commit()
+
+    _recover_on_startup(db)
+
+    row = db.execute("SELECT status FROM arcs WHERE name='supervisor-root'").fetchone()
+    assert row["status"] == "waiting"
+    db.close()
+
+
+def test_recover_preserves_passive_waiting_parent(test_db):
+    """A parent in ``waiting`` because of unfinished children stays ``waiting``.
+
+    No ``_retry_count`` → not a retry-backoff arc. ``freeze_arc`` will
+    re-evaluate the parent when each child finishes; restart shouldn't
+    force the parent back through dispatch.
+    """
+    from carpenter.db import get_db, _recover_on_startup
+
+    db = get_db()
+    db.execute(
+        "INSERT INTO arcs (name, goal, status) VALUES ('parent-arc', 'goal', 'waiting')"
+    )
+    db.commit()
+
+    _recover_on_startup(db)
+
+    row = db.execute("SELECT status FROM arcs WHERE name='parent-arc'").fetchone()
+    assert row["status"] == "waiting"
+    # No status_change arc_history written for an arc the recovery left alone.
+    arc_id = db.execute("SELECT id FROM arcs WHERE name='parent-arc'").fetchone()["id"]
+    history = db.execute(
+        "SELECT COUNT(*) AS n FROM arc_history "
+        "WHERE arc_id=? AND actor='startup_recovery'",
+        (arc_id,),
+    ).fetchone()
+    assert history["n"] == 0
+    db.close()
+
+
 def test_recover_is_idempotent(test_db):
     """Running recovery twice has no additional effect."""
     from carpenter.db import get_db, _recover_on_startup

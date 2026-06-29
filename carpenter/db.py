@@ -204,10 +204,27 @@ def _recover_on_startup(db) -> None:
                                  "reason": "orphaned by crash/restart"}), now),
         )
 
-    # Reset waiting arcs to pending so retry can resume.
-    # Retry state (_retry_count, _backoff_until) is preserved in arc_state.
+    # Reset *retry-waiting* arcs to pending so retry can resume.
+    #
+    # ``waiting`` is overloaded: it's used by retry-backoff (set by the
+    # dispatch handler after ``record_retry_attempt``), by SUPERVISOR
+    # birth (passive escalation handlers — see ``arcs.manager.create_arc``
+    # status seed), by ``freeze_arc`` when a parent has unfinished
+    # children, and by judge/reviewer verification holds. Only the
+    # retry-backoff variant should be coerced back to ``pending`` — the
+    # others are intentional passive holds that wake via their own
+    # events (supervisor_wake / child completion / verification verdict).
+    #
+    # The previous behavior reset every ``waiting`` arc indiscriminately,
+    # which "completed" passive parents out from under their still-
+    # blocking children on every restart (arc 8669 logged 38 such cycles
+    # between 2026-06-21 and 2026-06-28 before the skill-kb-review
+    # SUPERVISOR fix landed). Filtering by ``_retry_count`` arc_state
+    # generalises that fix to every passive-coordinator template.
     waiting_rows = db.execute(
-        "SELECT id FROM arcs WHERE status='waiting'"
+        "SELECT a.id FROM arcs a "
+        "JOIN arc_state s ON s.arc_id = a.id AND s.key = '_retry_count' "
+        "WHERE a.status = 'waiting'"
     ).fetchall()
     waiting_ids = [row["id"] for row in waiting_rows]
 
