@@ -191,7 +191,15 @@ def _send_email(message: str, priority: str, category: str | None) -> bool:
 
 
 def _send_email_smtp(email_config: dict, message: str, subject: str) -> bool:
-    """Send email via SMTP."""
+    """Send email via SMTP.
+
+    Port 465 (or ``smtp_ssl=True``) uses ``SMTP_SSL`` (implicit TLS on
+    connect); any other port with ``smtp_tls=True`` uses plain ``SMTP``
+    followed by ``STARTTLS``.  A connect/read timeout is always applied so
+    a wedged server can never hang the caller indefinitely — without it,
+    talking plain-SMTP to a 465 endpoint blocks in ``recv`` forever waiting
+    for a banner the server will never send until TLS is negotiated.
+    """
     host = email_config.get("smtp_host", "")
     port = email_config.get("smtp_port", 587)
     from_addr = email_config.get("smtp_from", "")
@@ -199,6 +207,8 @@ def _send_email_smtp(email_config: dict, message: str, subject: str) -> bool:
     username = email_config.get("smtp_username", "")
     password = email_config.get("smtp_password", "")
     use_tls = email_config.get("smtp_tls", True)
+    use_ssl = bool(email_config.get("smtp_ssl", False)) or int(port or 0) == 465
+    timeout = float(email_config.get("smtp_timeout", 30))
 
     if not host or not to_addr:
         logger.warning("Email SMTP not fully configured (missing host or to_addr)")
@@ -210,11 +220,12 @@ def _send_email_smtp(email_config: dict, message: str, subject: str) -> bool:
         msg["From"] = from_addr or f"carpenter@{host}"
         msg["To"] = to_addr
 
-        if use_tls:
-            smtp = smtplib.SMTP(host, port)
-            smtp.starttls()
+        if use_ssl:
+            smtp = smtplib.SMTP_SSL(host, port, timeout=timeout)
         else:
-            smtp = smtplib.SMTP(host, port)
+            smtp = smtplib.SMTP(host, port, timeout=timeout)
+            if use_tls:
+                smtp.starttls()
 
         if username and password:
             smtp.login(username, password)
