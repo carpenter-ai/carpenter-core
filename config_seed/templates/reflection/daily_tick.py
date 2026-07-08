@@ -42,8 +42,33 @@ def _eligible_root_arcs(db, since_iso: str, until_iso: str) -> list[int]:
 
 
 async def handle_reflection_tick(work_id: int, payload: dict) -> None:
-    """Create batched ``period`` reflections for arcs completed since last tick."""
+    """Create batched ``period`` reflections for arcs completed since last tick.
+
+    Refuses to run when no escalation destination is configured — see
+    :func:`carpenter.core.reflection_escalation.ensure_escalation_ready`.
+    Without this gate, reflection-spawned coding-change arcs produce
+    human-review URLs that no chat conversation is linked to, and the
+    URLs pile up in the DB unseen.  The gate check is O(1) config lookup,
+    no SMTP handshake, safe to run on every daily tick.
+    """
+    # Import the gate BEFORE any arc creation / token spend.  A guard-clause
+    # style keeps the "cheap refusal" branch obvious and testable.
+    from carpenter.core.reflection_escalation import (
+        ensure_escalation_ready,
+        get_or_create_reflection_home_conversation,
+    )
+    if not ensure_escalation_ready():
+        logger.warning(
+            "reflection.daily_tick: skipped — no escalation destination "
+            "configured. Configure "
+            "config.CONFIG['reflection']['escalation']['email']['to'] and "
+            "ensure carpenter-imap-email SMTP creds resolve. See "
+            "kb/reflections/setup.md.",
+        )
+        return
+
     from carpenter import config
+    from carpenter.agent import conversation as _conversation
     from carpenter.core.arcs import manager as arc_manager
     from carpenter.core.engine import template_manager
     from carpenter.core.workflows._arc_state import get_arc_state, set_arc_state
@@ -75,6 +100,12 @@ async def handle_reflection_tick(work_id: int, payload: dict) -> None:
     n_batches = (len(arc_ids) + batch_size - 1) // batch_size
     created = 0
 
+    # Resolve (or create) the reflection-home email-medium conversation
+    # ONCE per tick.  Every reflection arc this tick spawns will be linked
+    # to it so ``arc.chat_notify`` routes completion messages (and any
+    # pending review URLs) into the email escalation channel.
+    home_conv_id = get_or_create_reflection_home_conversation()
+
     for idx in range(n_batches):
         batch = arc_ids[idx * batch_size:(idx + 1) * batch_size]
         # When a single day needs multiple batches, disambiguate the KB key
@@ -94,6 +125,7 @@ async def handle_reflection_tick(work_id: int, payload: dict) -> None:
             agent_type="SUPERVISOR",
         )
         set_arc_state(arc_id, "reflection_subject", subject)
+        _conversation.link_arc_to_conversation(home_conv_id, arc_id)
         template_manager.instantiate_template(reflection_tmpl["id"], arc_id)
         created += 1
 

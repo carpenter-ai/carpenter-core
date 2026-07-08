@@ -64,6 +64,10 @@ If you do not know which files the change will touch, omit `affected_paths` — 
 
 Do NOT use files.write or direct file operations for platform source modifications. The coding-change workflow creates an isolated workspace, generates a diff for human review, and applies changes safely.
 
+## Reflections
+
+Reflections (autonomous periodic reviews of activity that can propose kb/skill/doc changes) are currently GATED — they only run when an escalation destination is configured; see the `reflections/setup` KB entry if the user asks how to enable them.
+
 ## Communication Style
 
 Every text response you generate is delivered as a message to the user. Most tool loops do NOT require a message. Only message the user for:

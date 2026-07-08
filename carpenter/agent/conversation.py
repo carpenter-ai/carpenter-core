@@ -155,7 +155,30 @@ def add_message(
             "WHERE id = ?",
             (conversation_id,),
         )
-        return msg_id
+
+        # Look up channel_type INSIDE the same transaction so we route
+        # correctly even if the conversation was just created.
+        channel_row = db.execute(
+            "SELECT channel_type FROM conversations WHERE id = ?",
+            (conversation_id,),
+        ).fetchone()
+
+    # Out-of-band delivery for medium-typed conversations (currently email
+    # only) runs AFTER the transaction commits so the DB row is durable
+    # regardless of what SMTP does.  This is the reflection escalation path:
+    # a reflection-home email-medium conversation routes every
+    # non-user message it receives to the configured email destination.
+    channel_type = channel_row["channel_type"] if channel_row else None
+    if channel_type == "email":
+        try:
+            from ..core.reflection_escalation import dispatch_email_message
+            dispatch_email_message(conversation_id, role, content, arc_id=arc_id)
+        except Exception:  # broad catch: outbound delivery must not raise
+            logger.exception(
+                "add_message: email dispatch failed for conversation %d",
+                conversation_id,
+            )
+    return msg_id
 
 
 def get_messages(conversation_id: int) -> list[dict]:

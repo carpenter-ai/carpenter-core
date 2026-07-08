@@ -162,7 +162,24 @@ def test_eligible_excludes_meta_templates_and_non_roots(pkg):
 # ── end-to-end batching handler ─────────────────────────────────────
 
 
-def test_daily_tick_creates_period_batches(pkg):
+@pytest.fixture
+def _escalation_open(monkeypatch):
+    """Open the reflection escalation gate for the end-to-end batching tests.
+
+    The reflection.daily_tick handler now refuses to run unless an
+    escalation destination is configured
+    (see :func:`carpenter.core.reflection_escalation.ensure_escalation_ready`).
+    These tests exercise the batching logic, not the gate itself, so we
+    stub the gate to True.  ``get_or_create_reflection_home_conversation``
+    is left as-is: it operates purely on the isolated test DB.
+    """
+    monkeypatch.setattr(
+        "carpenter.core.reflection_escalation.ensure_escalation_ready",
+        lambda: True,
+    )
+
+
+def test_daily_tick_creates_period_batches(pkg, _escalation_open):
     from carpenter import config
     daily_tick = pkg.daily_tick
 
@@ -194,7 +211,7 @@ def test_daily_tick_creates_period_batches(pkg):
     assert count == 1
 
 
-def test_daily_tick_splits_into_multiple_batches(pkg):
+def test_daily_tick_splits_into_multiple_batches(pkg, _escalation_open):
     from carpenter import config
     daily_tick = pkg.daily_tick
     _subject = pkg.subject

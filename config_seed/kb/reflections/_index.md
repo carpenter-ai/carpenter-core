@@ -8,3 +8,6 @@ Use `kb_search(query, path_prefix="reflections/")` to search reflections by topi
 - **daily** — End-of-day observations
 - **weekly** — Weekly patterns and trends
 - **monthly** — Monthly strategic review
+
+## Setup
+- [[reflections/setup]] — how to enable reflections (escalation destination + SMTP creds).
