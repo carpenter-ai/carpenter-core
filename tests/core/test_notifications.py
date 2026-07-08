@@ -297,6 +297,89 @@ def test_email_smtp_failure_returns_false():
     assert result is False
 
 
+def test_email_smtp_port_465_uses_ssl():
+    """Port 465 uses SMTP_SSL (implicit TLS) and never calls starttls."""
+    email_config = {
+        "enabled": True,
+        "mode": "smtp",
+        "smtp_host": "smtp.example.com",
+        "smtp_port": 465,
+        "smtp_from": "bot@example.com",
+        "smtp_to": "user@example.com",
+        "smtp_username": "bot",
+        "smtp_password": "secret",
+        "smtp_tls": True,
+        "command": "",
+    }
+
+    mock_ssl = MagicMock()
+    mock_plain = MagicMock()
+    with patch("carpenter.core.notifications.smtplib.SMTP_SSL", return_value=mock_ssl) as ssl_ctor, \
+         patch("carpenter.core.notifications.smtplib.SMTP", return_value=mock_plain) as plain_ctor:
+        result = notifications._send_email_smtp(email_config, "Test body", "Test Subject")
+
+    assert result is True
+    ssl_ctor.assert_called_once()
+    plain_ctor.assert_not_called()
+    mock_ssl.starttls.assert_not_called()
+    mock_ssl.login.assert_called_once_with("bot", "secret")
+    mock_ssl.sendmail.assert_called_once()
+    # Timeout must be applied so a wedged connection cannot hang forever.
+    assert "timeout" in ssl_ctor.call_args.kwargs
+    assert ssl_ctor.call_args.kwargs["timeout"] > 0
+
+
+def test_email_smtp_explicit_ssl_flag_uses_ssl():
+    """smtp_ssl=True forces SMTP_SSL regardless of port."""
+    email_config = {
+        "enabled": True,
+        "mode": "smtp",
+        "smtp_host": "smtp.example.com",
+        "smtp_port": 2465,
+        "smtp_from": "bot@example.com",
+        "smtp_to": "user@example.com",
+        "smtp_username": "",
+        "smtp_password": "",
+        "smtp_tls": False,
+        "smtp_ssl": True,
+        "command": "",
+    }
+
+    mock_ssl = MagicMock()
+    with patch("carpenter.core.notifications.smtplib.SMTP_SSL", return_value=mock_ssl) as ssl_ctor, \
+         patch("carpenter.core.notifications.smtplib.SMTP") as plain_ctor:
+        result = notifications._send_email_smtp(email_config, "Test", "Subject")
+
+    assert result is True
+    ssl_ctor.assert_called_once()
+    plain_ctor.assert_not_called()
+
+
+def test_email_smtp_starttls_path_applies_timeout():
+    """Plain SMTP + STARTTLS path also passes a timeout."""
+    email_config = {
+        "enabled": True,
+        "mode": "smtp",
+        "smtp_host": "smtp.example.com",
+        "smtp_port": 587,
+        "smtp_from": "bot@example.com",
+        "smtp_to": "user@example.com",
+        "smtp_username": "",
+        "smtp_password": "",
+        "smtp_tls": True,
+        "command": "",
+    }
+
+    mock_smtp = MagicMock()
+    with patch("carpenter.core.notifications.smtplib.SMTP", return_value=mock_smtp) as plain_ctor:
+        result = notifications._send_email_smtp(email_config, "Test", "Subject")
+
+    assert result is True
+    assert "timeout" in plain_ctor.call_args.kwargs
+    assert plain_ctor.call_args.kwargs["timeout"] > 0
+    mock_smtp.starttls.assert_called_once()
+
+
 def test_email_smtp_missing_host_returns_false():
     """SMTP with empty host returns False without attempting connection."""
     email_config = {
