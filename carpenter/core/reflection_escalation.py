@@ -183,9 +183,28 @@ def _format_subject(message: str, arc_id: int | None) -> str:
     return f"[Reflection] {body_snippet}"
 
 
-def _format_body(message: str) -> str:
-    """Build the outgoing email body, highlighting any review URLs on top."""
-    urls = _REVIEW_URL_RE.findall(message)
+def _format_body(message: str, arc_id: int | None = None) -> str:
+    """Build the outgoing email body, highlighting any review URLs on top.
+
+    Regex-scans ``message`` for review URLs *and*, when ``arc_id`` is
+    supplied, walks that arc's subtree for any pending-human-review URLs
+    the message body itself may have omitted.  The chat-agent response
+    that ``arc.chat_notify`` re-invokes often summarises with prose like
+    "Review pending at the link above" without repeating the URL — that
+    email would otherwise ship linkless, defeating the whole point of
+    the escalation channel.
+    """
+    urls: list[str] = list(_REVIEW_URL_RE.findall(message))
+    if arc_id is not None:
+        try:
+            from .workflows.arc_notify_handler import _collect_pending_reviews
+            urls.extend(_collect_pending_reviews(arc_id))
+        except Exception:  # noqa: BLE001 — URL augmentation must not break send
+            logger.exception(
+                "reflection_escalation: subtree review-URL lookup failed "
+                "for arc %d; sending body without augmentation",
+                arc_id,
+            )
     if not urls:
         return message
     dedup: list[str] = []
@@ -236,7 +255,7 @@ def dispatch_email_message(
         return False
 
     subject = _format_subject(message, arc_id)
-    body = _format_body(message)
+    body = _format_body(message, arc_id=arc_id)
     try:
         return bool(_send_email_smtp(email_config, body, subject))
     except Exception:  # broad catch: SMTP failure must not break add_message
