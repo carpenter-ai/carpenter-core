@@ -669,3 +669,56 @@ async def test_handler_skips_review_url_for_terminal_children():
     msgs = conversation.get_messages(conv_id)
     system_msgs = [m for m in msgs if m["role"] == "system"]
     assert "Pending reviews:" not in system_msgs[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_handler_collects_pending_reviews_from_grandchildren():
+    """Review URLs on grandchild arcs are surfaced in the parent's notify.
+
+    Reflection dispatch spawns coding-change arcs as children of the
+    ``dispatch-actions`` step, which itself is a child of the reflection
+    SUPERVISOR — the reviewable arcs live two levels down.  A direct-
+    children-only query would miss them and deliver an actionable-URL-
+    free email, defeating the whole escalation channel.
+    """
+    parent_id = arc_manager.create_arc("reflection-root")
+    arc_manager.update_status(parent_id, "active")
+    set_arc_state(parent_id, "_agent_response", "reflection done")
+
+    # Middle step (like dispatch-actions) — no review_url on itself.
+    middle_id = arc_manager.add_child(parent_id, "dispatch-actions")
+    arc_manager.update_status(middle_id, "active")
+
+    # Grandchild coding-change with pending human review, added while the
+    # middle step is still active (mirrors reflection dispatch behavior).
+    grandchild_id = arc_manager.add_child(middle_id, "coding-change-grand")
+    set_arc_state(grandchild_id, "_review_mode", "human")
+    set_arc_state(grandchild_id, "review_url", "/api/review/grandchild-999")
+
+    arc_manager.update_status(middle_id, "completed")
+    arc_manager.update_status(parent_id, "completed")
+
+    conv_id = conversation.get_or_create_conversation()
+    db = get_db()
+    try:
+        db.execute(
+            "INSERT INTO conversation_arcs (conversation_id, arc_id) VALUES (?, ?)",
+            (conv_id, parent_id),
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    mock_run = AsyncMock()
+    with patch(
+        "carpenter.core.workflows.arc_notify_handler.thread_pools.run_in_work_pool",
+        mock_run,
+    ):
+        await handle_arc_chat_notify(1, {"arc_id": parent_id})
+
+    msgs = conversation.get_messages(conv_id)
+    system_msgs = [m for m in msgs if m["role"] == "system"]
+    assert len(system_msgs) == 1
+    content = system_msgs[0]["content"]
+    assert "Pending reviews:" in content
+    assert "/api/review/grandchild-999" in content
