@@ -22,20 +22,30 @@ RESULT_PREVIEW_MAX = 4000
 
 
 def _collect_pending_reviews(parent_arc_id: int) -> list[str]:
-    """Return absolute review URLs for any pending-review children of
+    """Return absolute review URLs for any pending-review descendants of
     ``parent_arc_id``.
 
-    A "pending review" child is an arc with both a ``review_url`` and a
-    ``_review_mode='human'`` state key whose status is not yet terminal.
-    Used to embed actionable links in arc-completion notifications when
-    the completed (reflection) arc spawned gated children.
+    A "pending review" descendant is an arc with both a ``review_url``
+    and a ``_review_mode='human'`` state key whose status is not yet
+    terminal.  Walks the entire subtree (recursive CTE), not just direct
+    children — reflection dispatch spawns coding-change arcs as children
+    of the ``dispatch-actions`` step, which is itself a child of the
+    reflection SUPERVISOR, so the reviewable arcs live at least two
+    levels down.  Without the recursion, the SUPERVISOR's completion
+    notification email arrived without any actionable URLs, which is
+    the whole point of the escalation channel.
     """
     urls: list[str] = []
     with db_connection() as db:
         rows = db.execute(
+            "WITH RECURSIVE subtree(id) AS ("
+            "  SELECT id FROM arcs WHERE parent_id = ? "
+            "  UNION ALL "
+            "  SELECT a.id FROM arcs a JOIN subtree s ON a.parent_id = s.id"
+            ") "
             "SELECT a.id, a.status FROM arcs a "
-            "WHERE a.parent_id = ? "
-            "AND EXISTS ("
+            "JOIN subtree ON subtree.id = a.id "
+            "WHERE EXISTS ("
             "  SELECT 1 FROM arc_state s "
             "  WHERE s.arc_id = a.id AND s.key = 'review_url'"
             ")",
