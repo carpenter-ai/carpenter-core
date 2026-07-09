@@ -104,26 +104,31 @@ def get_or_create_reflection_home_conversation() -> int:
     existing ``arc.chat_notify`` pathway routes reflection completion
     messages (including any pending-review URLs) into the email medium.
     """
-    with db_connection() as db:
-        row = db.execute(
-            "SELECT id FROM conversations "
-            "WHERE title = ? AND channel_type = 'email' "
-            "ORDER BY id ASC LIMIT 1",
-            (REFLECTION_HOME_TITLE,),
-        ).fetchone()
-        if row is not None:
-            return int(row["id"])
-
+    # Always un-archive an existing reflection-home in the same transaction we
+    # find it in.  ``arc_notify_handler`` discards archived conversations and
+    # falls back to ``get_last_conversation()`` (a chat conv), so a stale
+    # archived flag silently reroutes escalation email into an ordinary chat
+    # thread the user does not monitor.  The reflection-home is an outbound
+    # delivery endpoint, not a browsable conversation — archiving it has no
+    # legitimate semantics for this code path.
     with db_transaction() as db:
-        # Double-check under the write lock in case a concurrent caller
-        # inserted between our read above and our write here.
         row = db.execute(
-            "SELECT id FROM conversations "
+            "SELECT id, archived FROM conversations "
             "WHERE title = ? AND channel_type = 'email' "
             "ORDER BY id ASC LIMIT 1",
             (REFLECTION_HOME_TITLE,),
         ).fetchone()
         if row is not None:
+            if row["archived"]:
+                db.execute(
+                    "UPDATE conversations SET archived = 0 WHERE id = ?",
+                    (row["id"],),
+                )
+                logger.info(
+                    "reflection_escalation: un-archived reflection-home "
+                    "conversation %d (archived flag was stale)",
+                    row["id"],
+                )
             return int(row["id"])
         cursor = db.execute(
             "INSERT INTO conversations (title, channel_type, last_message_at) "

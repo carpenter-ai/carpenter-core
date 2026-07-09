@@ -169,11 +169,17 @@ async def handle_arc_chat_notify(work_id: int, payload: dict) -> None:
         logger.debug("arc.chat_notify: arc %d is silent, skipping", arc_id)
         return
 
-    # Find the originating conversation
+    # Find the originating conversation.  Discard an archived conversation
+    # ONLY when it is a plain chat conv — a channel-medium conversation
+    # (email etc.) is an outbound delivery endpoint, so an archived flag
+    # there is either stale bookkeeping or unrelated to deliverability.
+    # Silently rerouting reflection escalation to ``get_last_conversation()``
+    # (a chat thread the user does not monitor) was how the pre-fix version
+    # dropped review URLs on the floor.
     conv_id = _find_arc_conversation(arc_id)
     if conv_id:
         conv = conversation.get_conversation(conv_id)
-        if conv and conv.get("archived"):
+        if conv and conv.get("archived") and not conv.get("channel_type"):
             conv_id = None
 
     if not conv_id:

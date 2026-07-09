@@ -98,6 +98,23 @@ def test_reflection_home_conversation_idempotent():
     assert conv["channel_type"] == "email"
 
 
+def test_reflection_home_conversation_unarchives_stale():
+    """A previously-archived reflection-home is un-archived on next lookup.
+
+    Without this, arc_notify_handler would discard the archived conv and
+    fall back to get_last_conversation() (a chat conv the user doesn't
+    monitor), silently rerouting reflection escalation email.
+    """
+    home_id = reflection_escalation.get_or_create_reflection_home_conversation()
+    conversation.archive_conversation(home_id)
+    assert conversation.get_conversation(home_id)["archived"] == 1
+
+    same_id = reflection_escalation.get_or_create_reflection_home_conversation()
+    assert same_id == home_id
+    conv = conversation.get_conversation(home_id)
+    assert conv["archived"] == 0
+
+
 def test_reflection_home_conversation_ignores_non_email_same_title():
     """A same-title conversation with a NULL channel_type is not reused.
 

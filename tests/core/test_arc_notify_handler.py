@@ -453,6 +453,61 @@ async def test_handler_skips_archived_conversation():
 
 
 @pytest.mark.asyncio
+async def test_handler_uses_archived_channel_medium_conversation():
+    """Archived channel-medium (email) conversation is still used.
+
+    A channel-medium conversation is an outbound delivery endpoint, not a
+    browsable chat thread — an archived flag on it must not silently
+    reroute reflection notifications to get_last_conversation() (which
+    would land them in an ordinary chat thread the user does not monitor).
+    """
+    arc_id = arc_manager.create_arc("archived-email-conv-arc")
+    arc_manager.update_status(arc_id, "active")
+    set_arc_state(arc_id, "_agent_response", "Result.")
+    arc_manager.update_status(arc_id, "completed")
+
+    # Create an archived EMAIL-medium conversation linked to the arc.
+    db = get_db()
+    try:
+        cursor = db.execute(
+            "INSERT INTO conversations (title, channel_type, archived) "
+            "VALUES (?, 'email', 1)",
+            ("Reflection escalation",),
+        )
+        email_conv_id = cursor.lastrowid
+        db.execute(
+            "INSERT INTO conversation_arcs (conversation_id, arc_id) VALUES (?, ?)",
+            (email_conv_id, arc_id),
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    # Also create a fresh chat conv that get_last_conversation() would pick
+    # if the handler wrongly fell back.
+    fallback_conv_id = conversation._create_conversation(get_db())
+
+    mock_run = AsyncMock()
+    with patch(
+        "carpenter.core.workflows.arc_notify_handler.thread_pools.run_in_work_pool",
+        mock_run,
+    ), patch(
+        "carpenter.core.reflection_escalation.dispatch_email_message",
+        return_value=True,
+    ):
+        await handle_arc_chat_notify(1, {"arc_id": arc_id})
+
+    email_msgs = conversation.get_messages(email_conv_id)
+    fallback_msgs = conversation.get_messages(fallback_conv_id)
+    assert len([m for m in email_msgs if m["role"] == "system"]) == 1, (
+        "notify should land on the email-medium conversation despite archived flag"
+    )
+    assert len([m for m in fallback_msgs if m["role"] == "system"]) == 0, (
+        "notify must not fall back to a chat conv when email conv is available"
+    )
+
+
+@pytest.mark.asyncio
 async def test_handler_invokes_chat_with_correct_params():
     """Verify invoke_for_chat is called with _system_triggered=True."""
     arc_id = arc_manager.create_arc("invoke-test")
