@@ -250,6 +250,52 @@ def test_dispatch_email_message_calls_send_email_smtp(monkeypatch):
     assert email_config["smtp_to"] == "you@example.com"
 
 
+def test_dispatch_email_message_appends_subtree_review_urls(monkeypatch):
+    """URL missing from message body but present in the arc subtree must
+    still land in the email header.
+
+    Regression cover: the chat-agent response that ``arc.chat_notify``
+    re-invokes often summarises with "Review pending at the link above"
+    without repeating the URL, so a body-only regex would ship a
+    linkless escalation email — defeating the whole point of the
+    channel.
+    """
+    sent: list[tuple] = []
+
+    def fake_send(email_config, message, subject):
+        sent.append((email_config, message, subject))
+        return True
+
+    subtree_url = (
+        "https://example.com/api/review/deadbeef-1234-5678-9abc-def012345678"
+    )
+    monkeypatch.setattr(
+        "carpenter.core.notifications._send_email_smtp",
+        fake_send,
+    )
+    monkeypatch.setattr(
+        "carpenter.core.workflows.arc_notify_handler._collect_pending_reviews",
+        lambda arc_id: [subtree_url],
+    )
+    _install_full_smtp(monkeypatch)
+    monkeypatch.setitem(
+        config.CONFIG,
+        "reflection",
+        {"escalation": {"email": {"to": "you@example.com"}}},
+    )
+
+    body = "Review pending at the link above."  # no URL in prose
+    ok = reflection_escalation.dispatch_email_message(
+        conversation_id=42, role="assistant", message=body, arc_id=7,
+    )
+    assert ok is True
+    _, message, _ = sent[0]
+    assert subtree_url in message
+    assert message.index("Pending review URLs") < message.index(
+        "Review pending at the link above."
+    )
+
+
 def test_dispatch_email_message_swallows_smtp_errors(monkeypatch):
     """An exception in _send_email_smtp is logged, not raised."""
     def boom(email_config, message, subject):
