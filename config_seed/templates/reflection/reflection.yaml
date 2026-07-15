@@ -1,54 +1,74 @@
 name: reflection
-description: Reflection — analyse completed work (a daily batch, or specific arcs) and distil lessons to KB
+description: Reflection — triage a batch of completed arcs and, only if warranted, synthesise KB/tool changes
 capabilities:
   - system.read
   - kb.write
 # Reflection is driven by a daily cadence, NOT a per-arc-completion trigger.
 # A cron emits ``reflection.daily_tick`` (registered in __init__.py); the
 # handler batches the arcs completed since the last tick into ``period``
-# reflections. This replaces the old ``arc.status_changed`` trigger, whose
-# create-on-every-completion semantics could form an unbounded feedback
-# loop (a reflection's actions wrote skills/, spawning a skill-kb-review
-# root arc, whose completion re-triggered a reflection, ...). A cadence
-# that runs once/day over a bounded batch cannot loop.
+# reflections.
+#
+# Each batch runs gather-activity → triage → (conditional) reflect →
+# save-reflection → dispatch-actions. The triage step is a cheap haiku
+# call that decides whether the batch is worth synthesising a KB or
+# tool change over. When triage returns ``needs_synthesis=false`` the
+# subsequent steps become no-ops for that batch (no reflect LLM call, no
+# KB write, no action dispatch). The KB is associative memory — most
+# days should write nothing.
 steps:
   - name: gather-activity
-    description: Build the gathered-activity contract for the reflect step
+    description: Build the gathered-activity contract for the triage + reflect steps
     role: prepare
     order: 0
     output_contract: data_models.reflection:GatheredActivity
-  - name: reflect
-    description: Analyse the gathered activity and emit a ReflectionResult
-    role: analyze
+  - name: triage
+    description: Decide whether this batch warrants synthesis at all
+    role: triage
     order: 1
+    agent_type: EXECUTOR
+    agent_model: haiku
+    input_contract: data_models.reflection:GatheredActivity
+    output_contract: data_models.reflection:TriageResult
+    # Render the triage step's agent goal at dispatch time from the
+    # GatheredActivity produced by the preceding gather-activity sibling.
+    # We feed the lightweight ``triage_summary`` field (chat prompts,
+    # agent responses, arc-tree signals) — the full trajectory dump is
+    # reserved for the (rarely-run) reflect step.
+    goal_template: triage-goal
+    goal_template_subdir: reflections
+    goal_input_sibling_role: prepare
+    goal_input_output_name: gathered_activity
+    goal_input_field: triage_summary
+    # Step-owned wrapper so the EXECUTOR replies directly with JSON
+    # instead of being forced through submit_code.
+    prompt_template: triage-step
+    prompt_template_subdir: reflections
+  - name: reflect
+    description: Analyse the gathered activity and emit a ReflectionResult (skipped when triage returns needs_synthesis=false)
+    role: analyze
+    order: 2
     agent_type: EXECUTOR
     agent_model: haiku
     input_contract: data_models.reflection:GatheredActivity
     output_contract: data_models.reflection:ReflectionResult
     # Render the reflect step's agent goal at dispatch time from the
-    # ``GatheredActivity`` produced by the preceding ``prepare`` sibling.
-    # The platform's dispatch handler reads the sibling output, renders
-    # ``reflect-goal.md`` against ``GatheredActivity.content``, and uses
-    # the rendered string as the agent's goal — replacing the obsolete
-    # SQL UPDATE on the sibling arc's goal column.
+    # ``GatheredActivity`` produced by the gather-activity sibling. The
+    # step handler ``handle_reflect_gated`` short-circuits before the
+    # LLM call when the sibling triage step returned needs_synthesis=false.
     goal_template: reflect-goal
     goal_template_subdir: reflections
     goal_input_sibling_role: prepare
     goal_input_output_name: gathered_activity
     goal_input_field: content
-    # Step-owned wrapper for the agent's first user message. The default
-    # ``arc_execute`` wrapper forces ``submit_code``, which defeats the
-    # JSON-output contract in ``reflect-goal.md``. This wrapper tells the
-    # EXECUTOR to reply directly with JSON instead.
     prompt_template: reflect-step
     prompt_template_subdir: reflections
   - name: save-reflection
-    description: Persist the reflection summary to KB
+    description: Persist provenance for the reflection (no diary KB write)
     role: persist
-    order: 2
+    order: 3
     input_contract: data_models.reflection:ReflectionResult
   - name: dispatch-actions
     description: Fan out proposed actions from the reflect step into child action arcs
     role: dispatch
-    order: 3
+    order: 4
     input_contract: data_models.reflection:ReflectionResult
