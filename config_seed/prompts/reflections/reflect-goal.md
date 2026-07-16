@@ -23,11 +23,13 @@ per-day notes.
 
 Before proposing a new KB entry:
 
-1. Skim any existing KB entries the batch already touched or that
-   sound topically adjacent.
-2. If a near-relevant entry exists, propose editing it (add a
-   cross-reference, tighten wording, add a "when to use this" note).
-3. Only propose a brand-new KB entry when no existing entry is a
+1. Read the **Nearby KB entries** block appended below (the platform
+   ran ``kb.search`` on each focus pointer for you). Each entry is a
+   candidate home for the lesson from that pointer.
+2. If any nearby entry is a plausible home, propose editing it (add a
+   cross-reference, tighten wording, add a "when to use this" note)
+   and add its path to ``kb_edit_targets``.
+3. Only propose a brand-new KB entry when no nearby entry is a
    plausible home for the lesson.
 
 Populate ``kb_edit_targets`` with the paths of existing entries you

@@ -563,7 +563,6 @@ class Coordinator:
         # item; this handler performs the store write with no knowledge
         # of the feature that produced the entry.
         async def _handle_kb_write_entry(work_id, payload):
-            import hashlib as _hashlib
             from .kb import get_store
             path = payload.get("kb_path") or payload.get("path")
             content = payload.get("content")
@@ -574,29 +573,12 @@ class Coordinator:
                     work_id,
                 )
                 return
-            # Content-hash dedupe: if the proposed body hashes identically
-            # to the existing KB entry body at this path, skip the write.
-            # This is a safety net against no-op churn from reflection
-            # dispatch-actions re-proposing the same content when an
-            # existing entry already says exactly what was proposed, and
-            # against any other caller producing a byte-identical rewrite.
+            # Content-hash dedupe is now enforced inside KBStore.write_entry
+            # itself — a byte-identical rewrite short-circuits with an
+            # "unchanged" success and no I/O. Every KB writer benefits
+            # (chat kb.edit, package installers, reflection dispatch),
+            # not just this coordinator handler.
             store = get_store()
-            try:
-                existing = store.get_entry(path)
-            except Exception:  # noqa: BLE001 — dedupe check must not break writes
-                existing = None
-            if existing and isinstance(existing.get("content"), str):
-                new_hash = _hashlib.sha256(content.encode("utf-8")).hexdigest()
-                old_hash = _hashlib.sha256(
-                    existing["content"].encode("utf-8"),
-                ).hexdigest()
-                if new_hash == old_hash:
-                    logger.info(
-                        "kb.write_entry work %s: skipping write to %s — "
-                        "content hash matches existing entry",
-                        work_id, path,
-                    )
-                    return
             store.write_entry(
                 path=path,
                 content=content,

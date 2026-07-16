@@ -63,8 +63,6 @@ def pkg(tmp_path):
             "carpenter_template_packages.reflection._subject"),
         daily_tick=importlib.import_module(
             "carpenter_template_packages.reflection.daily_tick"),
-        kb_entry=importlib.import_module(
-            "carpenter_template_packages.reflection.kb_entry"),
     )
     yield ns
     trigger_registry.reset()
@@ -75,7 +73,7 @@ def pkg(tmp_path):
 # ── subject model ───────────────────────────────────────────────────
 
 
-def test_subject_arc_ids_and_kb_path(pkg):
+def test_subject_arc_ids(pkg):
     _subject = pkg.subject
     arcs = {"kind": "arcs", "refs": [7]}
     period = {"kind": "period", "refs": [1, 2, 3],
@@ -85,10 +83,6 @@ def test_subject_arc_ids_and_kb_path(pkg):
     assert _subject.subject_arc_ids(arcs) == [7]
     assert _subject.subject_arc_ids(period) == [1, 2, 3]
     assert _subject.subject_arc_ids(theme) == []
-
-    assert _subject.subject_kb_path(arcs) == "reflections/by-arc/7"
-    assert _subject.subject_kb_path(period) == "reflections/by-day/2026-06-19"
-    assert _subject.subject_kb_path(theme) == "reflections/by-theme/email"
 
 
 def test_get_subject_legacy_fallback(pkg):
@@ -110,15 +104,9 @@ def test_get_subject_prefers_explicit_subject(pkg):
     assert subject["refs"] == [1, 2]
 
 
-def test_build_entry_from_period_subject(pkg):
-    kb_entry = pkg.kb_entry
-    subject = {"kind": "period", "refs": [5, 6],
-               "window": {"from": "2026-06-18T00:00:00",
-                          "to": "2026-06-19T00:00:00", "date": "2026-06-19"}}
-    entry = kb_entry.build_reflection_entry(subject=subject, content="lessons")
-    assert entry["kb_path"] == "reflections/by-day/2026-06-19"
-    assert "subject_kind: period" in entry["content"]
-    assert "lessons" in entry["content"]
+# The v2 pipeline dropped ``build_reflection_entry`` (per-day / per-arc
+# diary writes were removed). The subject descriptor is still used to
+# key batching, but is no longer materialised into a KB path.
 
 
 # ── eligibility filtering ───────────────────────────────────────────
@@ -214,7 +202,6 @@ def test_daily_tick_creates_period_batches(pkg, _escalation_open):
 def test_daily_tick_splits_into_multiple_batches(pkg, _escalation_open):
     from carpenter import config
     daily_tick = pkg.daily_tick
-    _subject = pkg.subject
 
     ids = [_insert_arc(f"goal-{i}") for i in range(3)]
     config.CONFIG["reflection"] = {"batch_size": 2}
@@ -228,11 +215,12 @@ def test_daily_tick_splits_into_multiple_batches(pkg, _escalation_open):
     # 3 arcs, batch_size 2 → ceil(3/2) = 2 reflection arcs.
     assert len(refl_rows) == 2
     all_refs = []
-    paths = []
+    refs_per_batch = []
     for r in refl_rows:
         subj = get_arc_state(r["id"], "reflection_subject")
         all_refs.extend(subj["refs"])
-        paths.append(_subject.subject_kb_path(subj))
+        refs_per_batch.append(tuple(sorted(subj["refs"])))
     assert set(all_refs) == set(ids)
-    # Multiple batches in a day get disambiguated KB keys.
-    assert len(set(paths)) == 2
+    # Multiple batches in a day get distinct arc-id sets — the
+    # disambiguator now that KB path is no longer materialised.
+    assert len(set(refs_per_batch)) == 2

@@ -275,15 +275,18 @@ def _arc_conversation_snippets(arc_id: int) -> tuple[list[str], list[str]]:
 def _arc_friction_signals(arc_id: int) -> dict:
     """Return a small dict of arc-tree friction signals for triage.
 
-    Signals:
+    Signals actually collected today:
       - status: the arc's final status (completed / failed / etc.)
       - child_count / failed_child_count
       - retry_count: number of retry_attempts recorded on this arc
-      - kb_fetch_count: number of ``kb.get_entry`` tool calls in the
-        arc's ephemeral conversation (proxy for "did the agent re-fetch
-        the same entry"; a real dedupe check is out of scope here — the
-        raw count is enough for triage to notice looping).
-      - tool_call_count: total tool-call transcripts in the subtree.
+
+    Per-arc tool-call / KB-fetch counts are NOT collected — the
+    coordinator's ``kb_access_log`` records per-conversation, and there
+    is no per-arc tool-invocation counter today. Adding either is
+    instrumentation work tracked in ``carpenter_reflection_v2.md``; the
+    triage prompt (``triage-goal.md``) has been trimmed to reference
+    only the signals actually available. This keeps the prompt honest
+    rather than asking triage to decide against evidence it can't see.
     """
     signals: dict = {"status": "unknown"}
     with db_connection() as db:

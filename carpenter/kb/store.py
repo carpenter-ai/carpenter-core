@@ -175,6 +175,18 @@ class KBStore:
         """Write entry to filesystem + update index.
 
         Returns success/error message.
+
+        **Content-hash dedupe:** if the proposed body byte-hashes
+        identically to the existing entry body at this path, the write
+        is skipped (no filesystem I/O, no DB update, no search-index
+        churn, no ``kb.entry_written`` event) and a synthetic
+        "unchanged" success message is returned. This is the canonical
+        no-op guard for ALL KB writes — reflection dispatch, chat
+        ``kb.edit`` tool calls, capability-package installers, etc. —
+        so callers can safely re-propose known content without churning
+        the KB. The return string starts with ``"KB entry unchanged: "``
+        so callers that inspect it can distinguish an unchanged path
+        from a real write (both non-error).
         """
         # Path validation
         if ".." in path or path.startswith("/"):
@@ -186,6 +198,22 @@ class KBStore:
             missing = [target for target, _ in links if not self.entry_exists(target)]
             if missing:
                 return f"Error: broken links — targets not found: {', '.join(missing)}"
+
+        # Content-hash dedupe: if an entry already exists at this path
+        # with a byte-identical body, short-circuit before touching the
+        # filesystem or DB. Applies to every caller (reflection dispatch,
+        # chat kb.edit, package installers, etc.), so callers never need
+        # their own dedupe layer.
+        existing_content = ""
+        existing_fs_path = self._fs_path(path)
+        if existing_fs_path:
+            existing_content = self._read_file(existing_fs_path)
+        if existing_content and existing_content == content:
+            logger.info(
+                "kb.write_entry: content unchanged, skipping write to %s",
+                path,
+            )
+            return f"KB entry unchanged: {path}"
 
         # Determine filesystem path
         fs_path = os.path.join(self.kb_dir, path + ".md")

@@ -127,6 +127,93 @@ class TestKBStoreWriteEntry:
         finally:
             db.close()
 
+    def test_write_identical_body_is_noop(self, tmp_path):
+        """A second write with byte-identical content short-circuits.
+
+        No filesystem mtime change, no DB update, no kb.entry_written
+        event, and the return string starts with the sentinel
+        ``"KB entry unchanged: "`` so callers can distinguish an
+        unchanged path from a real write.
+        """
+        kb_dir = str(tmp_path / "kb")
+        os.makedirs(kb_dir, exist_ok=True)
+        store = KBStore(kb_dir=kb_dir)
+        body = "# Dedupe Fixture\n\nHello world.\n"
+        first = store.write_entry(
+            path="dedupe/fixture",
+            content=body,
+            description="fixture",
+            validate_links=False,
+        )
+        assert first.startswith("Wrote"), first
+
+        fs_path = os.path.join(kb_dir, "dedupe", "fixture.md")
+        original_mtime = os.path.getmtime(fs_path)
+
+        # Capture emitted events to prove no kb.entry_written for a no-op.
+        events_seen: list[dict] = []
+        try:
+            from carpenter.core.engine import event_bus
+
+            original = event_bus.record_event
+
+            def spy(event_type, payload=None, source=None, **kwargs):
+                if event_type == "kb.entry_written":
+                    events_seen.append({"payload": payload})
+                return original(event_type, payload, source=source, **kwargs)
+
+            event_bus.record_event = spy  # type: ignore[assignment]
+        except Exception:
+            original = None  # pragma: no cover
+
+        try:
+            second = store.write_entry(
+                path="dedupe/fixture",
+                content=body,
+                description="fixture",
+                validate_links=False,
+            )
+        finally:
+            if original is not None:
+                try:
+                    from carpenter.core.engine import event_bus
+                    event_bus.record_event = original  # type: ignore[assignment]
+                except Exception:  # pragma: no cover
+                    pass
+
+        assert second.startswith("KB entry unchanged"), second
+        # File was not rewritten.
+        assert os.path.getmtime(fs_path) == original_mtime
+        # No kb.entry_written event was emitted for the no-op.
+        assert events_seen == [], (
+            f"expected no kb.entry_written event on no-op write; "
+            f"got {events_seen}"
+        )
+
+    def test_write_changed_body_updates_entry(self, tmp_path):
+        """Different content at the same path performs a real write."""
+        kb_dir = str(tmp_path / "kb")
+        os.makedirs(kb_dir, exist_ok=True)
+        store = KBStore(kb_dir=kb_dir)
+        body = "# Change Me\n\nOriginal body.\n"
+        store.write_entry(
+            path="change/me",
+            content=body,
+            description="original",
+            validate_links=False,
+        )
+        new_body = body + "\nExtra sentence.\n"
+        result = store.write_entry(
+            path="change/me",
+            content=new_body,
+            description="original",
+            validate_links=False,
+        )
+        assert result.startswith("Wrote"), result
+        entry = store.get_entry("change/me")
+        assert entry is not None
+        assert "Extra sentence." in entry["content"]
+
 
 class TestKBStoreDeleteEntry:
     def test_delete_entry(self, tmp_path):

@@ -375,81 +375,11 @@ def test_save_reflection_never_enqueues_kb_write(pkg):
     assert _enqueued_kb_writes() == []
 
 
-# ── content-hash dedupe in the coordinator kb.write_entry handler ───
-
-
-def test_kb_write_entry_dedupes_identical_body():
-    """The coordinator's kb.write_entry handler skips writes whose
-    content byte-hashes to the same as the existing entry body."""
-    from carpenter.kb import get_store
-
-    # Isolate the coordinator's handler for a direct call.
-    import asyncio as _asyncio
-    import hashlib as _hashlib
-
-    store = get_store()
-    path = "skills/dedupe-fixture/note"
-    body = "---\nkey: value\n---\n\n# Note\n\nHello world.\n"
-    store.write_entry(
-        path=path, content=body, description="fixture", validate_links=False,
-    )
-    existing_hash = _hashlib.sha256(body.encode("utf-8")).hexdigest()
-
-    # Copy of the coordinator's handler body — kept in sync with
-    # ``_handle_kb_write_entry`` in ``carpenter/coordinator.py``. This
-    # avoids booting a full coordinator/main-loop just to exercise a
-    # 20-line handler; the test would silently pass if the coordinator
-    # regressed, so we also assert the coordinator source contains the
-    # dedupe check below.
-    async def run_handler(payload):
-        p = payload.get("kb_path") or payload.get("path")
-        content = payload.get("content")
-        if not p or not content:
-            return "no-path"
-        s = get_store()
-        existing = s.get_entry(p)
-        if existing and isinstance(existing.get("content"), str):
-            nh = _hashlib.sha256(content.encode("utf-8")).hexdigest()
-            oh = _hashlib.sha256(existing["content"].encode("utf-8")).hexdigest()
-            if nh == oh:
-                return "deduped"
-        s.write_entry(
-            path=p, content=content,
-            description=payload.get("description") or "",
-            entry_type=payload.get("entry_type", "knowledge"),
-            trust_level=payload.get("trust_level", "trusted"),
-            validate_links=payload.get("validate_links", False),
-        )
-        return "written"
-
-    # Same body → deduped.
-    result = _asyncio.run(run_handler({
-        "kb_path": path,
-        "content": body,
-        "entry_type": "knowledge",
-    }))
-    assert result == "deduped"
-
-    # Different body at the same path → written.
-    new_body = body + "\nExtra sentence.\n"
-    result = _asyncio.run(run_handler({
-        "kb_path": path,
-        "content": new_body,
-        "entry_type": "knowledge",
-    }))
-    assert result == "written"
-    entry = store.get_entry(path)
-    assert entry and "Extra sentence." in entry["content"]
-
-    # Sanity: assert the coordinator module actually contains the
-    # dedupe check so this test can't silently drift.
-    import inspect
-    from carpenter import coordinator as _coord
-    src = inspect.getsource(_coord)
-    assert "content hash matches existing entry" in src, (
-        "coordinator._handle_kb_write_entry lost its dedupe check"
-    )
-    _ = existing_hash  # explicitly retain for clarity
+# Content-hash dedupe lives in ``KBStore.write_entry`` (see
+# ``tests/kb/test_store.py::test_write_identical_body_is_noop``). The
+# coordinator's ``kb.write_entry`` handler is now a thin dispatcher over
+# that method, so the dedupe test lives at the store layer where it
+# applies to every KB writer.
 
 
 # ── dispatch-actions prefers kb_edit_targets over per-action target ─

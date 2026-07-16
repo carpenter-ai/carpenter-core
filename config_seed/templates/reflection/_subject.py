@@ -59,46 +59,8 @@ def subject_arc_ids(subject: dict | None) -> list[int]:
     return []
 
 
-def subject_kb_path(subject: dict | None) -> str:
-    """KB path the reflection writes to, derived from the subject kind."""
-    if not subject:
-        return "reflections/unkeyed"
-    kind = subject.get("kind")
-    if kind == KIND_ARCS:
-        ids = subject_arc_ids(subject)
-        return f"reflections/by-arc/{ids[0]}" if ids else "reflections/by-arc/unknown"
-    if kind == KIND_PERIOD:
-        window = subject.get("window") or {}
-        date = window.get("date") or (window.get("to") or "")[:10] or "unknown"
-        return f"reflections/by-day/{date}"
-    if kind == KIND_THEME:
-        slug = subject.get("theme") or subject.get("slug") or "general"
-        return f"reflections/by-theme/{slug}"
-    return "reflections/unkeyed"
-
-
-def subject_title(subject: dict | None) -> str:
-    if not subject:
-        return "Reflection"
-    kind = subject.get("kind")
-    if kind == KIND_ARCS:
-        ids = subject_arc_ids(subject)
-        return f"Reflection on arc #{ids[0]}" if ids else "Reflection"
-    if kind == KIND_PERIOD:
-        window = subject.get("window") or {}
-        date = window.get("date") or (window.get("to") or "")[:10] or "period"
-        n = len(subject_arc_ids(subject))
-        return f"Daily Reflection — {date} ({n} arc(s))"
-    if kind == KIND_THEME:
-        return f"Theme Reflection — {subject.get('theme') or 'general'}"
-    return "Reflection"
-
-
-def subject_period(subject: dict | None) -> tuple[str, str]:
-    """(period_start, period_end) for frontmatter/provenance."""
-    if subject and subject.get("kind") == KIND_PERIOD:
-        window = subject.get("window") or {}
-        start = window.get("from", "") or ""
-        end = window.get("to", "") or start
-        return start, end
-    return "", ""
+# ``subject_title`` and ``subject_period`` were removed with the v2
+# pipeline. They only ever fed the diary KB frontmatter that the v2
+# pipeline no longer writes. Retrieve refs via :func:`subject_arc_ids`
+# and read window fields directly from the ``window`` dict if a caller
+# needs them.

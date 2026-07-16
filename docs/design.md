@@ -353,13 +353,21 @@ Self-reflection runs on a **daily cadence**, not per-arc completion. A cron emit
 
 A reflection's **subject** is a typed descriptor stored as JSON on the reflection parent arc's state, with three kinds:
 
-- `arcs` — one or more specific arcs (the legacy per-arc case is just `{kind: arcs, refs: [id]}`). KB path: `reflections/by-arc/{id}`.
-- `period` — everything that completed in a time window (the daily cadence batch). `refs` are the contributing arc ids; `window` carries `from`/`to`/`date`. KB path: `reflections/by-day/{date}`.
-- `theme` — a set of related updates under a KB path/slug. KB path: `reflections/by-theme/{slug}`.
+- `arcs` — one or more specific arcs (the legacy per-arc case is just `{kind: arcs, refs: [id]}`).
+- `period` — everything that completed in a time window (the daily cadence batch). `refs` are the contributing arc ids; `window` carries `from`/`to`/`date`.
+- `theme` — a set of related updates under a KB path/slug.
 
 `get_subject()` synthesises an `arcs` subject from a legacy scalar `reflected_arc_id` when no typed subject is present, preserving backwards compatibility with existing reflection arcs.
 
-Each reflection runs the standard arc pipeline (gather → reflect → save → dispatch). The reflect step invokes a model with the gathered activity data as goal; `save-reflection` writes the result to the KB at the subject's path; `dispatch-actions` parses proposed actions out of the reflect step's output and spawns one child arc per action (capped at `reflection.max_actions_per_reflection`, default 5).
+**v2 pipeline (2026-07-12): 5-step, triage-gated, no diary writes.** Each reflection runs `gather-activity → triage → reflect → save-reflection → dispatch-actions`. The design premise is that **KB is associative memory, not a diary** — most days should write nothing.
+
+- **gather-activity** (Python) builds a typed `GatheredActivity` with two views: a full-trajectory `content` for the reflect step, and a lightweight `triage_summary` (chat prompts, top-level agent responses, and coarse arc-tree signals) for triage.
+- **triage** (EXECUTOR, haiku) reads the summary and returns a `TriageResult{needs_synthesis, reasons, focus_pointers}`. It biases strongly toward `false`: only visible friction (failed user-requested task, self-contradiction, retries > 0, multiple failed children) flags the batch. Missing or unparseable triage output defaults to skip.
+- **reflect** (EXECUTOR-gated Python handler) short-circuits with an empty result when triage returned false — **no LLM call, no KB write, no token spend beyond triage**. On a flagged batch it computes topically-adjacent KB entries by running `KBStore.search()` on each focus pointer and appends a "Nearby KB entries" block to the goal so the agent prefers editing over creating.
+- **save-reflection** (Python) records provenance on `arc_state` only. The v1 "diary" KB writes (`reflections/by-day/*`, `reflections/by-arc/*`, `reflections/{daily,weekly,monthly}/*`) were removed — nothing at this step touches KB.
+- **dispatch-actions** (Python) fans structured `proposed_actions` into child arcs via `handle_invoke_coding_change`. When `kb_edit_targets` is populated, dispatch prefers routing kb-type actions to `kb-change` on the existing entry over creating a new one.
+
+**Content-hash dedupe at the store layer.** `KBStore.write_entry` performs a byte-hash check against the existing entry: an identical rewrite returns `"KB entry unchanged: <path>"` with no filesystem or DB I/O and no `kb.entry_written` event. Every caller (chat `kb.edit`, package installers, reflection dispatch) benefits — dedupe is defense-in-depth against no-op churn, not the primary guard.
 
 ### Reflection Auto-Action
 

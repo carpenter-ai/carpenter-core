@@ -286,19 +286,150 @@ async def handle_reflect_gated(arc_id: int, arc_info: dict) -> None:
     goal = rendered_goal or (
         arc_info.get("goal") or arc_info.get("name") or f"Arc #{arc_id}"
     )
+
+    # "Prefer edit over create": for each focus pointer surfaced by
+    # triage, run ``KBStore.search`` and append a compact "Nearby KB
+    # entries" block to the goal. The reflect prompt (see
+    # ``reflect-goal.md``) instructs the agent to populate
+    # ``kb_edit_targets`` from this list before proposing a fresh path.
+    nearby_block, nearby_paths = _build_nearby_kb_block(
+        triage_result.focus_pointers,
+    )
+    if nearby_block:
+        goal = f"{goal}\n\n{nearby_block}"
+    # Provenance marker: record which KB paths were surfaced to the
+    # reflect agent as edit candidates. Deterministic assertion surface
+    # for acceptance stories, and useful for debugging why the agent
+    # picked (or missed) a given ``kb_edit_target``.
+    set_arc_state(arc_id, "_reflect_nearby_kb_paths", nearby_paths)
+
     agent_config, _fallbacks, _selected, _degraded = resolve_dispatch_model(
         arc_id, arc_info,
     )
     conv_id = _find_arc_conversation_id(arc_id)
     try:
         await _run_arc_agent(arc_id, goal, conv_id, agent_config=agent_config)
-    except Exception:
+    except Exception as exc:
+        # Record a small provenance marker so ``save-reflection`` can
+        # distinguish "agent failed" from "agent returned nothing".
+        # Without this, downstream reads of ``_agent_response`` return
+        # empty and the failure is invisible in provenance.
+        set_arc_state(
+            arc_id, "_reflect_error", type(exc).__name__,
+        )
         logger.exception(
             "reflect arc %d: LLM invocation failed — freezing without result",
             arc_id,
         )
     arc_manager.freeze_arc(arc_id)
     _propagate_completion(arc_id)
+
+
+# Cap how many focus pointers we search for nearby entries, and how many
+# results per pointer end up in the goal. Kept snug so the goal doesn't
+# balloon on wide-net triage output.
+_NEARBY_MAX_POINTERS = 5
+_NEARBY_MAX_RESULTS_PER_POINTER = 3
+# Character cap on a single ``description`` field when rendered.
+_NEARBY_DESCRIPTION_MAX_CHARS = 160
+
+
+def _build_nearby_kb_block(focus_pointers) -> tuple[str, list[str]]:
+    """Return ``(markdown_block, matched_paths)`` for the reflect goal.
+
+    For each focus pointer (arc id, KB path, or tool name), search the
+    KB for topically-adjacent entries and list the top hits. The reflect
+    prompt uses this list to prefer editing an existing entry over
+    creating a new one.
+
+    Returns ``("", [])`` when the KB store is unavailable, when there
+    are no pointers, or when no queries produced any hits.
+    ``matched_paths`` preserves discovery order, deduped, and is
+    recorded on ``arc_state["_reflect_nearby_kb_paths"]`` for provenance
+    and deterministic acceptance-test assertions.
+    """
+    if not focus_pointers:
+        return "", []
+    try:
+        from carpenter.kb import get_store
+        store = get_store()
+    except Exception:  # pragma: no cover — degrades to no nearby-block
+        logger.debug("nearby-KB lookup: KB store unavailable")
+        return "", []
+
+    seen_paths: set[str] = set()
+    ordered_paths: list[str] = []
+    lines: list[str] = []
+    for pointer in list(focus_pointers)[:_NEARBY_MAX_POINTERS]:
+        query = _pointer_to_query(pointer)
+        if not query:
+            continue
+        try:
+            hits = store.search(
+                query, max_results=_NEARBY_MAX_RESULTS_PER_POINTER,
+            )
+        except Exception:
+            logger.debug("nearby-KB search failed for pointer %r", pointer)
+            continue
+        for hit in hits or []:
+            path = hit.get("path")
+            if not path or path in seen_paths:
+                continue
+            seen_paths.add(path)
+            ordered_paths.append(path)
+            title = hit.get("title") or path
+            desc = (hit.get("description") or "").strip()
+            if len(desc) > _NEARBY_DESCRIPTION_MAX_CHARS:
+                desc = desc[:_NEARBY_DESCRIPTION_MAX_CHARS].rstrip() + "…"
+            lines.append(
+                f"- `{path}` — {title}"
+                + (f": {desc}" if desc else "")
+                + f"  (matched pointer: {pointer!r})"
+            )
+    if not lines:
+        return "", []
+
+    parts = [
+        "## Nearby KB entries",
+        "",
+        (
+            "For each focus pointer surfaced by triage, the platform "
+            "searched the KB and found these topically-adjacent existing "
+            "entries. Prefer editing one of these over creating a new "
+            "entry. Populate ``kb_edit_targets`` with any path below "
+            "that a proposed action would touch."
+        ),
+        "",
+    ]
+    parts.extend(lines)
+    return "\n".join(parts), ordered_paths
+
+
+def _pointer_to_query(pointer) -> str:
+    """Convert a triage focus pointer into a KB search query.
+
+    - ``"#123"`` (arc id) → the arc's goal/name (best available signal).
+    - ``"skills/foo/bar"`` (KB path) → the path itself + entry title if
+      it exists.
+    - anything else (tool name, free text) → used verbatim.
+    """
+    if not isinstance(pointer, str):
+        return ""
+    p = pointer.strip()
+    if not p:
+        return ""
+    if p.startswith("#"):
+        try:
+            arc_id = int(p.lstrip("#"))
+        except ValueError:
+            return p
+        arc = arc_manager.get_arc(arc_id)
+        if not arc:
+            return p
+        return " ".join(
+            s for s in (arc.get("name") or "", arc.get("goal") or "") if s
+        ) or p
+    return p
 
 
 def _find_arc_conversation_id(arc_id: int) -> int | None:
@@ -345,6 +476,13 @@ async def handle_save_reflection(arc_id: int, arc_info: dict) -> None:
     n_actions = len(result.proposed_actions) if result is not None else 0
     n_edit_targets = len(result.kb_edit_targets) if result is not None else 0
 
+    # If the reflect step raised, ``_reflect_error`` was written on the
+    # reflect arc so save-reflection can record the failure honestly
+    # rather than logging an empty summary as a routine skip.
+    reflect_error = None
+    if reflect_arc_id is not None:
+        reflect_error = _get_arc_state(reflect_arc_id, "_reflect_error")
+
     provenance = {
         "summary": summary,
         "proposed_action_count": n_actions,
@@ -352,6 +490,8 @@ async def handle_save_reflection(arc_id: int, arc_info: dict) -> None:
         "subject_kind": (subject or {}).get("kind"),
         "model": model_resolver.get_model_for_role("reflection"),
     }
+    if reflect_error:
+        provenance["reflect_error"] = reflect_error
     set_arc_state(arc_id, "_agent_response", provenance)
 
     arc_manager.update_status(arc_id, "completed")

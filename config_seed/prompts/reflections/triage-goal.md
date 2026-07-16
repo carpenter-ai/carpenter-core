@@ -11,22 +11,24 @@ You are given, per root arc in the batch:
 
 - The user's original chat prompt (if any).
 - The agent's top-level response(s).
-- Arc-tree signals: failures, retries, tool-call counts, KB fetches,
-  transcripts-per-goal ratio, etc.
+- Arc-tree signals actually available today: the arc's final status,
+  its direct child count and failed-child count, and its retry count.
+
+(Tool-call / KB-fetch counts per arc are NOT currently instrumented at
+the arc granularity — the raw signals only cover status, children, and
+retries. See ``carpenter_reflection_v2.md`` in memory for the followup.)
 
 ## When to return `needs_synthesis: true`
 
 Return `true` **only** when at least one of the following is visibly
 true in the batch:
 
-- An agent got lost or looped (repeated tool calls with no progress).
-- An agent re-fetched the same KB entry multiple times in one arc — a
-  signal the entry is unclear, misplaced, or missing a cross-reference.
-- The agent failed a task the user explicitly asked for.
+- The agent failed a task the user explicitly asked for (visible in
+  the user turn vs. the agent's top-level response).
 - The agent produced a visibly wrong response (contradicts its own
   earlier output, contradicts the user's stated facts, etc.).
-- The arc tree shows unusual friction: many retries, escalations, or
-  deep failure chains.
+- The arc tree shows unusual friction in the raw signals: multiple
+  failed children, or retries > 0 on the root.
 
 ## When to return `needs_synthesis: false`
 
