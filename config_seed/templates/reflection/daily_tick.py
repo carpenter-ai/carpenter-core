@@ -119,8 +119,8 @@ async def handle_reflection_tick(work_id: int, payload: dict) -> None:
 
     for idx in range(n_batches):
         batch = arc_ids[idx * batch_size:(idx + 1) * batch_size]
-        # When a single day needs multiple batches, disambiguate the KB key
-        # so they don't collide on reflections/by-day/{date}.
+        # When a single day needs multiple batches, disambiguate the
+        # subject window's date key so per-batch subjects stay distinct.
         date_key = date_str if n_batches == 1 else f"{date_str}-{idx + 1}"
         subject = {
             "kind": "period",

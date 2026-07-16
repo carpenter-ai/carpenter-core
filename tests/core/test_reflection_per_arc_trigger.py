@@ -280,9 +280,6 @@ def test_gather_from_arc_produces_expected_shape(tmp_path):
     assert "Period Stats" in md
 
 
-# The v2 pipeline no longer writes diary KB entries. The two tests that
-# used to live here (``test_kb_entry_lands_under_by_arc``,
-# ``test_get_reflections_reads_legacy_cadence_layout``) exercised the
-# now-dead ``create_reflection_entry`` path. Content-hash dedupe is
-# covered by ``tests/kb/test_store.py`` and no-diary-write is covered
-# by ``tests/core/test_reflection_v2_triage.py``.
+# The v2 pipeline no longer writes diary KB entries. Content-hash
+# dedupe is covered by ``tests/kb/test_store.py`` and no-diary-write is
+# covered by ``tests/core/test_reflection_v2_triage.py``.

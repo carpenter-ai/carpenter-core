@@ -104,9 +104,9 @@ def test_get_subject_prefers_explicit_subject(pkg):
     assert subject["refs"] == [1, 2]
 
 
-# The v2 pipeline dropped ``build_reflection_entry`` (per-day / per-arc
-# diary writes were removed). The subject descriptor is still used to
-# key batching, but is no longer materialised into a KB path.
+# The v2 pipeline dropped per-day / per-arc diary writes. The subject
+# descriptor is still used to key batching, but is no longer
+# materialised into a KB path.
 
 
 # ── eligibility filtering ───────────────────────────────────────────
