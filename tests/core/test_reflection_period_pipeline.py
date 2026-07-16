@@ -8,9 +8,10 @@ the *period* path proper:
 
 - ``activity_gatherer.gather_from_subject`` batch / single-arc / theme
   framing.
-- ``reflection_storage.save_reflection`` KB keying for a period subject
-  (vs. the legacy int-arg form).
-- An end-to-end run of the three Python step handlers against a real DB
+- ``reflection_storage.save_reflection`` is now a **v2 no-op** (the
+  diary write paths were removed); the test below asserts nothing is
+  enqueued.
+- An end-to-end run of the Python step handlers against a real DB
   with a period subject over two completed arcs.
 
 The reflection submodules are only importable under
@@ -81,6 +82,8 @@ def pkg(tmp_path):
     importlib.reload(step_handlers)
     handler_registry.register_step_handler(
         "reflection", "gather-activity", step_handlers.handle_gather_activity)
+    handler_registry.register_step_handler(
+        "reflection", "reflect", step_handlers.handle_reflect_gated)
     handler_registry.register_step_handler(
         "reflection", "save-reflection", step_handlers.handle_save_reflection)
     handler_registry.register_step_handler(
@@ -225,8 +228,8 @@ def _enqueued_kb_writes():
     return [json.loads(r["payload_json"]) for r in rows]
 
 
-def test_save_reflection_period_subject_keys_by_day(pkg):
-    """A period subject enqueues a kb.write_entry keyed reflections/by-day/."""
+def test_save_reflection_v2_period_subject_is_noop(pkg):
+    """v2 removed the diary write paths — save_reflection() is a no-op."""
     a1 = _insert_arc("goal-1")
     a2 = _insert_arc("goal-2")
     subject = _period_subject([a1, a2], date="2026-06-19")
@@ -234,20 +237,18 @@ def test_save_reflection_period_subject_keys_by_day(pkg):
     pkg.storage.save_reflection(subject, "lessons learned today")
 
     payloads = _enqueued_kb_writes()
-    assert len(payloads) == 1
-    assert payloads[0]["kb_path"] == "reflections/by-day/2026-06-19"
-    assert payloads[0]["entry_type"] == "reflection"
+    assert payloads == []
 
 
-def test_save_reflection_legacy_int_arg_keys_by_arc(pkg):
-    """The legacy single-arc-id call form still keys reflections/by-arc/."""
+def test_save_reflection_v2_legacy_int_arg_is_noop(pkg):
+    """v2 removed the diary write paths — even the legacy int-arg call
+    form no longer enqueues a kb.write_entry."""
     a1 = _insert_arc("legacy-goal")
 
     pkg.storage.save_reflection(a1, "per-arc lesson")
 
     payloads = _enqueued_kb_writes()
-    assert len(payloads) == 1
-    assert payloads[0]["kb_path"] == f"reflections/by-arc/{a1}"
+    assert payloads == []
 
 
 # ── end-to-end period pipeline through the three step handlers ──────
@@ -256,7 +257,7 @@ def test_save_reflection_legacy_int_arg_keys_by_arc(pkg):
 def _build_period_reflection_tree(refs, date="2026-06-19"):
     """Instantiate the reflection template and set a period subject.
 
-    Returns (root_id, gather_id, reflect_id, save_id, dispatch_id).
+    Returns (root_id, gather_id, triage_id, reflect_id, save_id, dispatch_id).
     """
     tmpl = template_manager.get_template_by_name("reflection")
     assert tmpl is not None
@@ -276,10 +277,23 @@ def _build_period_reflection_tree(refs, date="2026-06-19"):
     return (
         root_id,
         by_name["gather-activity"],
+        by_name["triage"],
         by_name["reflect"],
         by_name["save-reflection"],
         by_name["dispatch-actions"],
     )
+
+
+def _set_triage(triage_id, needs_synthesis, focus_pointers=None, reasons=None):
+    """Convenience: set the triage arc's _agent_response to a valid TriageResult JSON."""
+    payload = json.dumps({
+        "needs_synthesis": bool(needs_synthesis),
+        "reasons": reasons or [],
+        "focus_pointers": focus_pointers or [],
+    })
+    set_arc_state(triage_id, "_agent_response", payload)
+    arc_manager.update_status(triage_id, "active")
+    arc_manager.update_status(triage_id, "completed")
 
 
 def _run(handler, arc_id):
@@ -288,16 +302,16 @@ def _run(handler, arc_id):
 
 
 def test_period_pipeline_gather_then_save(pkg):
-    """End-to-end: gather writes a typed GatheredActivity output and the
-    dispatch handler renders the reflect step's goal from it; save
-    enqueues a by-day KB write."""
+    """v2 end-to-end: gather writes typed GatheredActivity; save-reflection
+    records provenance on arc_state and does NOT write to KB (diary
+    write paths removed)."""
     from carpenter.core.arcs.dispatch_handler import (
         _render_goal_from_sibling_output,
     )
 
     a1 = _insert_arc("goal-1", goal="alpha work")
     a2 = _insert_arc("goal-2", goal="beta work")
-    root_id, gather_id, reflect_id, save_id, dispatch_id = (
+    root_id, gather_id, triage_id, reflect_id, save_id, dispatch_id = (
         _build_period_reflection_tree([a1, a2], date="2026-06-19"))
 
     # gather-activity → typed GatheredActivity output on the gather arc;
@@ -319,7 +333,8 @@ def test_period_pipeline_gather_then_save(pkg):
         ).fetchone()["goal"]
     assert "batch of completed arcs" not in reflect_goal
 
-    # reflect produces output, then save-reflection enqueues the KB write.
+    # reflect produces output, then save-reflection records provenance
+    # ONLY — no KB write is enqueued by save-reflection in v2.
     set_arc_state(reflect_id, "_agent_response", "Lessons: keep tests small.")
     arc_manager.update_status(reflect_id, "active")
     arc_manager.update_status(reflect_id, "completed")
@@ -327,13 +342,20 @@ def test_period_pipeline_gather_then_save(pkg):
     _run(pkg.step_handlers.handle_save_reflection, save_id)
 
     payloads = _enqueued_kb_writes()
-    assert len(payloads) == 1
-    assert payloads[0]["kb_path"] == "reflections/by-day/2026-06-19"
+    assert payloads == [], (
+        "v2 save-reflection must not enqueue any kb.write_entry "
+        "(diary write paths removed)"
+    )
     with db_connection() as db:
         save_status = db.execute(
             "SELECT status FROM arcs WHERE id = ?", (save_id,),
         ).fetchone()["status"]
     assert save_status == "completed"
+    # Provenance was recorded on the arc.
+    prov = get_arc_state(save_id, "_agent_response")
+    assert isinstance(prov, dict)
+    assert prov["summary"] == "Lessons: keep tests small."
+    assert prov["proposed_action_count"] == 0
 
 
 def test_period_pipeline_dispatch_actions_noop_completes(pkg):
@@ -341,7 +363,7 @@ def test_period_pipeline_dispatch_actions_noop_completes(pkg):
     clean no-op that still completes."""
     a1 = _insert_arc("goal-1")
     a2 = _insert_arc("goal-2")
-    root_id, gather_id, reflect_id, save_id, dispatch_id = (
+    root_id, gather_id, triage_id, reflect_id, save_id, dispatch_id = (
         _build_period_reflection_tree([a1, a2]))
 
     # Empty reflect output → no proposed actions parsed → no-op dispatch.
@@ -372,7 +394,7 @@ def test_gather_activity_writes_typed_output(pkg):
 
     a1 = _insert_arc("goal-1", goal="alpha work")
     a2 = _insert_arc("goal-2", goal="beta work")
-    root_id, gather_id, reflect_id, _, _ = (
+    root_id, gather_id, triage_id, reflect_id, _, _ = (
         _build_period_reflection_tree([a1, a2], date="2026-06-19"))
 
     arc_manager.update_status(gather_id, "active")
@@ -386,13 +408,16 @@ def test_gather_activity_writes_typed_output(pkg):
     assert sorted(model.source_arc_ids) == sorted([a1, a2])
     assert model.window and model.window.get("date") == "2026-06-19"
     assert "batch of completed arcs" in model.content
+    # v2: triage_summary is populated alongside the full content.
+    assert model.triage_summary
+    assert "Triage Summary" in model.triage_summary
 
 
 def test_dispatch_reads_structured_proposed_actions(pkg, stub_invoke):
     """dispatch-actions reads the typed ReflectionResult from the reflect arc."""
     a1 = _insert_arc("goal-1")
     a2 = _insert_arc("goal-2")
-    _, _, reflect_id, _, dispatch_id = (
+    _, _, triage_id, reflect_id, _, dispatch_id = (
         _build_period_reflection_tree([a1, a2]))
 
     payload = json.dumps({
@@ -424,14 +449,19 @@ def test_dispatch_reads_structured_proposed_actions(pkg, stub_invoke):
 
 
 def test_end_to_end_typed_contracts(pkg, stub_invoke):
-    """The full pipeline runs with typed contracts: gather → reflect → save → dispatch."""
+    """v2 full pipeline: gather → (triage flagged) reflect output →
+    save-reflection provenance (no KB write) → dispatch-actions spawns
+    one kb-type child."""
     a1 = _insert_arc("goal-1", goal="alpha work")
     a2 = _insert_arc("goal-2", goal="beta work")
-    root_id, gather_id, reflect_id, save_id, dispatch_id = (
+    root_id, gather_id, triage_id, reflect_id, save_id, dispatch_id = (
         _build_period_reflection_tree([a1, a2], date="2026-06-20"))
 
     arc_manager.update_status(gather_id, "active")
     _run(pkg.step_handlers.handle_gather_activity, gather_id)
+
+    _set_triage(triage_id, needs_synthesis=True,
+                focus_pointers=[f"#{a1}", f"#{a2}"])
 
     payload = json.dumps({
         "summary": "the two arcs shared a flaky-test pattern",
@@ -442,6 +472,7 @@ def test_end_to_end_typed_contracts(pkg, stub_invoke):
                 "action_type": "kb",
             },
         ],
+        "kb_edit_targets": [],
     })
     set_arc_state(reflect_id, "_agent_response", payload)
     arc_manager.update_status(reflect_id, "active")
@@ -451,9 +482,12 @@ def test_end_to_end_typed_contracts(pkg, stub_invoke):
     _run(pkg.step_handlers.handle_save_reflection, save_id)
 
     payloads = _enqueued_kb_writes()
-    assert any(p["kb_path"] == "reflections/by-day/2026-06-20" for p in payloads)
-    by_day = next(p for p in payloads if p["kb_path"].startswith("reflections/by-day"))
-    assert "shared a flaky-test pattern" in by_day["content"]
+    assert payloads == [], (
+        "v2 save-reflection must not enqueue any kb.write_entry"
+    )
+    prov = get_arc_state(save_id, "_agent_response")
+    assert prov["proposed_action_count"] == 1
+    assert prov["summary"] == "the two arcs shared a flaky-test pattern"
 
     arc_manager.update_status(dispatch_id, "active")
     _run(pkg.step_handlers.handle_dispatch_actions, dispatch_id)

@@ -8,6 +8,17 @@ and creates one ``period`` reflection arc per batch.
 
 Being cadence-bounded (once/day, bounded batches) and never fired by an arc
 completion, this cannot form the feedback loop the per-arc trigger could.
+
+**v2 pipeline note:** every batch arc runs
+``gather-activity → triage → reflect → save-reflection → dispatch-actions``.
+The triage step (cheap haiku) decides whether each batch is worth
+synthesising over. When triage returns ``needs_synthesis=false``,
+``handle_reflect_gated`` short-circuits the reflect step without an LLM
+call, and downstream save/dispatch see empty output and no-op — no KB
+write, no action dispatch. Most batches on most days flow the "skip"
+path. The daily-tick log line summarises how many batches were created;
+per-batch skip vs. synthesise decisions are logged by the respective
+step handlers.
 """
 
 from __future__ import annotations
@@ -108,8 +119,8 @@ async def handle_reflection_tick(work_id: int, payload: dict) -> None:
 
     for idx in range(n_batches):
         batch = arc_ids[idx * batch_size:(idx + 1) * batch_size]
-        # When a single day needs multiple batches, disambiguate the KB key
-        # so they don't collide on reflections/by-day/{date}.
+        # When a single day needs multiple batches, disambiguate the
+        # subject window's date key so per-batch subjects stay distinct.
         date_key = date_str if n_batches == 1 else f"{date_str}-{idx + 1}"
         subject = {
             "kind": "period",

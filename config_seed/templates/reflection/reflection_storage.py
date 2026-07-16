@@ -1,22 +1,25 @@
 """Reflection persistence helpers.
 
-KB is the sole persistence sink for reflections. The legacy
-``reflections`` SQL table was retired in Phase D.
+**v2 pipeline (2026-07-12):** The daily "diary" write paths
+(``reflections/by-day/{date}``, ``reflections/by-arc/{arc_id}``,
+``reflections/{daily,weekly,monthly}/{date}``) have been **removed**.
+KB is associative memory, not a diary — reflection knowledge only
+lands in KB via reviewed ``kb-change`` action arcs spawned by
+``dispatch-actions``. The generic platform ``kb.write_entry`` handler
+now content-hash-dedupes identical writes.
 
-- :func:`save_reflection` builds a reflection-specific KB entry (path,
-  frontmatter, body) via :func:`.kb_entry.build_reflection_entry` and
-  enqueues the platform-generic ``kb.write_entry`` work item for the
-  coordinator to persist asynchronously.
-- :func:`get_reflections` reads recent reflections back from KB. Handles
-  both the current per-arc layout (``reflections/by-arc/{arc_id}``) and
-  the legacy cadence layout (``reflections/{daily,weekly,monthly}/{date}``).
+- :func:`save_reflection` is retained for backward compatibility with a
+  couple of tests but is now a **no-op that logs** — nothing is written
+  to KB from this code path. Live reflection flow no longer calls it.
+- :func:`get_reflections` still reads any legacy per-arc / per-day
+  entries that pre-existed in KB from the v1 pipeline, so historical
+  entries remain browsable. New entries are never written under these
+  paths.
 """
 
 from __future__ import annotations
 
 import logging
-import sqlite3
-from datetime import datetime, timezone
 
 from carpenter.db import db_connection
 
@@ -31,77 +34,32 @@ def save_reflection(
     input_tokens: int = 0,
     output_tokens: int = 0,
 ) -> None:
-    """Enqueue an async KB write for a completed reflection.
+    """No-op in the v2 pipeline — retained for backward compatibility.
 
-    Args:
-        subject_or_arc_id: Either a typed subject dict (``{kind, refs,
-            window}``) or — for backward compatibility — a single arc id
-            (treated as ``{kind: arcs, refs: [id]}``). Determines the KB
-            path (by-day / by-arc / by-theme).
-        content: Reflection markdown body.
-        proposed_actions: Optional parsed action block (frontmatter).
-        model: Model string (frontmatter / provenance).
+    v1 enqueued a KB write keyed on the subject
+    (``reflections/by-day/*``, ``reflections/by-arc/*``, etc.). v2
+    deliberately drops those diary writes. Live reflection flow does
+    NOT call this function; a small number of legacy tests do, and this
+    logs a warning to make the behaviour change loud.
     """
-    from ._subject import subject_arc_ids, subject_kb_path, subject_period
-
-    if isinstance(subject_or_arc_id, dict):
-        subject = subject_or_arc_id
-    elif subject_or_arc_id is not None:
-        subject = {"kind": "arcs", "refs": [int(subject_or_arc_id)]}
-    else:
-        subject = None
-
-    period_start, period_end = subject_period(subject)
-    if not period_start:
-        ids = subject_arc_ids(subject)
-        if ids:
-            placeholders = ",".join("?" * len(ids))
-            with db_connection() as db:
-                row = db.execute(
-                    f"SELECT MIN(created_at) AS s, MAX(updated_at) AS e "
-                    f"FROM arcs WHERE id IN ({placeholders})",
-                    ids,
-                ).fetchone()
-            period_start = (row["s"] if row else "") or ""
-            period_end = (row["e"] if row else "") or period_start
-        else:
-            now = datetime.now(timezone.utc).isoformat()
-            period_start = period_end = now
-
-    from .kb_entry import build_reflection_entry
-
-    entry = build_reflection_entry(
-        subject=subject,
-        content=content,
-        proposed_actions=proposed_actions,
-        model=model,
-        period_start=period_start,
-        period_end=period_end,
+    logger.info(
+        "save_reflection: v2 pipeline is a no-op (subject=%r, len=%d). "
+        "KB writes now flow exclusively through dispatch-actions → "
+        "kb-change action arcs.",
+        subject_or_arc_id if not isinstance(subject_or_arc_id, dict)
+        else subject_or_arc_id.get("kind"),
+        len(content or ""),
     )
-    if entry is None:
-        return
-
-    kb_path = subject_kb_path(subject)
-    idem = "refl-kb-" + kb_path.replace("/", "-")
-    try:
-        from carpenter.core.engine import work_queue
-        work_queue.enqueue(
-            "kb.write_entry",
-            entry,
-            idempotency_key=idem,
-        )
-    except (ImportError, sqlite3.Error):
-        logger.exception("Failed to enqueue kb.write_entry for %s", kb_path)
 
 
 def get_reflections(limit: int = 5) -> list[dict]:
     """Return recent reflections from KB, newest first.
 
-    Reads ``reflections/by-arc/*.md`` primarily. Falls back to legacy
-    cadence-prefixed folders (``daily``/``weekly``/``monthly``) so
-    pre-migration entries remain readable. Entries are parsed with YAML
-    frontmatter; legacy entries without frontmatter fall back to regex
-    extraction of ``**Period**: <start> to <end>``.
+    v2 pipeline no longer writes new entries under
+    ``reflections/by-*`` — this reader is kept so legacy entries from
+    the v1 pipeline (per-arc, per-day, weekly, monthly) remain
+    browsable. Returns an empty list once the legacy entries age out or
+    are removed.
 
     Args:
         limit: Max results.
@@ -181,3 +139,7 @@ def _parse_reflection_entry(content: str) -> tuple[dict, str]:
         meta["period_start"] = m.group(1)
         meta["period_end"] = m.group(2)
     return meta, content
+
+
+# Preserved for imports elsewhere (e.g. tests importing db_connection).
+__all__ = ["save_reflection", "get_reflections", "db_connection"]

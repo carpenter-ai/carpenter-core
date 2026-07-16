@@ -6,6 +6,12 @@ completes, and reflects on that specific arc — its goal, its outputs,
 its children, its outcome. :func:`gather_from_arc` produces the markdown
 block fed into the reflect step's goal, framed by a small period-stats
 block (see :mod:`.period_stats`).
+
+For the triage step (which decides whether reflect runs at all), a
+lightweight parallel view is produced by :func:`triage_summary_from_subject`
+— chat prompts, top-level agent responses, and arc-tree friction signals
+only, no verbose trajectories. Cheap enough to feed haiku on every
+batch.
 """
 
 from __future__ import annotations
@@ -24,6 +30,12 @@ logger = logging.getLogger(__name__)
 _CHILD_OUTPUT_MAX_CHARS = 400
 # Character cap when inlining the reflected arc's own final state.
 _FINAL_STATE_MAX_CHARS = 1500
+
+# Triage-view character caps. Deliberately snug: triage should be able
+# to spot obvious failure/loop/re-fetch patterns from prompts + top-level
+# responses without carrying full trajectories.
+_TRIAGE_USER_MAX_CHARS = 1500
+_TRIAGE_AGENT_MAX_CHARS = 1500
 
 
 def gather_from_arc(arc_id: int) -> str:
@@ -203,4 +215,164 @@ def _gather_theme(subject: dict) -> str:
         logger.exception("theme gather failed for prefix %s", kb_prefix)
         parts.append("## Updates\n- (error reading KB)")
     parts.append("")
+    return "\n".join(parts)
+
+
+# ── Triage view ──────────────────────────────────────────────────────
+#
+# The triage step is a cheap haiku call that decides whether the reflect
+# step should run at all. It reads a lightweight per-arc view — user
+# turns, top-level agent responses, and coarse friction signals — rather
+# than the full trajectory dump the reflect step gets.
+
+
+def _arc_conversation_snippets(arc_id: int) -> tuple[list[str], list[str]]:
+    """Return (user_turns, assistant_turns) for arc_id's originating conv.
+
+    An arc may be linked to zero, one, or many conversations
+    (``conversation_arcs``). We take the earliest-linked conversation
+    (usually the originating chat), read its ``messages`` in order, and
+    split into user / assistant turns capped at
+    ``_TRIAGE_USER_MAX_CHARS`` / ``_TRIAGE_AGENT_MAX_CHARS`` total per
+    side. Trigger/background arcs with no conversation return two empty
+    lists.
+    """
+    with db_connection() as db:
+        row = db.execute(
+            "SELECT conversation_id FROM conversation_arcs "
+            "WHERE arc_id = ? ORDER BY created_at ASC LIMIT 1",
+            (arc_id,),
+        ).fetchone()
+        if not row:
+            return [], []
+        conv_id = row["conversation_id"]
+        msg_rows = db.execute(
+            "SELECT role, content FROM messages "
+            "WHERE conversation_id = ? ORDER BY id ASC",
+            (conv_id,),
+        ).fetchall()
+
+    users: list[str] = []
+    assistants: list[str] = []
+    user_used = 0
+    agent_used = 0
+    for m in msg_rows:
+        role = m["role"]
+        content = m["content"] or ""
+        if role == "user" and user_used < _TRIAGE_USER_MAX_CHARS:
+            remaining = _TRIAGE_USER_MAX_CHARS - user_used
+            snippet = content[:remaining]
+            users.append(snippet)
+            user_used += len(snippet)
+        elif role == "assistant" and agent_used < _TRIAGE_AGENT_MAX_CHARS:
+            remaining = _TRIAGE_AGENT_MAX_CHARS - agent_used
+            snippet = content[:remaining]
+            assistants.append(snippet)
+            agent_used += len(snippet)
+    return users, assistants
+
+
+def _arc_friction_signals(arc_id: int) -> dict:
+    """Return a small dict of arc-tree friction signals for triage.
+
+    Signals actually collected today:
+      - status: the arc's final status (completed / failed / etc.)
+      - child_count / failed_child_count
+      - retry_count: number of retry_attempts recorded on this arc
+
+    Per-arc tool-call / KB-fetch counts are NOT collected — the
+    coordinator's ``kb_access_log`` records per-conversation, and there
+    is no per-arc tool-invocation counter today. Adding either is
+    instrumentation work tracked in ``carpenter_reflection_v2.md``; the
+    triage prompt (``triage-goal.md``) has been trimmed to reference
+    only the signals actually available. This keeps the prompt honest
+    rather than asking triage to decide against evidence it can't see.
+    """
+    signals: dict = {"status": "unknown"}
+    with db_connection() as db:
+        arc = db.execute(
+            "SELECT status FROM arcs WHERE id = ?", (arc_id,),
+        ).fetchone()
+        if arc:
+            signals["status"] = arc["status"]
+        children = db.execute(
+            "SELECT status FROM arcs WHERE parent_id = ?", (arc_id,),
+        ).fetchall()
+        signals["child_count"] = len(children)
+        signals["failed_child_count"] = sum(
+            1 for c in children if c["status"] == "failed"
+        )
+        try:
+            retries = db.execute(
+                "SELECT COUNT(*) AS n FROM retry_attempts WHERE arc_id = ?",
+                (arc_id,),
+            ).fetchone()
+            signals["retry_count"] = int(retries["n"]) if retries else 0
+        except Exception:  # noqa: BLE001 — table may not exist in older DBs
+            signals["retry_count"] = 0
+    return signals
+
+
+def _triage_block_for_arc(arc_id: int) -> str:
+    """Return a compact triage-summary markdown block for one arc."""
+    arc = arc_manager.get_arc(arc_id)
+    if not arc:
+        return f"### Arc #{arc_id} — missing\n"
+    users, assistants = _arc_conversation_snippets(arc_id)
+    signals = _arc_friction_signals(arc_id)
+    goal = (arc.get("goal") or "").strip()
+    parts = [
+        f"### Arc #{arc['id']} [{signals.get('status')}] {arc.get('name') or ''}",
+    ]
+    if goal:
+        parts.append(f"- goal: {goal[:200]}")
+    parts.append(
+        "- signals: children={child_count} failed_children={failed_child_count} "
+        "retries={retry_count}".format(**signals)
+    )
+    if users:
+        parts.append("- user turns:")
+        for u in users:
+            for line in u.splitlines():
+                parts.append(f"  > {line}")
+    if assistants:
+        parts.append("- assistant turns:")
+        for a in assistants:
+            for line in a.splitlines():
+                parts.append(f"  > {line}")
+    if not users and not assistants:
+        parts.append("- (no originating conversation)")
+    parts.append("")
+    return "\n".join(parts)
+
+
+def triage_summary_from_subject(subject: dict) -> str:
+    """Return the lightweight triage view for a subject.
+
+    Per root arc: originating chat prompts, top-level agent responses,
+    and coarse arc-tree friction signals. Designed to be small enough to
+    feed haiku on every batch — no full trajectories, no child-arc
+    outputs.
+    """
+    from ._subject import subject_arc_ids
+
+    arc_ids = subject_arc_ids(subject)
+    if not arc_ids:
+        return "# Triage Summary — no arcs in subject\n"
+    window = subject.get("window") or {}
+    parts = [
+        "# Triage Summary",
+        "",
+        (
+            "For each root arc: the user's prompt (if any), the agent's "
+            "top-level response(s), and coarse arc-tree friction "
+            "signals. Decide whether synthesis is warranted."
+        ),
+        "",
+        f"- period: {window.get('from', '?')} → {window.get('to', '?')}",
+        f"- arc count: {len(arc_ids)}",
+        "",
+    ]
+    for aid in arc_ids:
+        parts.append(_triage_block_for_arc(aid))
     return "\n".join(parts)

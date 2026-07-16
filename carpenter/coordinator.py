@@ -573,7 +573,13 @@ class Coordinator:
                     work_id,
                 )
                 return
-            get_store().write_entry(
+            # Content-hash dedupe is now enforced inside KBStore.write_entry
+            # itself — a byte-identical rewrite short-circuits with an
+            # "unchanged" success and no I/O. Every KB writer benefits
+            # (chat kb.edit, package installers, reflection dispatch),
+            # not just this coordinator handler.
+            store = get_store()
+            store.write_entry(
                 path=path,
                 content=content,
                 description=payload.get("description") or "",
