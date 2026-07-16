@@ -722,3 +722,131 @@ async def test_handler_collects_pending_reviews_from_grandchildren():
     content = system_msgs[0]["content"]
     assert "Pending reviews:" in content
     assert "/api/review/grandchild-999" in content
+
+
+# ── Reflection arcs get a single-email escalation path ───────────────
+
+
+def _create_reflection_arc(name: str = "reflection") -> int:
+    """Create a reflection-origin_kind root arc for the single-email tests."""
+    return arc_manager.create_arc(name, origin_kind="reflection")
+
+
+@pytest.mark.asyncio
+async def test_reflection_no_pending_reviews_sends_no_email():
+    """A completed reflection with nothing actionable must not notify.
+
+    The whole point of the fix: a passive daily tick with 0 proposed
+    actions should be silent, not spam the operator.
+    """
+    arc_id = _create_reflection_arc()
+    arc_manager.update_status(arc_id, "active")
+    set_arc_state(arc_id, "_agent_response", "nothing to do")
+    arc_manager.update_status(arc_id, "completed")
+
+    conv_id = conversation.get_or_create_conversation()
+    db = get_db()
+    try:
+        db.execute(
+            "INSERT INTO conversation_arcs (conversation_id, arc_id) VALUES (?, ?)",
+            (conv_id, arc_id),
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    mock_run = AsyncMock()
+    with patch(
+        "carpenter.core.workflows.arc_notify_handler.thread_pools.run_in_work_pool",
+        mock_run,
+    ):
+        await handle_arc_chat_notify(1, {"arc_id": arc_id})
+
+    msgs = conversation.get_messages(conv_id)
+    assert [m for m in msgs if m["role"] == "system"] == []
+    mock_run.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_reflection_with_pending_reviews_sends_exactly_one_email():
+    """A reflection with pending review URLs sends ONE message and skips
+    the chat-agent relay.
+
+    Previously the raw system message *and* the chat-agent's paraphrase
+    both landed in the email-medium conversation, producing two emails.
+    """
+    parent_id = _create_reflection_arc()
+    arc_manager.update_status(parent_id, "active")
+    set_arc_state(parent_id, "_agent_response", "reflection done")
+
+    child_id = arc_manager.add_child(parent_id, "reflection-action-0")
+    set_arc_state(child_id, "_review_mode", "human")
+    set_arc_state(child_id, "review_url", "/api/review/abc-123")
+
+    arc_manager.update_status(parent_id, "completed")
+
+    conv_id = conversation.get_or_create_conversation()
+    db = get_db()
+    try:
+        db.execute(
+            "INSERT INTO conversation_arcs (conversation_id, arc_id) VALUES (?, ?)",
+            (conv_id, parent_id),
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    mock_run = AsyncMock()
+    with patch(
+        "carpenter.core.workflows.arc_notify_handler.thread_pools.run_in_work_pool",
+        mock_run,
+    ):
+        await handle_arc_chat_notify(1, {"arc_id": parent_id})
+
+    system_msgs = [
+        m for m in conversation.get_messages(conv_id) if m["role"] == "system"
+    ]
+    assert len(system_msgs) == 1
+    content = system_msgs[0]["content"]
+    assert "/api/review/abc-123" in content
+    assert "Pending review URLs:" in content
+    assert "[Be concise.]" not in content
+    mock_run.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_reflection_failed_sends_one_email_no_chat_relay():
+    """A failed reflection still emails once — failures are worth
+    surfacing — but the chat-agent relay stays skipped."""
+    arc_id = _create_reflection_arc()
+    arc_manager.update_status(arc_id, "active")
+    arc_manager.update_status(arc_id, "failed")
+
+    conv_id = conversation.get_or_create_conversation()
+    db = get_db()
+    try:
+        db.execute(
+            "INSERT INTO conversation_arcs (conversation_id, arc_id) VALUES (?, ?)",
+            (conv_id, arc_id),
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    mock_run = AsyncMock()
+    with patch(
+        "carpenter.core.workflows.arc_notify_handler.thread_pools.run_in_work_pool",
+        mock_run,
+    ):
+        await handle_arc_chat_notify(1, {"arc_id": arc_id})
+
+    # Filter to messages our handler produced (there is also a separate
+    # root_failure message emitted by an unrelated reporter).
+    ours = [
+        m
+        for m in conversation.get_messages(conv_id)
+        if m["role"] == "system" and m["content"].startswith("Reflection arc")
+    ]
+    assert len(ours) == 1
+    assert "failed" in ours[0]["content"]
+    mock_run.assert_not_called()

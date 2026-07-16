@@ -159,6 +159,30 @@ def _build_resource_preview(arc_id: int, arc_name: str) -> str | None:
     return msg
 
 
+def _build_reflection_message(
+    name: str, status: str, review_urls: list[str]
+) -> str:
+    """Plain-text body for the reflection escalation email.
+
+    Only invoked when there is something actionable to surface — pending
+    review URLs or a failure.  Completed-with-no-URLs is suppressed
+    upstream so a passive tick never emails.
+    """
+    if status == "failed":
+        lines = [f'Reflection arc "{name}" failed.']
+    else:
+        lines = [
+            f'Reflection arc "{name}" completed with '
+            f"pending human-review actions."
+        ]
+    if review_urls:
+        lines.append("")
+        lines.append("Pending review URLs:")
+        for url in review_urls:
+            lines.append(f"  - {url}")
+    return "\n".join(lines)
+
+
 async def handle_arc_chat_notify(work_id: int, payload: dict) -> None:
     """Handle an ``arc.chat_notify`` work item.
 
@@ -201,6 +225,40 @@ async def handle_arc_chat_notify(work_id: int, payload: dict) -> None:
     # Build notification message
     name = arc.get("name") or f"#{arc_id}"
     status = arc["status"]
+
+    # Reflection arcs get a dedicated single-email escalation path:
+    #   * suppressed entirely when the arc completed with no pending
+    #     review URLs — a passive daily tick with nothing actionable
+    #     should not page the operator, and
+    #   * when there IS something actionable (or a failure), a plain-text
+    #     message is written to the email-medium conversation ONCE and
+    #     the chat-agent relay is skipped.
+    # Previously both the raw system message AND the chat-agent's
+    # paraphrase were add_message'd into the reflection-home
+    # conversation, and add_message auto-dispatches every non-user
+    # message on email-channel conversations — so every reflection
+    # produced two emails.
+    if arc.get("origin_kind") == "reflection":
+        pending_review_urls = _collect_pending_reviews(arc_id)
+        if status == "completed" and not pending_review_urls:
+            logger.info(
+                "arc.chat_notify: reflection arc %d completed with no "
+                "pending reviews — no email sent",
+                arc_id,
+            )
+            return
+        msg = _build_reflection_message(name, status, pending_review_urls)
+        conversation.add_message(
+            conv_id, "system", msg, arc_id=arc_id, hidden=True
+        )
+        logger.info(
+            "arc.chat_notify: reflection arc %d — sent 1 escalation email "
+            "(%d pending review URL%s)",
+            arc_id,
+            len(pending_review_urls),
+            "" if len(pending_review_urls) == 1 else "s",
+        )
+        return
 
     if status == "completed":
         # Prefer a trusted primary Resource preview when the arc set one.
