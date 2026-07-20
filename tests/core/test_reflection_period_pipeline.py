@@ -472,7 +472,6 @@ def test_end_to_end_typed_contracts(pkg, stub_invoke):
                 "action_type": "kb",
             },
         ],
-        "kb_edit_targets": [],
     })
     set_arc_state(reflect_id, "_agent_response", payload)
     arc_manager.update_status(reflect_id, "active")

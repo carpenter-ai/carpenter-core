@@ -73,11 +73,11 @@ class ReflectionResult:
     ``summary`` is the free-form reflection text (kept for provenance;
     no longer written to KB as a diary entry). ``proposed_actions`` are
     the structured follow-ups the ``dispatch-actions`` step fans out
-    into child arcs. ``kb_edit_targets`` lists existing KB paths the
-    reflect agent proposes editing — dispatch-actions prefers routing to
-    edit-existing-entry actions over new-entry actions when populated.
+    into child arcs. Each ``ProposedAction.target_path`` is the single
+    source of truth for what the action touches — dispatch-actions
+    routes on that path directly and the workflow selector picks
+    ``kb-change`` on an existing entry when the path resolves to one.
     """
 
     summary: str
     proposed_actions: list[ProposedAction] = attrs.Factory(list)
-    kb_edit_targets: list[str] = attrs.Factory(list)

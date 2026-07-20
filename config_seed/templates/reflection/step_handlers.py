@@ -31,11 +31,14 @@ Four Python-only step handlers ship in this package:
 - :func:`handle_dispatch_actions` — post-save step. Reads the sibling
   ``reflect`` arc's ``ReflectionResult``, iterates its structured
   ``proposed_actions``, and dispatches each one through the platform's
-  standard ``invoke_coding_change`` entry point. When
-  ``kb_edit_targets`` is populated on the reflect output, edit-target
-  paths take precedence over any per-action ``target_path`` for
-  workflow selection (routing to ``kb-change`` on an existing path
-  rather than creating a new entry).
+  standard ``invoke_coding_change`` entry point. Each action's
+  ``target_path`` drives workflow selection directly — the workflow
+  selector routes ``kb-change`` on an existing entry when the path
+  resolves to one. Actions whose ``target_path`` matches a diary-shape
+  pattern (``reflections/*``, ``by-day/*``, dated components, etc.)
+  are dropped as safety-net protection against the "reintroduce a
+  diary" failure mode; the drop is recorded on this arc's
+  ``_dispatch_dropped_diary_targets`` state for provenance.
 
 All four are registered in ``__init__.py`` via :func:`register_handlers`.
 Reflection is driven by a daily cron (see :mod:`.daily_tick`).
@@ -45,6 +48,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 
 import cattrs
 
@@ -244,7 +248,6 @@ async def handle_reflect_gated(arc_id: int, arc_info: dict) -> None:
         empty = ReflectionResult(
             summary="",
             proposed_actions=[],
-            kb_edit_targets=[],
         )
         set_arc_state(
             arc_id, "_agent_response",
@@ -290,8 +293,9 @@ async def handle_reflect_gated(arc_id: int, arc_info: dict) -> None:
     # "Prefer edit over create": for each focus pointer surfaced by
     # triage, run ``KBStore.search`` and append a compact "Nearby KB
     # entries" block to the goal. The reflect prompt (see
-    # ``reflect-goal.md``) instructs the agent to populate
-    # ``kb_edit_targets`` from this list before proposing a fresh path.
+    # ``reflect-goal.md``) instructs the agent to set a proposed
+    # action's ``target_path`` to one of these nearby entries before
+    # proposing a fresh path.
     nearby_block, nearby_paths = _build_nearby_kb_block(
         triage_result.focus_pointers,
     )
@@ -396,8 +400,8 @@ def _build_nearby_kb_block(focus_pointers) -> tuple[str, list[str]]:
             "For each focus pointer surfaced by triage, the platform "
             "searched the KB and found these topically-adjacent existing "
             "entries. Prefer editing one of these over creating a new "
-            "entry. Populate ``kb_edit_targets`` with any path below "
-            "that a proposed action would touch."
+            "entry — set the proposed action's ``target_path`` to a "
+            "path below (verbatim) when the lesson belongs there."
         ),
         "",
     ]
@@ -430,6 +434,44 @@ def _pointer_to_query(pointer) -> str:
             s for s in (arc.get("name") or "", arc.get("goal") or "") if s
         ) or p
     return p
+
+
+# Path-component prefixes that indicate a per-time-period diary entry.
+# These are structural (KB-layout) diary shapes — kept in sync with the
+# ``## Never write per-time-period diary entries`` section of
+# ``reflect-goal.md``.
+_DIARY_PREFIXES: tuple[str, ...] = (
+    "reflections/",
+    "by-day/",
+    "by-arc/",
+    "daily/",
+    "weekly/",
+    "monthly/",
+)
+# Any path component matching ISO-date-shaped ``YYYY-MM-DD`` also
+# indicates a diary entry regardless of prefix.
+_DATE_COMPONENT_RE = re.compile(r"(?:^|[/_-])\d{4}-\d{2}-\d{2}(?:[/_-]|$)")
+
+
+def _is_diary_path(path: str) -> bool:
+    """Return True when ``path`` looks like a per-time-period diary entry.
+
+    Belt-and-braces safety net: the reflect prompt already forbids
+    these; this predicate is the handler-level backstop that filters
+    LLM output that ignored the prompt. Match rules:
+
+    - starts with any prefix in ``_DIARY_PREFIXES`` (case-insensitive)
+    - contains an ISO date component like ``2026-06-19``
+    """
+    if not path:
+        return False
+    lower = path.lower().lstrip("/")
+    for prefix in _DIARY_PREFIXES:
+        if lower.startswith(prefix):
+            return True
+    if _DATE_COMPONENT_RE.search(lower):
+        return True
+    return False
 
 
 def _find_arc_conversation_id(arc_id: int) -> int | None:
@@ -474,7 +516,6 @@ async def handle_save_reflection(arc_id: int, arc_info: dict) -> None:
 
     summary = (result.summary if result is not None else "") or ""
     n_actions = len(result.proposed_actions) if result is not None else 0
-    n_edit_targets = len(result.kb_edit_targets) if result is not None else 0
 
     # If the reflect step raised, ``_reflect_error`` was written on the
     # reflect arc so save-reflection can record the failure honestly
@@ -486,7 +527,6 @@ async def handle_save_reflection(arc_id: int, arc_info: dict) -> None:
     provenance = {
         "summary": summary,
         "proposed_action_count": n_actions,
-        "kb_edit_target_count": n_edit_targets,
         "subject_kind": (subject or {}).get("kind"),
         "model": model_resolver.get_model_for_role("reflection"),
     }
@@ -509,9 +549,9 @@ async def handle_save_reflection(arc_id: int, arc_info: dict) -> None:
         conv_module.archive_conversation(conv_row["conversation_id"])
 
     logger.info(
-        "save-reflection arc %d completed: %d proposed action(s), "
-        "%d kb_edit_target(s) — no diary KB write (v2)",
-        arc_id, n_actions, n_edit_targets,
+        "save-reflection arc %d completed: %d proposed action(s) — "
+        "no diary KB write (v2)",
+        arc_id, n_actions,
     )
 
 
@@ -522,13 +562,16 @@ async def handle_dispatch_actions(arc_id: int, arc_info: dict) -> None:
     which picks the appropriate workflow template
     (``coding-change`` / ``yaml-change`` / ``kb-change``) via
     :func:`select_workflow_for_paths` and applies the standard
-    force-human gate for T1/T0 paths.
+    force-human gate for T1/T0 paths. Each action's ``target_path`` is
+    the single source of truth for what the action touches; when it
+    matches an existing KB entry the selector routes to ``kb-change``.
 
-    When the reflect output populates ``kb_edit_targets``, dispatch
-    passes those paths as ``affected_paths`` in preference to the
-    per-action ``target_path`` so the workflow selector routes the
-    action to an ``kb-change`` on an existing entry rather than
-    creating a new one.
+    Actions whose ``target_path`` looks like a per-time-period diary
+    entry (see :func:`_is_diary_path`) are dropped before dispatch.
+    The prompt already forbids these paths; this handler is the
+    belt-and-braces safety net that records dropped targets on
+    ``_dispatch_dropped_diary_targets`` for provenance and monitoring
+    of LLM compliance.
     """
     if arc_info.get("status") == "pending":
         arc_manager.update_status(arc_id, "active")
@@ -546,7 +589,29 @@ async def handle_dispatch_actions(arc_id: int, arc_info: dict) -> None:
         )
 
     proposed = list(result.proposed_actions) if result is not None else []
-    kb_edit_targets = list(result.kb_edit_targets) if result is not None else []
+    dropped_diary_targets: list[dict] = []
+    kept: list = []
+    for action in proposed:
+        tp = (action.target_path or "").strip()
+        if tp and _is_diary_path(tp):
+            dropped_diary_targets.append({
+                "target_path": tp,
+                "action_type": action.action_type or "other",
+                "description": (action.description or "").strip()[:200],
+            })
+            logger.warning(
+                "dispatch-actions arc %d: dropping proposed action with "
+                "diary-shaped target_path %r (LLM ignored the prompt's "
+                "no-diary rule)",
+                arc_id, tp,
+            )
+            continue
+        kept.append(action)
+    proposed = kept
+    if dropped_diary_targets:
+        set_arc_state(
+            arc_id, "_dispatch_dropped_diary_targets", dropped_diary_targets,
+        )
 
     if not proposed:
         logger.info(
@@ -559,6 +624,7 @@ async def handle_dispatch_actions(arc_id: int, arc_info: dict) -> None:
             "action_types": [],
             "total_proposed": 0,
             "truncated": 0,
+            "dropped_diary_targets": len(dropped_diary_targets),
         })
         arc_manager.update_status(arc_id, "completed")
         arc_manager.freeze_arc(arc_id)
@@ -593,23 +659,12 @@ async def handle_dispatch_actions(arc_id: int, arc_info: dict) -> None:
             "parent_id": arc_id,
         }
 
-        # Prefer edit-existing over new-write: when the reflect step
-        # populated kb_edit_targets AND this is a kb-type action AND
-        # the action either targets one of the edit targets or has no
-        # target of its own, route via the kb_edit_targets so
-        # select_workflow_for_paths picks kb-change on the existing
-        # entry.
-        effective_paths: list[str] = []
-        if action_type == "kb" and kb_edit_targets:
-            if action_target and action_target in kb_edit_targets:
-                effective_paths = [action_target]
-            elif not action_target:
-                effective_paths = list(kb_edit_targets)
-            else:
-                effective_paths = [action_target]
-        elif action_target:
-            effective_paths = [action_target]
-
+        # The action's target_path is the sole source of truth for
+        # what the action touches. When it names an existing KB entry
+        # the workflow selector routes to kb-change on that entry;
+        # when it names a new path the selector routes to a fresh
+        # kb-change/coding-change as appropriate.
+        effective_paths: list[str] = [action_target] if action_target else []
         if effective_paths:
             invoke_params["affected_paths"] = effective_paths
 
@@ -650,7 +705,7 @@ async def handle_dispatch_actions(arc_id: int, arc_info: dict) -> None:
         "action_types": action_types,
         "total_proposed": total_proposed,
         "truncated": truncated_count,
-        "kb_edit_targets": kb_edit_targets,
+        "dropped_diary_targets": len(dropped_diary_targets),
     })
 
     arc_manager.update_status(arc_id, "completed")
@@ -661,7 +716,7 @@ async def handle_dispatch_actions(arc_id: int, arc_info: dict) -> None:
 
     logger.info(
         "dispatch-actions arc %d: spawned %d child arcs from %d proposed "
-        "actions (%d truncated by cap=%d, %d kb_edit_targets)",
+        "actions (%d truncated by cap=%d, %d dropped as diary paths)",
         arc_id, len(spawned_arcs), total_proposed, truncated_count, cap,
-        len(kb_edit_targets),
+        len(dropped_diary_targets),
     )
