@@ -39,8 +39,13 @@ def _register_builtin_factories():
         from .signal_channel import SignalChannelConnector
         return SignalChannelConnector(name, config)
 
+    def _email_factory(name, config):
+        from .email_channel import EmailChannelConnector
+        return EmailChannelConnector(name, config)
+
     register_factory("channel", "telegram", _telegram_factory)
     register_factory("channel", "signal", _signal_factory)
+    register_factory("channel", "email", _email_factory)
 
 
 # Register on import

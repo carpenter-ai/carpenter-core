@@ -1,57 +1,66 @@
-"""Tests for the reflection escalation gate + email-medium dispatch.
+"""Tests for the reflection escalation gate + email-medium plumbing.
 
-Covers the two public entry points on
-:mod:`carpenter.core.reflection_escalation` plus the
-:func:`conversation.add_message` generalisation and the
-:func:`handle_reflection_tick` gate.
+The email delivery layer itself now lives in
+:class:`carpenter.channels.email_channel.EmailChannelConnector` (tested
+separately in ``tests/channels/test_email_channel.py``).  This module
+tests only the reflection-specific glue:
+
+* :func:`ensure_escalation_ready` — config-presence + connector-presence
+  gate that ``handle_reflection_tick`` uses to refuse to start when
+  escalation would be undeliverable.
+* :func:`get_or_create_reflection_home_conversation` — idempotent
+  email-medium conversation with a seeded ``channel_bindings`` row.
+* :func:`format_reflection_email_body` — URL-hoisting body preparation.
+* :func:`send_reflection_escalation` — thin coroutine that hands the
+  formatted body to the email connector's ``send_message``.
 """
 
 from __future__ import annotations
 
 import asyncio
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+
+# Tests that need to drive coroutines use `async def` so pytest-asyncio
+# (mode=auto) manages the loop.  Calling ``asyncio.run()`` here would
+# close the process default loop and break sibling tests that use the
+# deprecated ``asyncio.get_event_loop()`` pattern.
 
 from carpenter import config
 from carpenter.agent import conversation
 from carpenter.core import reflection_escalation
+from carpenter.db import get_db
 
 
 # ── ensure_escalation_ready ───────────────────────────────────────────
 
 
-def _install_full_smtp(monkeypatch):
-    """Stub resolve_package_secret so all required keys return values."""
-    def fake_resolve(pkg, key):
-        if pkg != "carpenter-imap-email":
-            return None
-        return {
-            "EMAIL_SMTP_HOST": "smtp.example.com",
-            "EMAIL_SMTP_USERNAME": "bot@example.com",
-            "EMAIL_SMTP_PASSWORD": "hunter2",
-            "EMAIL_SMTP_PORT": "587",
-            "EMAIL_SMTP_FROM": "bot@example.com",
-        }.get(key)
-
+def _install_fake_email_connector(monkeypatch, connector=None):
+    """Stub _get_email_connector to return ``connector`` (or a MagicMock)."""
+    if connector is None:
+        connector = MagicMock()
+        connector.channel_type = "email"
+        connector.enabled = True
     monkeypatch.setattr(
-        "carpenter.core.reflection_escalation.resolve_package_secret",
-        fake_resolve,
+        "carpenter.core.reflection_escalation._get_email_connector",
+        lambda: connector,
     )
+    return connector
 
 
 def test_ensure_escalation_ready_false_when_config_missing(monkeypatch):
     """No ``reflection.escalation.email.to`` config → gate refuses."""
-    _install_full_smtp(monkeypatch)
-    # Ensure there is no reflection.escalation.email.to entry.
+    _install_fake_email_connector(monkeypatch)
     monkeypatch.setitem(config.CONFIG, "reflection", {})
     assert reflection_escalation.ensure_escalation_ready() is False
 
 
-def test_ensure_escalation_ready_false_when_smtp_creds_missing(monkeypatch):
-    """SMTP creds unresolved → gate refuses even with a `to` address."""
+def test_ensure_escalation_ready_false_when_no_connector(monkeypatch):
+    """No enabled email connector → gate refuses even with a `to` address."""
     monkeypatch.setattr(
-        "carpenter.core.reflection_escalation.resolve_package_secret",
-        lambda pkg, key: None,
+        "carpenter.core.reflection_escalation._get_email_connector",
+        lambda: None,
     )
     monkeypatch.setitem(
         config.CONFIG,
@@ -63,7 +72,7 @@ def test_ensure_escalation_ready_false_when_smtp_creds_missing(monkeypatch):
 
 def test_ensure_escalation_ready_false_when_to_missing_at(monkeypatch):
     """A ``to`` value missing an ``@`` is not a valid address."""
-    _install_full_smtp(monkeypatch)
+    _install_fake_email_connector(monkeypatch)
     monkeypatch.setitem(
         config.CONFIG,
         "reflection",
@@ -73,8 +82,8 @@ def test_ensure_escalation_ready_false_when_to_missing_at(monkeypatch):
 
 
 def test_ensure_escalation_ready_true_when_all_present(monkeypatch):
-    """Both config and creds present → gate opens."""
-    _install_full_smtp(monkeypatch)
+    """Config address + a registered connector → gate opens."""
+    _install_fake_email_connector(monkeypatch)
     monkeypatch.setitem(
         config.CONFIG,
         "reflection",
@@ -86,8 +95,13 @@ def test_ensure_escalation_ready_true_when_all_present(monkeypatch):
 # ── get_or_create_reflection_home_conversation ─────────────────────────
 
 
-def test_reflection_home_conversation_idempotent():
+def test_reflection_home_conversation_idempotent(monkeypatch):
     """Creating on first call, reusing on second call."""
+    monkeypatch.setitem(
+        config.CONFIG,
+        "reflection",
+        {"escalation": {"email": {"to": "you@example.com"}}},
+    )
     first = reflection_escalation.get_or_create_reflection_home_conversation()
     second = reflection_escalation.get_or_create_reflection_home_conversation()
     assert first == second
@@ -98,13 +112,40 @@ def test_reflection_home_conversation_idempotent():
     assert conv["channel_type"] == "email"
 
 
-def test_reflection_home_conversation_unarchives_stale():
-    """A previously-archived reflection-home is un-archived on next lookup.
+def test_reflection_home_conversation_seeds_channel_binding(monkeypatch):
+    """A ``channel_bindings`` row must land so the email connector can
+    resolve a recipient for the reflection-home conversation."""
+    to_addr = "operator@example.com"
+    monkeypatch.setitem(
+        config.CONFIG,
+        "reflection",
+        {"escalation": {"email": {"to": to_addr}}},
+    )
+    home_id = reflection_escalation.get_or_create_reflection_home_conversation()
 
-    Without this, arc_notify_handler would discard the archived conv and
-    fall back to get_last_conversation() (a chat conv the user doesn't
-    monitor), silently rerouting reflection escalation email.
-    """
+    conn = get_db()
+    try:
+        row = conn.execute(
+            "SELECT channel_user_id, conversation_id "
+            "FROM channel_bindings "
+            "WHERE channel_type = 'email' AND conversation_id = ?",
+            (home_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+
+    assert row is not None
+    assert row["channel_user_id"] == to_addr
+    assert row["conversation_id"] == home_id
+
+
+def test_reflection_home_conversation_unarchives_stale(monkeypatch):
+    """A previously-archived reflection-home is un-archived on next lookup."""
+    monkeypatch.setitem(
+        config.CONFIG,
+        "reflection",
+        {"escalation": {"email": {"to": "you@example.com"}}},
+    )
     home_id = reflection_escalation.get_or_create_reflection_home_conversation()
     conversation.archive_conversation(home_id)
     assert conversation.get_conversation(home_id)["archived"] == 1
@@ -115,14 +156,13 @@ def test_reflection_home_conversation_unarchives_stale():
     assert conv["archived"] == 0
 
 
-def test_reflection_home_conversation_ignores_non_email_same_title():
-    """A same-title conversation with a NULL channel_type is not reused.
-
-    We look up by (title, channel_type='email'), so a stray conversation
-    that happens to have the same title but no email channel_type is
-    ignored and a fresh email-medium row is created.
-    """
-    # Create a non-email conversation with the same title.
+def test_reflection_home_conversation_ignores_non_email_same_title(monkeypatch):
+    """A same-title conversation with a NULL channel_type is not reused."""
+    monkeypatch.setitem(
+        config.CONFIG,
+        "reflection",
+        {"escalation": {"email": {"to": "you@example.com"}}},
+    )
     conv_id = conversation.create_conversation()
     conversation.set_conversation_title(
         conv_id, reflection_escalation.REFLECTION_HOME_TITLE,
@@ -134,195 +174,129 @@ def test_reflection_home_conversation_ignores_non_email_same_title():
     assert home["channel_type"] == "email"
 
 
-# ── add_message routing ────────────────────────────────────────────────
+# ── format_reflection_email_body ────────────────────────────────────────
 
 
-def test_add_message_chat_medium_does_not_invoke_smtp(monkeypatch):
-    """Regular chat conversations must NOT trigger email dispatch."""
-    calls: list[tuple] = []
-
-    def fake_dispatch(*args, **kwargs):
-        calls.append((args, kwargs))
-        return True
-
-    monkeypatch.setattr(
-        "carpenter.core.reflection_escalation.dispatch_email_message",
-        fake_dispatch,
-    )
-
-    conv_id = conversation.create_conversation()  # channel_type = NULL
-    conversation.add_message(conv_id, "assistant", "hi there")
-
-    assert calls == []
+def test_format_reflection_email_body_hoists_body_urls():
+    """A review URL in the body is surfaced in the header."""
+    url = "https://example.com/api/review/deadbeef-1234-5678-9abc-def012345678"
+    body = f"Please review at {url}"
+    out = reflection_escalation.format_reflection_email_body(body)
+    assert "Pending review URLs:" in out
+    assert url in out
+    assert out.index("Pending review URLs") < out.index("Please review at")
 
 
-def test_add_message_email_medium_dispatches(monkeypatch):
-    """Email-medium conversations MUST route add_message through SMTP."""
-    calls: list[dict] = []
+def test_format_reflection_email_body_hoists_subtree_urls(monkeypatch):
+    """When body omits the URL, subtree lookup fills it in.
 
-    def fake_dispatch(conversation_id, role, message, arc_id=None):
-        calls.append({
-            "conversation_id": conversation_id,
-            "role": role,
-            "message": message,
-            "arc_id": arc_id,
-        })
-        return True
-
-    monkeypatch.setattr(
-        "carpenter.core.reflection_escalation.dispatch_email_message",
-        fake_dispatch,
-    )
-
-    home_id = reflection_escalation.get_or_create_reflection_home_conversation()
-    # No arc_id: FK requires a real arc row, and the routing logic doesn't
-    # care about arc_id — it only checks the conversation's channel_type.
-    conversation.add_message(home_id, "system", "arc 42 completed")
-
-    assert len(calls) == 1
-    assert calls[0]["conversation_id"] == home_id
-    assert calls[0]["role"] == "system"
-    assert calls[0]["arc_id"] is None
-    assert "arc 42 completed" in calls[0]["message"]
-
-
-def test_dispatch_email_message_skips_user_role(monkeypatch):
-    """The ``user`` role must be skipped entirely (no SMTP send)."""
-    sent: list[tuple] = []
-
-    def fake_send(email_config, message, subject):
-        sent.append((email_config, message, subject))
-        return True
-
-    monkeypatch.setattr(
-        "carpenter.core.notifications._send_email_smtp",
-        fake_send,
-    )
-    _install_full_smtp(monkeypatch)
-    monkeypatch.setitem(
-        config.CONFIG,
-        "reflection",
-        {"escalation": {"email": {"to": "you@example.com"}}},
-    )
-
-    result = reflection_escalation.dispatch_email_message(
-        conversation_id=1, role="user", message="hi",
-    )
-    assert result is False
-    assert sent == []
-
-
-def test_dispatch_email_message_calls_send_email_smtp(monkeypatch):
-    """A non-user message with valid config actually invokes SMTP send."""
-    sent: list[tuple] = []
-
-    def fake_send(email_config, message, subject):
-        sent.append((email_config, message, subject))
-        return True
-
-    monkeypatch.setattr(
-        "carpenter.core.notifications._send_email_smtp",
-        fake_send,
-    )
-    _install_full_smtp(monkeypatch)
-    monkeypatch.setitem(
-        config.CONFIG,
-        "reflection",
-        {"escalation": {"email": {"to": "you@example.com"}}},
-    )
-
-    review_url = "https://example.com/api/review/deadbeef-1234-5678-9abc-def012345678"
-    body = f"Arc 7 completed. See {review_url} to approve."
-    ok = reflection_escalation.dispatch_email_message(
-        conversation_id=42, role="assistant", message=body, arc_id=7,
-    )
-    assert ok is True
-    assert len(sent) == 1
-    email_config, message, subject = sent[0]
-    # Subject includes the arc id and a body snippet.
-    assert "arc 7" in subject
-    assert "[Reflection]" in subject
-    # Body highlights the review URL at the top AND preserves the original.
-    assert review_url in message
-    assert message.index("Pending review URLs") < message.index("Arc 7 completed.")
-    # Email config was assembled from the fake resolver.
-    assert email_config["smtp_host"] == "smtp.example.com"
-    assert email_config["smtp_to"] == "you@example.com"
-
-
-def test_dispatch_email_message_appends_subtree_review_urls(monkeypatch):
-    """URL missing from message body but present in the arc subtree must
-    still land in the email header.
-
-    Regression cover: the chat-agent response that ``arc.chat_notify``
-    re-invokes often summarises with "Review pending at the link above"
-    without repeating the URL, so a body-only regex would ship a
-    linkless escalation email — defeating the whole point of the
-    channel.
+    Regression cover: the chat-agent summary often reads
+    "Review pending at the link above" with no URL — the connector must
+    still ship an actionable link.
     """
-    sent: list[tuple] = []
-
-    def fake_send(email_config, message, subject):
-        sent.append((email_config, message, subject))
-        return True
-
     subtree_url = (
         "https://example.com/api/review/deadbeef-1234-5678-9abc-def012345678"
-    )
-    monkeypatch.setattr(
-        "carpenter.core.notifications._send_email_smtp",
-        fake_send,
     )
     monkeypatch.setattr(
         "carpenter.core.workflows.arc_notify_handler._collect_pending_reviews",
         lambda arc_id: [subtree_url],
     )
-    _install_full_smtp(monkeypatch)
-    monkeypatch.setitem(
-        config.CONFIG,
-        "reflection",
-        {"escalation": {"email": {"to": "you@example.com"}}},
-    )
-
-    body = "Review pending at the link above."  # no URL in prose
-    ok = reflection_escalation.dispatch_email_message(
-        conversation_id=42, role="assistant", message=body, arc_id=7,
-    )
-    assert ok is True
-    _, message, _ = sent[0]
-    assert subtree_url in message
-    assert message.index("Pending review URLs") < message.index(
+    body = "Review pending at the link above."
+    out = reflection_escalation.format_reflection_email_body(body, arc_id=7)
+    assert subtree_url in out
+    assert out.index("Pending review URLs") < out.index(
         "Review pending at the link above."
     )
 
 
-def test_dispatch_email_message_swallows_smtp_errors(monkeypatch):
-    """An exception in _send_email_smtp is logged, not raised."""
-    def boom(email_config, message, subject):
-        raise RuntimeError("smtp exploded")
+def test_format_reflection_email_body_no_urls_returns_message():
+    """When there are no URLs anywhere, no header is added."""
+    body = "Reflection completed with nothing to do."
+    out = reflection_escalation.format_reflection_email_body(body)
+    assert out == body
 
+
+def test_format_reflection_email_body_deduplicates_urls(monkeypatch):
+    """A URL in both body and subtree is not listed twice."""
+    url = "https://example.com/api/review/deadbeef-1234-5678-9abc-def012345678"
     monkeypatch.setattr(
-        "carpenter.core.notifications._send_email_smtp",
-        boom,
+        "carpenter.core.workflows.arc_notify_handler._collect_pending_reviews",
+        lambda arc_id: [url],
     )
-    _install_full_smtp(monkeypatch)
-    monkeypatch.setitem(
-        config.CONFIG,
-        "reflection",
-        {"escalation": {"email": {"to": "you@example.com"}}},
+    body = f"See {url} to approve."
+    out = reflection_escalation.format_reflection_email_body(body, arc_id=7)
+    # Only one occurrence in the header block
+    header = out.split("\n\n", 1)[0]
+    assert header.count(url) == 1
+
+
+# ── send_reflection_escalation ─────────────────────────────────────────
+
+
+async def test_send_reflection_escalation_returns_false_when_no_connector(
+    monkeypatch,
+):
+    """Missing email connector → the coroutine returns ``False`` cleanly."""
+    monkeypatch.setattr(
+        "carpenter.core.reflection_escalation._get_email_connector",
+        lambda: None,
+    )
+    ok = await reflection_escalation.send_reflection_escalation(
+        conversation_id=42, message="anything"
+    )
+    assert ok is False
+
+
+async def test_send_reflection_escalation_calls_connector(monkeypatch):
+    """Body is formatted, subject is derived, connector.send_message is called."""
+    url = "https://example.com/api/review/deadbeef-1234-5678-9abc-def012345678"
+    connector = MagicMock()
+    connector.send_message = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        "carpenter.core.reflection_escalation._get_email_connector",
+        lambda: connector,
     )
 
-    # No exception must escape.
-    result = reflection_escalation.dispatch_email_message(
-        conversation_id=1, role="system", message="oops",
+    body = f"Arc 7 completed. See {url} to approve."
+    ok = await reflection_escalation.send_reflection_escalation(
+        conversation_id=42, message=body, arc_id=7
     )
-    assert result is False
+    assert ok is True
+
+    connector.send_message.assert_awaited_once()
+    args, kwargs = connector.send_message.call_args
+    # positional (conversation_id, formatted_body)
+    assert args[0] == 42
+    formatted = args[1]
+    assert url in formatted
+    assert formatted.index("Pending review URLs") < formatted.index(
+        "Arc 7 completed."
+    )
+    # metadata carries subject + arc_id
+    md = kwargs["metadata"]
+    assert "arc 7" in md["subject"]
+    assert "[Reflection]" in md["subject"]
+    assert md["arc_id"] == 7
+
+
+async def test_send_reflection_escalation_forwards_failure(monkeypatch):
+    """A ``False`` return from the connector propagates back to the caller."""
+    connector = MagicMock()
+    connector.send_message = AsyncMock(return_value=False)
+    monkeypatch.setattr(
+        "carpenter.core.reflection_escalation._get_email_connector",
+        lambda: connector,
+    )
+    ok = await reflection_escalation.send_reflection_escalation(
+        conversation_id=1, message="hi"
+    )
+    assert ok is False
 
 
 # ── daily_tick gate ────────────────────────────────────────────────────
 
 
-def test_handle_reflection_tick_gates_when_escalation_missing(monkeypatch):
+async def test_handle_reflection_tick_gates_when_escalation_missing(monkeypatch):
     """When the gate blocks, no reflection arc must be created."""
     from config_seed.templates.reflection import daily_tick as _daily_tick
 
@@ -331,7 +305,6 @@ def test_handle_reflection_tick_gates_when_escalation_missing(monkeypatch):
         lambda: False,
     )
 
-    # Sentinel to detect any arc creation attempt.
     arc_creation_calls: list[dict] = []
 
     def _record(*args, **kwargs):
@@ -343,6 +316,6 @@ def test_handle_reflection_tick_gates_when_escalation_missing(monkeypatch):
         _record,
     )
 
-    asyncio.run(_daily_tick.handle_reflection_tick(work_id=0, payload={}))
+    await _daily_tick.handle_reflection_tick(work_id=0, payload={})
 
     assert arc_creation_calls == []

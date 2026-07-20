@@ -1,6 +1,5 @@
 """Tests for Connector ABC and HealthStatus."""
 
-import asyncio
 from datetime import datetime
 
 import pytest
@@ -54,15 +53,15 @@ class TestConnectorABC:
         assert c.kind == "tool"
         assert c.enabled is True
 
-    def test_start_stop(self):
+    async def test_start_stop(self):
         c = DummyConnector("test")
-        asyncio.get_event_loop().run_until_complete(c.start({}))
+        await c.start({})
         assert c._started
-        asyncio.get_event_loop().run_until_complete(c.stop())
+        await c.stop()
         assert c._stopped
 
-    def test_health_check(self):
+    async def test_health_check(self):
         c = DummyConnector("test")
-        result = asyncio.get_event_loop().run_until_complete(c.health_check())
+        result = await c.health_check()
         assert result.healthy is True
         assert result.detail == "ok"

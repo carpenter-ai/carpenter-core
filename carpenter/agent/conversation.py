@@ -156,28 +156,14 @@ def add_message(
             (conversation_id,),
         )
 
-        # Look up channel_type INSIDE the same transaction so we route
-        # correctly even if the conversation was just created.
-        channel_row = db.execute(
-            "SELECT channel_type FROM conversations WHERE id = ?",
-            (conversation_id,),
-        ).fetchone()
-
-    # Out-of-band delivery for medium-typed conversations (currently email
-    # only) runs AFTER the transaction commits so the DB row is durable
-    # regardless of what SMTP does.  This is the reflection escalation path:
-    # a reflection-home email-medium conversation routes every
-    # non-user message it receives to the configured email destination.
-    channel_type = channel_row["channel_type"] if channel_row else None
-    if channel_type == "email":
-        try:
-            from ..core.reflection_escalation import dispatch_email_message
-            dispatch_email_message(conversation_id, role, content, arc_id=arc_id)
-        except Exception:  # broad catch: outbound delivery must not raise
-            logger.exception(
-                "add_message: email dispatch failed for conversation %d",
-                conversation_id,
-            )
+    # Outbound delivery for channel-medium conversations is the caller's
+    # responsibility now: they own a :class:`ChannelConnector` (e.g.
+    # :class:`EmailChannelConnector`) and call ``send_message()``
+    # explicitly.  Previously ``add_message`` sniffed
+    # ``channel_type == 'email'`` and side-triggered an SMTP send, which
+    # coupled DB persistence to network I/O and caused every
+    # non-user write on the reflection-home conversation to fan-out
+    # (system message *and* chat-agent reply → two emails per tick).
     return msg_id
 
 
