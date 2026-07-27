@@ -11,8 +11,11 @@ Covers the observable-behaviour invariants promised by the v2 design:
 - The generic ``kb.write_entry`` handler in the coordinator dedupes on
   content hash: when the proposed body matches the existing entry
   exactly, no write is performed.
-- ``dispatch-actions`` prefers ``kb_edit_targets`` over per-action
-  ``target_path`` when populated for kb-type actions.
+- ``dispatch-actions`` routes each action via its ``target_path``
+  directly (single source of truth for what the action touches).
+- ``dispatch-actions`` drops actions whose ``target_path`` matches a
+  per-time-period diary shape (``reflections/*``, dated components,
+  etc.) and records the drop on ``_dispatch_dropped_diary_targets``.
 """
 
 from __future__ import annotations
@@ -364,7 +367,6 @@ def test_save_reflection_never_enqueues_kb_write(pkg):
     set_arc_state(reflect_id, "_agent_response", json.dumps({
         "summary": "The batch showed a recurring flaky-test pattern.",
         "proposed_actions": [],
-        "kb_edit_targets": [],
     }))
     arc_manager.update_status(reflect_id, "active")
     arc_manager.update_status(reflect_id, "completed")
@@ -382,14 +384,12 @@ def test_save_reflection_never_enqueues_kb_write(pkg):
 # applies to every KB writer.
 
 
-# ── dispatch-actions prefers kb_edit_targets over per-action target ─
+# ── dispatch-actions routes via each action's target_path ──────────
 
 
-def test_dispatch_prefers_kb_edit_targets_over_action_target(
-    pkg, stub_invoke,
-):
-    """When kb_edit_targets is populated and a kb action has no
-    target_path, dispatch routes via the edit targets."""
+def test_dispatch_routes_via_action_target_path(pkg, stub_invoke):
+    """Each proposed action's target_path drives dispatch directly —
+    it is passed as ``affected_paths`` to invoke_coding_change."""
     a1 = _insert_arc("goal-1")
     _, _, _, reflect_id, _, dispatch_id = _build_tree([a1])
 
@@ -398,11 +398,10 @@ def test_dispatch_prefers_kb_edit_targets_over_action_target(
         "proposed_actions": [
             {
                 "description": "clarify wording of the caching note",
-                "target_path": None,
+                "target_path": "skills/caching/lru",
                 "action_type": "kb",
             },
         ],
-        "kb_edit_targets": ["skills/caching/lru"],
     }))
     arc_manager.update_status(reflect_id, "active")
     arc_manager.update_status(reflect_id, "completed")
@@ -411,3 +410,150 @@ def test_dispatch_prefers_kb_edit_targets_over_action_target(
 
     assert len(stub_invoke) == 1
     assert stub_invoke[0]["affected_paths"] == ["skills/caching/lru"]
+
+
+def test_dispatch_no_target_path_omits_affected_paths(pkg, stub_invoke):
+    """An action with no target_path still dispatches, and the coding-
+    change invocation gets no ``affected_paths`` (the workflow selector
+    then routes generically on the description)."""
+    a1 = _insert_arc("goal-1")
+    _, _, _, reflect_id, _, dispatch_id = _build_tree([a1])
+
+    set_arc_state(reflect_id, "_agent_response", json.dumps({
+        "summary": "generic follow-up with no specific target",
+        "proposed_actions": [
+            {
+                "description": "investigate the flaky-test pattern",
+                "target_path": None,
+                "action_type": "other",
+            },
+        ],
+    }))
+    arc_manager.update_status(reflect_id, "active")
+    arc_manager.update_status(reflect_id, "completed")
+    arc_manager.update_status(dispatch_id, "active")
+    _run(pkg.step_handlers.handle_dispatch_actions, dispatch_id)
+
+    assert len(stub_invoke) == 1
+    assert "affected_paths" not in stub_invoke[0]
+
+
+# ── dispatch-actions drops diary-shaped target_path values ─────────
+
+
+@pytest.mark.parametrize("diary_path", [
+    "reflections/cache-efficiency-baseline",
+    "reflections/by-day/2026-06-19",
+    "by-day/2026-06-19/summary",
+    "by-arc/9304",
+    "daily/2026-06-19",
+    "weekly/2026-W25",
+    "monthly/2026-06",
+    "topics/cache/2026-06-19/notes",
+    "insights/2026-06-19-cache-hit-rate",
+])
+def test_dispatch_drops_diary_shaped_target_paths(
+    pkg, stub_invoke, diary_path,
+):
+    """Actions whose target_path looks like a per-time-period diary
+    entry are dropped, and the drop is recorded on
+    ``_dispatch_dropped_diary_targets`` for provenance."""
+    a1 = _insert_arc("goal-1")
+    _, _, _, reflect_id, _, dispatch_id = _build_tree([a1])
+
+    set_arc_state(reflect_id, "_agent_response", json.dumps({
+        "summary": "LLM proposed a diary write despite the prompt",
+        "proposed_actions": [
+            {
+                "description": "note today's cache hit rate as baseline",
+                "target_path": diary_path,
+                "action_type": "kb",
+            },
+            {
+                "description": "add cross-ref to canonical caching note",
+                "target_path": "skills/caching/lru",
+                "action_type": "kb",
+            },
+        ],
+    }))
+    arc_manager.update_status(reflect_id, "active")
+    arc_manager.update_status(reflect_id, "completed")
+    arc_manager.update_status(dispatch_id, "active")
+    _run(pkg.step_handlers.handle_dispatch_actions, dispatch_id)
+
+    # Only the durable-topic action reached dispatch.
+    assert len(stub_invoke) == 1
+    assert stub_invoke[0]["affected_paths"] == ["skills/caching/lru"]
+
+    # The drop was recorded with enough context for post-hoc audit.
+    dropped = get_arc_state(dispatch_id, "_dispatch_dropped_diary_targets")
+    assert isinstance(dropped, list)
+    assert len(dropped) == 1
+    assert dropped[0]["target_path"] == diary_path
+    assert dropped[0]["action_type"] == "kb"
+
+    # Provenance summary reflects the drop count.
+    resp = get_arc_state(dispatch_id, "_agent_response")
+    assert resp["dropped_diary_targets"] == 1
+
+
+def test_dispatch_no_diary_paths_leaves_dropped_state_unset(
+    pkg, stub_invoke,
+):
+    """When no proposed action hits the diary filter,
+    ``_dispatch_dropped_diary_targets`` is not written and the
+    provenance count is zero."""
+    a1 = _insert_arc("goal-1")
+    _, _, _, reflect_id, _, dispatch_id = _build_tree([a1])
+
+    set_arc_state(reflect_id, "_agent_response", json.dumps({
+        "summary": "clean output",
+        "proposed_actions": [
+            {
+                "description": "tighten wording of the caching note",
+                "target_path": "skills/caching/lru",
+                "action_type": "kb",
+            },
+        ],
+    }))
+    arc_manager.update_status(reflect_id, "active")
+    arc_manager.update_status(reflect_id, "completed")
+    arc_manager.update_status(dispatch_id, "active")
+    _run(pkg.step_handlers.handle_dispatch_actions, dispatch_id)
+
+    assert get_arc_state(
+        dispatch_id, "_dispatch_dropped_diary_targets",
+    ) is None
+    resp = get_arc_state(dispatch_id, "_agent_response")
+    assert resp["dropped_diary_targets"] == 0
+
+
+def test_is_diary_path_predicate(pkg):
+    """Unit-level guard against future prefix regressions in
+    :func:`_is_diary_path`."""
+    from carpenter_template_packages.reflection.step_handlers import (
+        _is_diary_path,
+    )
+    # Positive cases:
+    for p in [
+        "reflections/cache-baseline",
+        "REFLECTIONS/Foo",  # case-insensitive
+        "/reflections/leading-slash",
+        "by-day/anything",
+        "by-arc/9304",
+        "daily/whatever",
+        "weekly/2026-W25",
+        "monthly/2026-06",
+        "topics/foo/2026-06-19",
+        "insights/2026-06-19-note",
+    ]:
+        assert _is_diary_path(p), f"expected diary: {p!r}"
+    # Negative cases:
+    for p in [
+        "",
+        "skills/caching/lru",
+        "topics/foo/durable-idea",
+        "runbooks/failover",
+        "concepts/associative-memory",
+    ]:
+        assert not _is_diary_path(p), f"expected non-diary: {p!r}"

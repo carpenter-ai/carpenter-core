@@ -28,13 +28,26 @@ Before proposing a new KB entry:
    candidate home for the lesson from that pointer.
 2. If any nearby entry is a plausible home, propose editing it (add a
    cross-reference, tighten wording, add a "when to use this" note)
-   and add its path to ``kb_edit_targets``.
+   and set that action's ``target_path`` to the nearby entry's path
+   exactly as listed.
 3. Only propose a brand-new KB entry when no nearby entry is a
    plausible home for the lesson.
 
-Populate ``kb_edit_targets`` with the paths of existing entries you
-would edit. Dispatch prefers routing to edit-existing-entry actions
-when this field is populated.
+## Never write per-time-period diary entries
+
+The KB is associative memory, not a journal. Do **NOT** propose
+``target_path`` values that look like time-period diary paths, e.g.:
+
+- ``reflections/…`` (anything under ``reflections/``)
+- ``by-day/…``, ``by-arc/…``, ``daily/…``, ``weekly/…``, ``monthly/…``
+- any path containing a date component like ``2026-06-19`` or
+  ``2026/06/19``
+- a path whose leaf describes an event or observation from a specific
+  run (``cache-efficiency-baseline``, ``today-summary``, etc.) rather
+  than a durable topic
+
+If the lesson has no durable topic home, either propose editing a
+nearby entry that *does* cover the topic, or omit the action.
 
 ## Output contract
 
@@ -47,13 +60,9 @@ schema:
   "proposed_actions": [
     {
       "description": "<one-line, concrete, actionable>",
-      "target_path": "<existing KB/file path if editing, or new path if creating>",
+      "target_path": "<existing KB/file path if editing, or new topical path if creating>",
       "action_type": "kb | code | config | other"
     }
-  ],
-  "kb_edit_targets": [
-    "existing/kb/path/to/edit",
-    "another/existing/path"
   ]
 }
 ```
@@ -64,8 +73,10 @@ Keep ``proposed_actions`` short — **three or fewer** well-justified
 actions are almost always better than a longer list. If nothing needs
 to change after all, return an empty ``proposed_actions`` array.
 
-The platform will parse your response as JSON. Do not wrap the JSON in
-backticks or prose.
+**Output raw JSON only.** Do NOT wrap the JSON in triple backticks.
+Do NOT prefix with ``json``. Do NOT add any prose before or after
+the JSON object. The first character of your response must be ``{``
+and the last must be ``}``.
 
 ## Activity to reflect on
 
