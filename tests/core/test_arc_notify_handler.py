@@ -814,14 +814,20 @@ async def test_reflection_with_pending_reviews_sends_exactly_one_email():
     ]
     assert len(system_msgs) == 1
     content = system_msgs[0]["content"]
-    assert "/api/review/abc-123" in content
-    assert "Pending review URLs:" in content
+    # URL emission is delegated to format_reflection_email_body (called
+    # inside send_reflection_escalation) so the outgoing email hoists a
+    # subtree-derived URL list once — the DB body itself is intentionally
+    # URL-free, avoiding a duplicate header/inline URL block in email.
+    assert "Pending review URLs:" not in content
+    assert '"reflection"' in content or "reflection" in content
     assert "[Be concise.]" not in content
     mock_run.assert_not_called()
     mock_send.assert_called_once()
     call_args, call_kwargs = mock_send.call_args
     assert call_args[0] == conv_id
     assert call_args[1] == content
+    # Arc id is what lets send_reflection_escalation walk the subtree for
+    # pending-review URLs — without it, the outgoing email would have no URL.
     assert call_kwargs["arc_id"] == parent_id
 
 

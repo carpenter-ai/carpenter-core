@@ -75,6 +75,12 @@ class EmailChannelConnector(ChannelConnector):
         self._smtp_timeout: float = float(cc.get("smtp_timeout", 30))
         self._subject_prefix: str = cc.get("subject_prefix", "[Carpenter]")
         self._last_healthy: datetime | None = None
+        # Set True at the end of ``start()`` after credentials are
+        # materialised.  The reflection gate consults this before opening
+        # — a connector that raised in ``start()`` (and was therefore
+        # left in the registry by :meth:`ConnectorRegistry.start_all` but
+        # never fully initialised) must not report ready.
+        self.started: bool = False
 
     # -- Lifecycle ------------------------------------------------------
 
@@ -101,6 +107,7 @@ class EmailChannelConnector(ChannelConnector):
             self._smtp_from = self._smtp_username or ""
 
         self._last_healthy = datetime.now()
+        self.started = True
         logger.info(
             "Email connector %r started (host=%s, from=%s)",
             self.name, self._smtp_host, self._smtp_from or "<unset>",
@@ -108,6 +115,7 @@ class EmailChannelConnector(ChannelConnector):
 
     async def stop(self) -> None:
         """No persistent connection to tear down."""
+        self.started = False
         return None
 
     async def health_check(self) -> HealthStatus:

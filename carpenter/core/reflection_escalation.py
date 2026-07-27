@@ -59,10 +59,19 @@ def _escalation_email_to() -> str | None:
 
 
 def _get_email_connector():
-    """Return the enabled email connector, or ``None``.
+    """Return the enabled+started email connector, or ``None``.
 
     Kept as a module-level function so tests can monkey-patch a single
     entry point instead of reaching into the registry.
+
+    A connector that raised during :meth:`start` is left in the registry
+    (:meth:`ConnectorRegistry.start_all` logs the exception and moves
+    on) but its ``started`` flag stays False.  Treating it as ready
+    would let :func:`ensure_escalation_ready` pass — reflection would
+    fire, produce human-review URLs, and the send would silently fail
+    inside the half-initialised connector.  Guarding on ``started``
+    keeps the "reflection needs an async delivery channel" invariant
+    honest.
     """
     from ..channels.registry import get_connector_registry
 
@@ -70,8 +79,16 @@ def _get_email_connector():
     if reg is None:
         return None
     for connector in reg.list_connectors(kind="channel"):
-        if getattr(connector, "channel_type", None) == "email" and connector.enabled:
-            return connector
+        if getattr(connector, "channel_type", None) != "email":
+            continue
+        if not connector.enabled:
+            continue
+        # ``started`` is set by EmailChannelConnector at the end of
+        # start(); a connector without the attribute (e.g. a stub in
+        # tests) is treated as ready to preserve monkey-patch ergonomics.
+        if not getattr(connector, "started", True):
+            continue
+        return connector
     return None
 
 

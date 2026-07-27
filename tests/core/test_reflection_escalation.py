@@ -92,6 +92,53 @@ def test_ensure_escalation_ready_true_when_all_present(monkeypatch):
     assert reflection_escalation.ensure_escalation_ready() is True
 
 
+def test_get_email_connector_skips_unstarted(monkeypatch):
+    """A connector whose ``start()`` raised must not be reported ready.
+
+    :class:`ConnectorRegistry.start_all` catches start-time exceptions
+    and moves on, leaving the failed connector in ``self.connectors``.
+    Without this guard, ``ensure_escalation_ready`` would open the gate,
+    reflection would produce human-review URLs, and the send would then
+    silently fail — the exact "silent human-review orphan" scenario the
+    reflections-need-an-async-channel rule warns about.
+    """
+    from carpenter.channels.email_channel import EmailChannelConnector
+
+    # Real connector, real ``started=False`` (never called start()).
+    conn = EmailChannelConnector(connector_config={"enabled": True})
+    assert conn.started is False  # sanity
+
+    fake_registry = MagicMock()
+    fake_registry.list_connectors.return_value = [conn]
+    monkeypatch.setattr(
+        "carpenter.channels.registry.get_connector_registry",
+        lambda: fake_registry,
+    )
+    assert reflection_escalation._get_email_connector() is None
+
+
+async def test_get_email_connector_returns_started(monkeypatch):
+    """A fully-started connector IS returned by the reflection lookup."""
+    from carpenter.channels.email_channel import EmailChannelConnector
+
+    conn = EmailChannelConnector(connector_config={
+        "enabled": True,
+        "smtp_host": "smtp.example.com",
+        "smtp_username": "bot@example.com",
+        "smtp_password": "x",
+    })
+    await conn.start({})
+    assert conn.started is True  # sanity
+
+    fake_registry = MagicMock()
+    fake_registry.list_connectors.return_value = [conn]
+    monkeypatch.setattr(
+        "carpenter.channels.registry.get_connector_registry",
+        lambda: fake_registry,
+    )
+    assert reflection_escalation._get_email_connector() is conn
+
+
 # ── get_or_create_reflection_home_conversation ─────────────────────────
 
 

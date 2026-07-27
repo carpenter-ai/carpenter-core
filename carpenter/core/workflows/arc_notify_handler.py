@@ -167,20 +167,23 @@ def _build_reflection_message(
     Only invoked when there is something actionable to surface — pending
     review URLs or a failure.  Completed-with-no-URLs is suppressed
     upstream so a passive tick never emails.
+
+    Deliberately does NOT include the review URLs in the body —
+    :func:`reflection_escalation.format_reflection_email_body` hoists
+    them into a header via a subtree walk on the reflection arc.
+    Emitting them here too would result in the outgoing email showing
+    the URL list twice (once in the formatter header, once inline).
+    ``review_urls`` is still an argument so callers stay explicit about
+    whether this send is actionable — the arg is used to shape the
+    opening line's phrasing.
     """
+    del review_urls  # intentionally unused; see docstring
     if status == "failed":
-        lines = [f'Reflection arc "{name}" failed.']
-    else:
-        lines = [
-            f'Reflection arc "{name}" completed with '
-            f"pending human-review actions."
-        ]
-    if review_urls:
-        lines.append("")
-        lines.append("Pending review URLs:")
-        for url in review_urls:
-            lines.append(f"  - {url}")
-    return "\n".join(lines)
+        return f'Reflection arc "{name}" failed.'
+    return (
+        f'Reflection arc "{name}" completed with '
+        f"pending human-review actions."
+    )
 
 
 async def handle_arc_chat_notify(work_id: int, payload: dict) -> None:
