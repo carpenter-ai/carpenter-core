@@ -167,20 +167,23 @@ def _build_reflection_message(
     Only invoked when there is something actionable to surface — pending
     review URLs or a failure.  Completed-with-no-URLs is suppressed
     upstream so a passive tick never emails.
+
+    Deliberately does NOT include the review URLs in the body —
+    :func:`reflection_escalation.format_reflection_email_body` hoists
+    them into a header via a subtree walk on the reflection arc.
+    Emitting them here too would result in the outgoing email showing
+    the URL list twice (once in the formatter header, once inline).
+    ``review_urls`` is still an argument so callers stay explicit about
+    whether this send is actionable — the arg is used to shape the
+    opening line's phrasing.
     """
+    del review_urls  # intentionally unused; see docstring
     if status == "failed":
-        lines = [f'Reflection arc "{name}" failed.']
-    else:
-        lines = [
-            f'Reflection arc "{name}" completed with '
-            f"pending human-review actions."
-        ]
-    if review_urls:
-        lines.append("")
-        lines.append("Pending review URLs:")
-        for url in review_urls:
-            lines.append(f"  - {url}")
-    return "\n".join(lines)
+        return f'Reflection arc "{name}" failed.'
+    return (
+        f'Reflection arc "{name}" completed with '
+        f"pending human-review actions."
+    )
 
 
 async def handle_arc_chat_notify(work_id: int, payload: dict) -> None:
@@ -230,14 +233,10 @@ async def handle_arc_chat_notify(work_id: int, payload: dict) -> None:
     #   * suppressed entirely when the arc completed with no pending
     #     review URLs — a passive daily tick with nothing actionable
     #     should not page the operator, and
-    #   * when there IS something actionable (or a failure), a plain-text
-    #     message is written to the email-medium conversation ONCE and
-    #     the chat-agent relay is skipped.
-    # Previously both the raw system message AND the chat-agent's
-    # paraphrase were add_message'd into the reflection-home
-    # conversation, and add_message auto-dispatches every non-user
-    # message on email-channel conversations — so every reflection
-    # produced two emails.
+    #   * when there IS something actionable (or a failure), one message
+    #     is persisted to the reflection-home conversation and one
+    #     email is dispatched via the EmailChannel connector; the
+    #     chat-agent relay is skipped.
     if arc.get("origin_kind") == "reflection":
         pending_review_urls = _collect_pending_reviews(arc_id)
         if status == "completed" and not pending_review_urls:
@@ -251,10 +250,13 @@ async def handle_arc_chat_notify(work_id: int, payload: dict) -> None:
         conversation.add_message(
             conv_id, "system", msg, arc_id=arc_id, hidden=True
         )
+        from ..reflection_escalation import send_reflection_escalation
+        sent = await send_reflection_escalation(conv_id, msg, arc_id=arc_id)
         logger.info(
-            "arc.chat_notify: reflection arc %d — sent 1 escalation email "
+            "arc.chat_notify: reflection arc %d — email dispatch %s "
             "(%d pending review URL%s)",
             arc_id,
+            "OK" if sent else "FAILED",
             len(pending_review_urls),
             "" if len(pending_review_urls) == 1 else "s",
         )

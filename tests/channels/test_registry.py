@@ -34,7 +34,7 @@ class DummyConnector(Connector):
 
 
 class TestConnectorRegistryLifecycle:
-    def test_start_all(self, tmp_path):
+    async def test_start_all(self, tmp_path):
         shared = tmp_path / "shared"
         shared.mkdir()
         registry = ConnectorRegistry({
@@ -45,9 +45,9 @@ class TestConnectorRegistryLifecycle:
                 "shared_folder": str(shared),
             },
         })
-        asyncio.get_event_loop().run_until_complete(registry.start_all())
+        await registry.start_all()
 
-    def test_stop_all(self, tmp_path):
+    async def test_stop_all(self, tmp_path):
         shared = tmp_path / "shared"
         shared.mkdir()
         registry = ConnectorRegistry({
@@ -58,9 +58,9 @@ class TestConnectorRegistryLifecycle:
                 "shared_folder": str(shared),
             },
         })
-        asyncio.get_event_loop().run_until_complete(registry.stop_all())
+        await registry.stop_all()
 
-    def test_managed_context_manager(self, tmp_path):
+    async def test_managed_context_manager(self, tmp_path):
         shared = tmp_path / "shared"
         shared.mkdir()
         registry = ConnectorRegistry({
@@ -72,11 +72,8 @@ class TestConnectorRegistryLifecycle:
             },
         })
 
-        async def _run():
-            async with registry.managed():
-                assert len(registry.connectors) == 1
-
-        asyncio.get_event_loop().run_until_complete(_run())
+        async with registry.managed():
+            assert len(registry.connectors) == 1
 
 
 class TestFactoryRegistration:
@@ -104,7 +101,7 @@ class TestFactoryRegistration:
 
 
 class TestInitializeConnectorRegistry:
-    def test_initialize_with_empty_config(self, monkeypatch):
+    async def test_initialize_with_empty_config(self, monkeypatch):
         monkeypatch.setattr("carpenter.channels.registry.config.CONFIG", {
             "connectors": {},
             "plugins_config": "",
@@ -112,14 +109,12 @@ class TestInitializeConnectorRegistry:
         })
 
         with patch("carpenter.core.engine.main_loop.register_heartbeat_hook"):
-            asyncio.get_event_loop().run_until_complete(
-                initialize_connector_registry()
-            )
+            await initialize_connector_registry()
 
         registry = get_connector_registry()
         assert registry is not None
 
-    def test_initialize_auto_migrates(self, monkeypatch, tmp_path):
+    async def test_initialize_auto_migrates(self, monkeypatch, tmp_path):
         import json
         shared = tmp_path / "shared"
         shared.mkdir()
@@ -142,9 +137,7 @@ class TestInitializeConnectorRegistry:
         monkeypatch.setattr("carpenter.channels.registry.config.CONFIG", cfg)
 
         with patch("carpenter.core.engine.main_loop.register_heartbeat_hook"):
-            asyncio.get_event_loop().run_until_complete(
-                initialize_connector_registry()
-            )
+            await initialize_connector_registry()
 
         registry = get_connector_registry()
         assert registry is not None

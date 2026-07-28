@@ -491,9 +491,6 @@ async def test_handler_uses_archived_channel_medium_conversation():
     with patch(
         "carpenter.core.workflows.arc_notify_handler.thread_pools.run_in_work_pool",
         mock_run,
-    ), patch(
-        "carpenter.core.reflection_escalation.dispatch_email_message",
-        return_value=True,
     ):
         await handle_arc_chat_notify(1, {"arc_id": arc_id})
 
@@ -756,15 +753,20 @@ async def test_reflection_no_pending_reviews_sends_no_email():
         db.close()
 
     mock_run = AsyncMock()
+    mock_send = AsyncMock(return_value=True)
     with patch(
         "carpenter.core.workflows.arc_notify_handler.thread_pools.run_in_work_pool",
         mock_run,
+    ), patch(
+        "carpenter.core.reflection_escalation.send_reflection_escalation",
+        mock_send,
     ):
         await handle_arc_chat_notify(1, {"arc_id": arc_id})
 
     msgs = conversation.get_messages(conv_id)
     assert [m for m in msgs if m["role"] == "system"] == []
     mock_run.assert_not_called()
+    mock_send.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -797,9 +799,13 @@ async def test_reflection_with_pending_reviews_sends_exactly_one_email():
         db.close()
 
     mock_run = AsyncMock()
+    mock_send = AsyncMock(return_value=True)
     with patch(
         "carpenter.core.workflows.arc_notify_handler.thread_pools.run_in_work_pool",
         mock_run,
+    ), patch(
+        "carpenter.core.reflection_escalation.send_reflection_escalation",
+        mock_send,
     ):
         await handle_arc_chat_notify(1, {"arc_id": parent_id})
 
@@ -808,10 +814,21 @@ async def test_reflection_with_pending_reviews_sends_exactly_one_email():
     ]
     assert len(system_msgs) == 1
     content = system_msgs[0]["content"]
-    assert "/api/review/abc-123" in content
-    assert "Pending review URLs:" in content
+    # URL emission is delegated to format_reflection_email_body (called
+    # inside send_reflection_escalation) so the outgoing email hoists a
+    # subtree-derived URL list once — the DB body itself is intentionally
+    # URL-free, avoiding a duplicate header/inline URL block in email.
+    assert "Pending review URLs:" not in content
+    assert '"reflection"' in content or "reflection" in content
     assert "[Be concise.]" not in content
     mock_run.assert_not_called()
+    mock_send.assert_called_once()
+    call_args, call_kwargs = mock_send.call_args
+    assert call_args[0] == conv_id
+    assert call_args[1] == content
+    # Arc id is what lets send_reflection_escalation walk the subtree for
+    # pending-review URLs — without it, the outgoing email would have no URL.
+    assert call_kwargs["arc_id"] == parent_id
 
 
 @pytest.mark.asyncio
@@ -834,9 +851,13 @@ async def test_reflection_failed_sends_one_email_no_chat_relay():
         db.close()
 
     mock_run = AsyncMock()
+    mock_send = AsyncMock(return_value=True)
     with patch(
         "carpenter.core.workflows.arc_notify_handler.thread_pools.run_in_work_pool",
         mock_run,
+    ), patch(
+        "carpenter.core.reflection_escalation.send_reflection_escalation",
+        mock_send,
     ):
         await handle_arc_chat_notify(1, {"arc_id": arc_id})
 
@@ -850,3 +871,4 @@ async def test_reflection_failed_sends_one_email_no_chat_relay():
     assert len(ours) == 1
     assert "failed" in ours[0]["content"]
     mock_run.assert_not_called()
+    mock_send.assert_called_once()

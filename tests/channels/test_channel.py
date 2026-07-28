@@ -42,18 +42,18 @@ class TestInvocationTracker:
         tracker = InvocationTracker()
         assert tracker.is_pending(1) is False
 
-    def test_track_makes_pending(self):
+    async def test_track_makes_pending(self):
         tracker = InvocationTracker()
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         future = loop.create_future()
         task = asyncio.ensure_future(future)
         tracker.track(1, task)
         assert tracker.is_pending(1) is True
         future.set_result(None)
 
-    def test_done_callback_removes_pending(self):
+    async def test_done_callback_removes_pending(self):
         tracker = InvocationTracker()
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         future = loop.create_future()
         task = asyncio.ensure_future(future)
         tracker.track(1, task)
@@ -61,12 +61,12 @@ class TestInvocationTracker:
 
         # Complete the future and run callbacks
         future.set_result(None)
-        loop.run_until_complete(asyncio.sleep(0))
+        await asyncio.sleep(0)
         assert tracker.is_pending(1) is False
 
-    def test_cancel_all(self):
+    async def test_cancel_all(self):
         tracker = InvocationTracker()
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         future = loop.create_future()
         task = asyncio.ensure_future(future)
         tracker.track(1, task)
@@ -74,9 +74,9 @@ class TestInvocationTracker:
         assert tracker.is_pending(1) is False
         assert task.cancelled()
 
-    def test_clear(self):
+    async def test_clear(self):
         tracker = InvocationTracker()
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         future = loop.create_future()
         task = asyncio.ensure_future(future)
         tracker.track(1, task)
@@ -103,7 +103,7 @@ class TestChannelConnectorProperties:
 
 
 class TestChannelConnectorDeliverInbound:
-    def test_deliver_creates_conversation_and_message(self, db):
+    async def test_deliver_creates_conversation_and_message(self, db):
         """deliver_inbound saves the user message and returns a conv_id."""
         channel = DummyChannel()
 
@@ -114,14 +114,12 @@ class TestChannelConnectorDeliverInbound:
              patch("carpenter.agent.conversation.get_messages", return_value=[]):
             mock_invoke.return_value = {}
 
-            conv_id = asyncio.get_event_loop().run_until_complete(
-                channel.deliver_inbound("user123", "Hello")
-            )
+            conv_id = await channel.deliver_inbound("user123", "Hello")
 
         assert conv_id == 1
         mock_add.assert_called_once_with(1, "user", "Hello")
 
-    def test_deliver_with_explicit_conversation_id(self, db):
+    async def test_deliver_with_explicit_conversation_id(self, db):
         """deliver_inbound uses explicit conversation_id when provided."""
         channel = DummyChannel()
 
@@ -130,9 +128,7 @@ class TestChannelConnectorDeliverInbound:
              patch("carpenter.agent.conversation.get_messages", return_value=[]):
             mock_invoke.return_value = {}
 
-            conv_id = asyncio.get_event_loop().run_until_complete(
-                channel.deliver_inbound("user123", "Hello", conversation_id=42)
-            )
+            conv_id = await channel.deliver_inbound("user123", "Hello", conversation_id=42)
 
         assert conv_id == 42
         mock_add.assert_called_once_with(42, "user", "Hello")
