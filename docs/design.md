@@ -461,3 +461,32 @@ SQLite WAL mode. 20+ tables including:
 | `cron_entries` | Scheduled tasks |
 | `conversations_fts` | FTS5 full-text index on conversation titles/summaries |
 | `compaction_events` | Context compaction records (message ranges, model, tokens reclaimed) |
+
+---
+
+## Housekeeping
+
+### Resource Sweep
+
+Weekly job (03:00 UTC Sunday) that reclaims blobs from deprecated `resources` rows past `resource_sweep_age_days` (default 7). Configured by that top-level key. DB rows stay as tombstones; only the on-disk blob is unlinked. See `carpenter/core/resources/sweep.py`.
+
+### Data Retention
+
+Daily job (04:00 UTC) that ages out log-like rows in `platform.db` past a configurable per-table retention window. Off by default — opt in via `db_retention.enabled: true` in `config.yaml`. See `carpenter/core/engine/retention.py`.
+
+| Table | Predicate |
+|-------|-----------|
+| `events` | `processed=1 AND created_at < cutoff` |
+| `work_queue` | terminal `status` AND `COALESCE(completed_at, created_at) < cutoff` |
+| `arc_history` | arc in frozen status AND arc `updated_at < cutoff` |
+| `arc_state` | arc in frozen status AND arc `updated_at < cutoff` |
+| `tool_calls` | conversation `archived=1` AND `last_message_at < cutoff` AND row `created_at < cutoff` |
+| `messages` | conversation `archived=1` AND `last_message_at < cutoff` AND row `created_at < cutoff` |
+
+Each table has an independent `enabled` toggle and `retention_days` (default 30). `retention_days: 0` is treated as *disabled* for that table (safer than "delete everything"). Deletions are batched (`batch_size`, default 1000 rows/transaction). Deletion order fixes `tool_calls` before `messages` to preserve FK integrity.
+
+**`messages` retention is a no-op unless conversations get auto-archived upstream.** The predicate only touches messages whose parent conversation has `archived=1`. If your deployment never archives conversations, message pruning will not free any space no matter what retention_days you set — tune conversation archival (a separate concern) if you want this table's sweep to actually do work.
+
+**Disk space caveat**: SQLite reuses freed pages, so the `.db` file will not shrink after a sweep unless `db_retention.vacuum_after: true` is set or long-running growth eventually overwrites the freed pages. The nightly rsync snapshot backups still benefit from the changed page contents even without VACUUM.
+
+Emits `db.retention.swept` events with per-table `{projected, deleted}` counts for observability. Set `db_retention.dry_run: true` to log projected counts without executing any DELETE.

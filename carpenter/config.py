@@ -318,6 +318,30 @@ DEFAULTS = {
     "subscriptions": [],
     # Resource sweep: delete blobs of deprecated Resources older than N days.
     "resource_sweep_age_days": 7,
+    # Platform-DB retention sweep (see carpenter/core/engine/retention.py).
+    # Off by default — operators opt in explicitly by setting `enabled: true`.
+    # `retention_days = 0` on any table is treated as "disabled for that
+    # table" (safer than "delete everything").
+    #
+    # NOTE on `messages`: the retention predicate only touches messages
+    # under conversations that are `archived=1`.  If nothing archives
+    # conversations, this table's retention is effectively a no-op —
+    # tune conversation archival separately if you want message pruning
+    # to actually free space.  See docs/design.md § Data Retention.
+    "db_retention": {
+        "enabled": False,
+        "dry_run": False,
+        "batch_size": 1000,
+        "vacuum_after": False,
+        "tables": {
+            "events":      {"enabled": True, "retention_days": 30},
+            "work_queue":  {"enabled": True, "retention_days": 30},
+            "arc_history": {"enabled": True, "retention_days": 30},
+            "arc_state":   {"enabled": True, "retention_days": 30},
+            "tool_calls":  {"enabled": True, "retention_days": 30},
+            "messages":    {"enabled": True, "retention_days": 30},
+        },
+    },
     "connectors": {},                   # Connector definitions (replaces plugins.json)
     "connector_retention_days": 7,      # Days to keep completed connector task folders
     "plugin_shared_base": "",           # Base path for plugin shared folders (empty = disabled)
