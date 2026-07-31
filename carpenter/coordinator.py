@@ -300,6 +300,15 @@ class Coordinator:
         from .core.resources import sweep as _resource_sweep
         _resource_sweep.register_weekly_sweep(main_loop.register_handler)
 
+        # Register the daily platform-DB retention sweep.  Seeds a cron
+        # entry that emits ``db.retention.sweep`` and a work-item
+        # handler that runs :func:`run_retention_sweep`.  The sweep is
+        # gated on config (``db_retention.enabled``); the cron and
+        # handler are always registered so that flipping the config
+        # takes effect without a restart.
+        from .core.engine import retention as _db_retention
+        _db_retention.register_daily_retention(main_loop.register_handler)
+
         # Load subscriptions from config
         sub_configs = config.CONFIG.get("subscriptions", [])
         if sub_configs:
