@@ -60,4 +60,4 @@ not call `submit_code`.
 
 ## Batch summary
 
-{{ content }}
+{{ triage_summary }}
