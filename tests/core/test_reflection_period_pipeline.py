@@ -413,6 +413,36 @@ def test_gather_activity_writes_typed_output(pkg):
     assert "Triage Summary" in model.triage_summary
 
 
+def test_triage_goal_renders_gather_triage_summary(pkg):
+    """Regression: the triage step's goal template must render the
+    ``triage_summary`` field from the gather-activity sibling's output.
+
+    The step config in ``reflection.yaml`` sets
+    ``goal_input_field: triage_summary``, so the dispatch-time context
+    passed to ``triage-goal.md`` is ``{"triage_summary": <text>}``. If
+    the template references a different variable name it silently
+    renders empty and the triage LLM always answers ``needs_synthesis:
+    false``, killing the entire reflection pipeline.
+    """
+    from carpenter.core.arcs.dispatch_handler import (
+        _render_goal_from_sibling_output,
+    )
+
+    a1 = _insert_arc("goal-1", goal="alpha work")
+    a2 = _insert_arc("goal-2", goal="beta work")
+    _, gather_id, triage_id, _, _, _ = (
+        _build_period_reflection_tree([a1, a2], date="2026-06-19"))
+
+    arc_manager.update_status(gather_id, "active")
+    _run(pkg.step_handlers.handle_gather_activity, gather_id)
+
+    rendered = _render_goal_from_sibling_output(triage_id)
+    assert rendered is not None
+    assert "Batch summary" in rendered
+    assert "Triage Summary" in rendered
+    assert f"#{a1}" in rendered and f"#{a2}" in rendered
+
+
 def test_dispatch_reads_structured_proposed_actions(pkg, stub_invoke):
     """dispatch-actions reads the typed ReflectionResult from the reflect arc."""
     a1 = _insert_arc("goal-1")
