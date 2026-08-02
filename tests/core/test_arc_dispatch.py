@@ -1028,3 +1028,85 @@ class TestCloneArcForCron:
         # The clone path should refuse rather than produce an orphan
         # untrusted root with no reviewer chain.
         assert new_id is None
+
+
+# ---------------------------------------------------------------------------
+# LLM invocation error propagation (regression: arc-marks-completed-despite-400)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_arc_agent_raises_on_error_response():
+    """When invoke_for_chat returns an error-shaped result (circuit breaker,
+    HTTP 400 cost-cap, retries exhausted), _run_arc_agent must raise so the
+    outer dispatch handler routes through retry/escalate/mark-failed logic
+    instead of silently letting the arc freeze as ``completed`` with the
+    error string sitting in ``_agent_response``.
+
+    Regression: prior behavior stored the human-readable error message
+    (e.g. "AI service circuit breaker activated after 4 attempts…") as
+    ``_agent_response`` and returned normally, so freeze_arc(leaf) marked
+    the arc ``completed``.
+    """
+    arc_id = arc_manager.create_arc("test-err-propagate", goal="Test")
+    arc_manager.update_status(arc_id, "active")
+
+    error_info = ErrorInfo(
+        type="APIOutageError",
+        retry_count=4,
+        source_location="invocation._call_with_retries",
+        message=(
+            "AI service circuit breaker activated after 4 attempts. "
+            "Service may be experiencing issues. Please try again later."
+        ),
+    )
+    # Shape matches invoke_for_chat's error-return: response_text is the
+    # user-facing error string, and ``error`` is set to the ErrorInfo.
+    mock_result = {
+        "conversation_id": 1,
+        "response_text": error_info.message,
+        "code": None,
+        "message_id": None,
+        "error": error_info,
+    }
+
+    with patch("carpenter.thread_pools.run_in_work_pool", new_callable=AsyncMock) as mock_pool:
+        mock_pool.return_value = mock_result
+        with pytest.raises(Exception) as exc_info:
+            await arc_dispatch_handler._run_arc_agent(
+                arc_id=arc_id,
+                goal="Test",
+                source_conv_id=None,
+                agent_config=None,
+            )
+
+    # The raised exception carries the error message so callers / logs can
+    # identify the underlying failure.
+    assert "circuit breaker" in str(exc_info.value).lower() or "4 attempts" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_run_arc_agent_does_not_raise_on_success_response():
+    """Successful invocations must NOT raise — regression guard against the
+    error-propagation fix over-firing on normal responses.
+    """
+    arc_id = arc_manager.create_arc("test-success-noraise", goal="Test")
+    arc_manager.update_status(arc_id, "active")
+
+    # No ``error`` key — normal success path.
+    mock_result = {
+        "conversation_id": 1,
+        "response_text": "Here is the answer.",
+        "code": None,
+        "message_id": 42,
+    }
+
+    with patch("carpenter.thread_pools.run_in_work_pool", new_callable=AsyncMock) as mock_pool:
+        mock_pool.return_value = mock_result
+        # Should complete without raising
+        await arc_dispatch_handler._run_arc_agent(
+            arc_id=arc_id,
+            goal="Test",
+            source_conv_id=None,
+            agent_config=None,
+        )
