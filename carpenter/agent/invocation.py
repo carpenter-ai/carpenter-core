@@ -2643,6 +2643,7 @@ def invoke_for_chat(
                     error_json = json.dumps(error_info.to_json())
                 else:
                     # Fallback for backward compatibility
+                    error_info = None
                     error_text = "I'm sorry, I couldn't process your message right now."
                     error_json = None
 
@@ -2650,11 +2651,18 @@ def invoke_for_chat(
                 error_msg_id = conversation.add_message(
                     conv_id, "system", error_text, content_json=error_json
                 )
+                # NB: Include ``error`` in the return dict so upstream
+                # callers (in particular the arc dispatcher) can distinguish
+                # an error-return from a successful agent response. Without
+                # this signal, arc leaves silently transitioned to
+                # ``completed`` even when the LLM call had exhausted its
+                # retries (e.g. circuit-breaker open, HTTP 400 cost-cap).
                 return {
                     "conversation_id": conv_id,
                     "response_text": error_text,
                     "code": None,
                     "message_id": error_msg_id,
+                    "error": error_info,
                 }
             break
 
