@@ -19,3 +19,6 @@ venv/
 .mypy_cache/
 # Instance-specific launch script (contains personal tokens/bind config)
 launch.sh
+
+# Claude Code worktrees live here; never commit one.
+.claude/worktrees/
