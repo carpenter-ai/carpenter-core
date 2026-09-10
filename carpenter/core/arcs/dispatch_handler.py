@@ -991,6 +991,7 @@ async def _run_arc_agent(
     model_override = agent_config.get("model") if agent_config else None
 
     from ... import thread_pools
+    _agent_error: Exception | None = None
     try:
         result = await thread_pools.run_in_work_pool(
             invocation.invoke_for_chat,
@@ -1021,10 +1022,31 @@ async def _run_arc_agent(
                 _db.commit()
             finally:
                 _db.close()
-    except Exception:  # broad catch: AI agent invocation may raise anything
+
+        # If ``invoke_for_chat`` returned an error result (retries exhausted,
+        # circuit-breaker open, HTTP 400 cost-cap, network outage, etc.),
+        # the response_text is a human-readable error string — NOT valid
+        # agent output. Surface it as an exception so the outer
+        # ``handle_arc_dispatch`` handler routes through retry / escalation /
+        # mark-failed logic instead of silently freezing this arc as
+        # ``completed`` with the error message in ``_agent_response``.
+        # ``_extract_error_info`` will re-hydrate the structured ErrorInfo
+        # from the ``system``-role message that ``invoke_for_chat`` wrote to
+        # the arc's conversation (content_json still contains error_info).
+        if isinstance(result, dict) and result.get("error") is not None:
+            _err_msg = getattr(result["error"], "message", None) or "arc agent invocation returned error result"
+            _agent_error = RuntimeError(_err_msg)
+    except Exception as e:  # broad catch: AI agent invocation may raise anything
         logger.exception("Arc agent invocation failed for arc %d", arc_id)
+        _agent_error = e
     finally:
         conv_module.archive_conversation(arc_conv_id)
+
+    # Re-raise outside the try/finally so archive_conversation always runs,
+    # then let handle_arc_dispatch's error path handle retry/escalation
+    # instead of silently freezing the arc as ``completed``.
+    if _agent_error is not None:
+        raise _agent_error
 
 
 def _propagate_completion(arc_id: int) -> None:
