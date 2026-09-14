@@ -162,10 +162,31 @@ def test_call_sends_temperature_for_supported_model(monkeypatch):
 
 
 def test_supports_temperature_helper():
-    """supports_temperature flags opus-4-7 unsupported, others supported."""
-    assert claude_client.supports_temperature("claude-opus-4-7") is False
-    assert claude_client.supports_temperature("claude-sonnet-4-6") is True
-    assert claude_client.supports_temperature("claude-haiku-4-5") is True
+    """Sampling params were removed across the whole 4.7-and-later generation.
+
+    Not just Opus: Sonnet 5 and the Fable/Mythos 5 families reject
+    temperature too. 4.6-and-earlier models still accept it. Until
+    2026-09-14 this list held only claude-opus-4-7, so pointing any model
+    role at a newer model would have 400'd on every call.
+    """
+    for unsupported in (
+        "claude-opus-4-7",
+        "claude-opus-4-8",
+        "claude-opus-5",
+        "claude-sonnet-5",
+        "claude-fable-5",
+        "claude-fable-5-1",
+        "claude-mythos-5-1",
+    ):
+        assert claude_client.supports_temperature(unsupported) is False, unsupported
+
+    for supported in (
+        "claude-opus-4-6",
+        "claude-sonnet-4-6",
+        "claude-haiku-4-5",
+    ):
+        assert claude_client.supports_temperature(supported) is True, supported
+
     assert claude_client.supports_temperature(None) is True
 
 
