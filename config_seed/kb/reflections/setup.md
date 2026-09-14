@@ -1,5 +1,21 @@
 # Reflection setup
 
+## Turning reflection off
+
+`reflection.enabled` (default `true`) is the master switch. Setting it
+`false` in `config.yaml` stops the whole cadence — no cron is
+registered, any leftover `reflection-daily-tick` row in `cron_entries`
+is disabled at startup, and a tick that somehow still arrives is
+refused before any token is spent. Restart the platform for the change
+to take effect.
+
+Disabling the cron row by hand is **not** enough on its own:
+`trigger_manager.add_cron` re-enables a disabled entry of the same
+name, so the next startup with the flag on would undo it. The config
+flag is the switch; the DB row follows it.
+
+## What reflections are
+
 Reflections are autonomous periodic reviews (daily cadence) that scan
 recently-completed root arcs and propose kb/skill/doc changes via
 `coding-change` follow-up arcs. Because they fire from a cron with no

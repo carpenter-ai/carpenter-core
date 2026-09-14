@@ -104,7 +104,7 @@ Key config areas:
 - `encryption.enforce` — Fernet encryption for non-trusted arc output (default: true, fails-closed)
 - `egress_policy` / `egress_enforce` — Executor network egress enforcement
 - `api_standards` — Maps providers to API standard (`"anthropic"` or `"openai"`). Defaults: `{anthropic: anthropic, ollama: openai, tinfoil: openai, chain: anthropic}`. To add a new provider: set its standard here, implement `call()` with `tools` param, register in `_get_client()`/`_get_provider_for_client()`
-- `reflection.*` — Reflective meta-cognition (opt-in, costs API credits)
+- `reflection.*` — Reflective meta-cognition (costs API credits). `reflection.enabled` (default `true`) is the master switch: set it `false` to stop the daily cadence entirely — no cron, no tick, no spend — without uninstalling the template. It is enforced both at cron registration (which also disables a leftover cron row, since `add_cron` would otherwise re-enable it) and inside `handle_reflection_tick`.
 - `review.adversarial_mode` — Adversarial zero-findings review mode
 
 ## Making Changes to This Repo

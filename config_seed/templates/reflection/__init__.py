@@ -27,6 +27,13 @@ dispatch, no token spend beyond triage. The old "diary" KB writes
 (``reflections/by-day/{date}``, ``reflections/by-arc/{arc_id}``) have
 been removed; KB knowledge only lands via reviewed kb-change action
 arcs.
+
+**Master switch:** ``reflection.enabled`` (default true). Set it false
+to stop reflection spending API credits without uninstalling the
+template — :func:`_register_cadence` then skips cron registration and
+disables any leftover cron row, and
+:func:`daily_tick.handle_reflection_tick` refuses any tick that still
+reaches it.
 """
 
 from __future__ import annotations
@@ -79,26 +86,57 @@ def _register_cadence() -> None:
     feedback loop); it runs once per day over the arcs that completed since
     the last tick. The schedule is config-overridable via
     ``reflection.daily_cron`` (default 04:00 daily).
+
+    When ``reflection.enabled`` is false this registers the work-item
+    handler but no cron, and actively disables any ``reflection-daily-tick``
+    row an earlier (enabled) run installed. That second step is the
+    load-bearing one: :func:`trigger_manager.add_cron` re-enables a
+    disabled entry of the same name, so without it the switch would be
+    undone by the next startup that had the flag on.
     """
     import logging
 
     from carpenter import config
-    from carpenter.core.engine import main_loop
+    from carpenter.core.engine import main_loop, trigger_manager
 
-    from .daily_tick import handle_reflection_tick
+    from .daily_tick import handle_reflection_tick, reflection_enabled
 
+    logger = logging.getLogger(__name__)
+
+    # Registered unconditionally: the handler is the thing that enforces
+    # the switch for any tick that reaches the queue anyway, and leaving
+    # the event type unhandled would just log an unknown-handler error.
     main_loop.register_handler("reflection.daily_tick", handle_reflection_tick)
+
+    cron_name = "reflection-daily-tick"
+
+    if not reflection_enabled():
+        try:
+            if trigger_manager.enable_cron(cron_name, False):
+                logger.info(
+                    "reflection: disabled existing %s cron "
+                    "(reflection.enabled is false)", cron_name,
+                )
+            else:
+                logger.info(
+                    "reflection: cadence not registered "
+                    "(reflection.enabled is false)",
+                )
+        except Exception as exc:  # pragma: no cover - best-effort teardown
+            logger.warning(
+                "reflection: failed to disable daily cron: %s", exc,
+            )
+        return
 
     cron_expr = config.CONFIG.get("reflection", {}).get("daily_cron", "0 4 * * *")
     try:
-        from carpenter.core.engine import trigger_manager
         trigger_manager.add_cron(
-            name="reflection-daily-tick",
+            name=cron_name,
             cron_expr=cron_expr,
             event_type="reflection.daily_tick",
         )
     except Exception as exc:  # pragma: no cover - best-effort registration
         if not ("UNIQUE" in str(exc) or "already" in str(exc).lower()):
-            logging.getLogger(__name__).warning(
+            logger.warning(
                 "reflection: failed to register daily cron: %s", exc,
             )

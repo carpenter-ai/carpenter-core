@@ -224,3 +224,104 @@ def test_daily_tick_splits_into_multiple_batches(pkg, _escalation_open):
     # Multiple batches in a day get distinct arc-id sets — the
     # disambiguator now that KB path is no longer materialised.
     assert len(set(refs_per_batch)) == 2
+
+
+# ── master switch (reflection.enabled) ──────────────────────────────
+
+
+@pytest.fixture
+def refl_pkg(pkg):
+    """The reflection template package itself (for ``_register_cadence``)."""
+    return importlib.import_module("carpenter_template_packages.reflection")
+
+
+def test_daily_tick_refuses_when_disabled(pkg, _escalation_open, monkeypatch):
+    """A tick that reaches the handler with the flag off spends nothing."""
+    from carpenter import config
+    daily_tick = pkg.daily_tick
+
+    _insert_arc("goal-1")
+    monkeypatch.setitem(config.CONFIG, "reflection",
+                        {"enabled": False, "batch_size": 20})
+
+    asyncio.run(daily_tick.handle_reflection_tick(0, {}))
+
+    with db_transaction() as db:
+        count = db.execute(
+            "SELECT COUNT(*) AS n FROM arcs WHERE name = 'reflection' "
+            "AND origin_kind = 'reflection' AND parent_id IS NULL"
+        ).fetchone()["n"]
+    assert count == 0
+    # The watermark must NOT advance while disabled: re-enabling should
+    # pick up the arcs that completed during the off period rather than
+    # silently skipping them.
+    assert get_arc_state(0, daily_tick.WATERMARK_KEY) is None
+
+
+def test_daily_tick_runs_when_flag_absent(pkg, _escalation_open, monkeypatch):
+    """Default is True — an upgrade never silently disables reflection."""
+    from carpenter import config
+    daily_tick = pkg.daily_tick
+
+    _insert_arc("goal-1")
+    monkeypatch.setitem(config.CONFIG, "reflection", {"batch_size": 20})
+
+    asyncio.run(daily_tick.handle_reflection_tick(0, {}))
+
+    with db_transaction() as db:
+        count = db.execute(
+            "SELECT COUNT(*) AS n FROM arcs WHERE name = 'reflection' "
+            "AND origin_kind = 'reflection' AND parent_id IS NULL"
+        ).fetchone()["n"]
+    assert count == 1
+
+
+def test_register_cadence_skips_cron_when_disabled(refl_pkg, monkeypatch):
+    from carpenter import config
+    from carpenter.core.engine import trigger_manager
+
+    trigger_manager.remove_cron("reflection-daily-tick")
+    monkeypatch.setitem(config.CONFIG, "reflection", {"enabled": False})
+
+    refl_pkg._register_cadence()
+
+    assert trigger_manager.get_cron("reflection-daily-tick") is None
+
+
+def test_register_cadence_disables_leftover_cron(refl_pkg, monkeypatch):
+    """The load-bearing half of the switch.
+
+    ``add_cron`` re-enables a disabled entry of the same name, so a row
+    left by an earlier enabled run must be disabled at startup or the
+    flag would not actually hold reflection off.
+    """
+    from carpenter import config
+    from carpenter.core.engine import trigger_manager
+
+    trigger_manager.add_cron(
+        name="reflection-daily-tick",
+        cron_expr="0 4 * * *",
+        event_type="reflection.daily_tick",
+    )
+    assert trigger_manager.get_cron("reflection-daily-tick")["enabled"]
+
+    monkeypatch.setitem(config.CONFIG, "reflection", {"enabled": False})
+    refl_pkg._register_cadence()
+
+    assert not trigger_manager.get_cron("reflection-daily-tick")["enabled"]
+
+
+def test_register_cadence_registers_cron_when_enabled(refl_pkg, monkeypatch):
+    from carpenter import config
+    from carpenter.core.engine import trigger_manager
+
+    trigger_manager.remove_cron("reflection-daily-tick")
+    monkeypatch.setitem(config.CONFIG, "reflection",
+                        {"enabled": True, "daily_cron": "0 8 * * *"})
+
+    refl_pkg._register_cadence()
+
+    row = trigger_manager.get_cron("reflection-daily-tick")
+    assert row is not None
+    assert row["enabled"]
+    assert row["cron_expr"] == "0 8 * * *"
