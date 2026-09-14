@@ -460,7 +460,19 @@ DEFAULTS = {
     # unbounded feedback loop (reflection → skill-kb-review → reflection → …).
     # ``daily_cron`` is evaluated in UTC; a fixed UTC expression drifts an
     # hour seasonally for local-time observers in DST zones.
+    #
+    # ``enabled`` is the master switch. Reflection spends API credits on
+    # every tick (a triage call per batch, plus a reflect call and any
+    # dispatched action arcs when triage asks for synthesis), so an
+    # operator needs a way to stop that spend without uninstalling the
+    # template. Setting it false skips cron registration at startup AND
+    # disables any ``reflection-daily-tick`` row a previous run left in
+    # ``cron_entries`` — the latter matters because ``add_cron`` re-enables
+    # a disabled entry of the same name, so the DB alone cannot hold the
+    # switch off. ``handle_reflection_tick`` re-checks the flag, so an
+    # in-flight or manually emitted tick is a no-op too.
     "reflection": {
+        "enabled": True,                     # master switch; false = no ticks, no spend
         "daily_cron": "0 4 * * *",          # 04:00 UTC daily
         "batch_size": 20,                    # arcs per period reflection
         "max_actions_per_reflection": 5,     # fan-out cap for proposed actions

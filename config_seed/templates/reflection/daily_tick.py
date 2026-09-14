@@ -37,6 +37,20 @@ WATERMARK_KEY = "reflection_last_tick"
 EXCLUDED_TEMPLATES = ("reflection", "skill-kb-review")
 
 
+def reflection_enabled() -> bool:
+    """Return whether reflection is switched on (``reflection.enabled``).
+
+    Read at cron-registration time *and* again on every tick, so flipping
+    the flag off stops spend without a restart mattering either way: the
+    restart path skips registering the cron, and the running path refuses
+    the tick.  Defaults to True so an upgrade never silently disables a
+    deployment that was already reflecting.
+    """
+    from carpenter import config
+
+    return bool(config.CONFIG.get("reflection", {}).get("enabled", True))
+
+
 def _eligible_root_arcs(db, since_iso: str, until_iso: str) -> list[int]:
     rows = db.execute(
         "SELECT a.id FROM arcs a "
@@ -61,7 +75,18 @@ async def handle_reflection_tick(work_id: int, payload: dict) -> None:
     human-review URLs that no chat conversation is linked to, and the
     URLs pile up in the DB unseen.  The gate check is O(1) config lookup,
     no SMTP handshake, safe to run on every daily tick.
+
+    Also refuses when ``reflection.enabled`` is false.  The cron is not
+    registered in that case, but a row left behind by an earlier run (or
+    a hand-emitted ``reflection.daily_tick`` event) can still reach this
+    handler, so the switch is enforced here as well as at registration.
     """
+    if not reflection_enabled():
+        logger.info(
+            "reflection.daily_tick: skipped — reflection.enabled is false.",
+        )
+        return
+
     # Import the gate BEFORE any arc creation / token spend.  A guard-clause
     # style keeps the "cheap refusal" branch obvious and testable.
     from carpenter.core.reflection_escalation import (
