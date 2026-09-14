@@ -2,6 +2,9 @@
 
 import os
 
+import httpx
+import pytest
+
 from carpenter.db import get_db
 from carpenter.kb.store import KBStore
 from carpenter.kb.work_history import (
@@ -186,3 +189,115 @@ class TestCreateWorkEntry:
 
         path = create_work_entry(parent_id, store)
         assert path is None
+
+
+class TestGenerateWorkSummaryApiFailure:
+    """A failing AI call must degrade to None, not escape the function.
+
+    Regression for the 354 dead-lettered ``kb.work_summary`` work items on
+    the Pi between 2026-07-10 and 2026-09-14. The org hit its Anthropic
+    spend cap, which returns a **400** (not a 429), so the provider layer
+    correctly declined to retry and re-raised ``httpx.HTTPStatusError``.
+    That class was absent from this function's ``except`` tuple, so it
+    escaped to the work handler, which retried three times and then
+    dead-lettered — despite the docstring promising "None on failure".
+    """
+
+    def _patch_resolver(self, monkeypatch, client):
+        # Patch the resolver, not the provider module: generate_work_summary
+        # imports model_resolver inside the function body, so these three
+        # names are the only interception point.
+        monkeypatch.setattr(
+            "carpenter.agent.model_resolver.get_model_for_role",
+            lambda role: "anthropic:claude-test",
+        )
+        monkeypatch.setattr(
+            "carpenter.agent.model_resolver.create_client_for_model",
+            lambda model_str: client,
+        )
+        monkeypatch.setattr(
+            "carpenter.agent.model_resolver.parse_model_string",
+            lambda model_str: ("anthropic", "claude-test"),
+        )
+
+    def _arc(self):
+        db = get_db()
+        try:
+            parent_id = _create_arc(db, "Build Feature")
+            _create_arc(db, "Write code", goal="Write it", parent_id=parent_id)
+        finally:
+            db.close()
+        return parent_id
+
+    def test_spend_cap_400_returns_none(self, monkeypatch):
+        """The exact shape that caused the outage: a non-retryable 400."""
+        parent_id = self._arc()
+
+        class CapReachedClient:
+            def call(self, system, messages, **kw):
+                request = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+                response = httpx.Response(400, request=request, json={
+                    "type": "error",
+                    "error": {
+                        "type": "invalid_request_error",
+                        "message": "You have reached your specified API usage limits.",
+                    },
+                })
+                raise httpx.HTTPStatusError(
+                    "Client error '400 Bad Request'",
+                    request=request, response=response,
+                )
+
+            def extract_text(self, resp):  # pragma: no cover - never reached
+                raise AssertionError("extract_text must not run after a failed call")
+
+        self._patch_resolver(monkeypatch, CapReachedClient())
+        assert generate_work_summary(parent_id) is None
+
+    @pytest.mark.parametrize("exc", [
+        httpx.ConnectError("connection refused"),
+        httpx.TimeoutException("timed out"),
+    ])
+    def test_transport_failures_return_none(self, monkeypatch, exc):
+        """Any httpx.HTTPError subclass, not just status errors."""
+        parent_id = self._arc()
+
+        class FailingClient:
+            def call(self, system, messages, **kw):
+                raise exc
+
+            def extract_text(self, resp):  # pragma: no cover
+                raise AssertionError("unreachable")
+
+        self._patch_resolver(monkeypatch, FailingClient())
+        assert generate_work_summary(parent_id) is None
+
+    def test_create_work_entry_writes_nothing_on_api_failure(self, tmp_path, monkeypatch):
+        """The caller must no-op too — no KB entry, no exception."""
+        parent_id = self._arc()
+
+        class FailingClient:
+            def call(self, system, messages, **kw):
+                raise httpx.ConnectError("connection refused")
+
+            def extract_text(self, resp):  # pragma: no cover
+                raise AssertionError("unreachable")
+
+        self._patch_resolver(monkeypatch, FailingClient())
+        store = KBStore(str(tmp_path / "kb"))
+        assert create_work_entry(parent_id, store) is None
+
+    def test_programming_errors_still_surface(self, monkeypatch):
+        """Don't over-widen: a genuine bug must not be silently swallowed."""
+        parent_id = self._arc()
+
+        class BuggyClient:
+            def call(self, system, messages, **kw):
+                raise AttributeError("genuine bug in the client")
+
+            def extract_text(self, resp):  # pragma: no cover
+                raise AssertionError("unreachable")
+
+        self._patch_resolver(monkeypatch, BuggyClient())
+        with pytest.raises(AttributeError):
+            generate_work_summary(parent_id)

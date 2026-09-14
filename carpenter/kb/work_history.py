@@ -10,6 +10,8 @@ import logging
 import re
 import sqlite3
 
+import httpx
+
 from .. import config
 from ..db import get_db, db_connection
 
@@ -105,6 +107,20 @@ def generate_work_summary(arc_id: int) -> str | None:
         )
         summary = client_mod.extract_text(resp).strip()
         return summary if summary else None
+    except httpx.HTTPError as exc:
+        # The provider is unreachable, rate-limiting us, or refusing the
+        # request outright — notably the org's API spend cap, which comes
+        # back as a *400*, not a 429, and so is not retryable. A work
+        # summary is regenerable scratch; degrade to None rather than let
+        # the exception escape to the work handler, which would retry three
+        # times (burning three more rejected requests) and then dead-letter
+        # the item. WARNING rather than exception(): a provider outage is
+        # not a bug in this module, and a stack trace per completed arc
+        # buries the one line that matters.
+        logger.warning(
+            "Work summary for arc %d skipped — AI call failed: %s", arc_id, exc,
+        )
+        return None
     except (sqlite3.Error, KeyError, ValueError) as _exc:
         logger.exception("Failed to generate work summary for arc %d", arc_id)
         return None
