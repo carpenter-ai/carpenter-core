@@ -328,6 +328,23 @@ trigger_subscriptions:
     template: email-triage
 ```
 
+**Turning a trigger off on one install.** Do not edit the installed
+`manifest.yaml`: the platform hash-verifies installed packages and
+refuses to load one whose files changed. Switch the trigger off in
+`config.yaml` instead, then restart:
+
+```yaml
+packages:
+  carpenter-imap-email:
+    triggers:
+      imap-inbound-poll:
+        enabled: false
+```
+
+The package still loads (its chat tools keep working); only that
+trigger is not started. Delete the entry or set `enabled: true` to turn
+it back on.
+
 ### 4.7 Credential requirements (`credential_requirements:`) — OAuth callback
 
 If your package needs OAuth-protected APIs (Gmail, Calendar, Drive,
