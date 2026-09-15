@@ -1025,6 +1025,25 @@ def _install_trigger_subscriptions(
     return registered
 
 
+def _trigger_disabled_by_config(package_name: str, trigger_name: str) -> bool:
+    """Return True if config switches this package trigger off.
+
+    Reads ``packages.<package>.triggers.<trigger>.enabled``.  Only an
+    explicit ``false`` disables; anything missing or malformed leaves the
+    manifest's own ``enabled`` in charge.
+    """
+    from ..config import get_config
+
+    packages_cfg = get_config("packages", {}) or {}
+    if not isinstance(packages_cfg, dict):
+        return False
+    triggers_cfg = (packages_cfg.get(package_name) or {}).get("triggers") or {}
+    if not isinstance(triggers_cfg, dict):
+        return False
+    trigger_cfg = triggers_cfg.get(trigger_name) or {}
+    return isinstance(trigger_cfg, dict) and trigger_cfg.get("enabled") is False
+
+
 def _install_triggers(
     manifest: PackageManifest, install_path: Path,
     *, conn: sqlite3.Connection | None = None,
@@ -1041,6 +1060,9 @@ def _install_triggers(
        :class:`PackageStateHandle` bound to the same name.
     3. Call ``start()`` on the new instance so it can self-register
        (e.g., create cron rows, open connections).
+
+    A trigger is skipped if its manifest entry says ``enabled: false`` or
+    if config sets ``packages.<package>.triggers.<trigger>.enabled: false``.
 
     Idempotent on re-install: prior triggers + types for the package are
     dropped via :func:`registry.unregister_for_package` before re-loading.
@@ -1124,6 +1146,14 @@ def _install_triggers(
             logger.info(
                 "Trigger %s (package %r) is disabled; skipping instantiation",
                 tref.name, manifest.name,
+            )
+            continue
+        if _trigger_disabled_by_config(manifest.name, tref.name):
+            logger.info(
+                "Trigger %s (package %r) is disabled by config "
+                "(packages.%s.triggers.%s.enabled: false); skipping "
+                "instantiation",
+                tref.name, manifest.name, manifest.name, tref.name,
             )
             continue
         cfg = dict(tref.config)

@@ -477,6 +477,16 @@ DEFAULTS = {
         "batch_size": 20,                    # arcs per period reflection
         "max_actions_per_reflection": 5,     # fan-out cap for proposed actions
     },
+    # Per-package operator overrides, keyed by package name.  Today this
+    # only switches a package's declared triggers off without editing the
+    # installed manifest (which would fail the install hash check):
+    #   packages:
+    #     carpenter-imap-email:
+    #       triggers:
+    #         imap-inbound-poll:
+    #           enabled: false
+    # Read at trigger install/startup, so a change needs a restart.
+    "packages": {},
     "model_presets": {},  # User overrides for model selector presets (see model_selector.py)
     # Platform-integrity classifier config.  Read by
     # ``carpenter/security/platform_paths.py`` to drive path-tier and

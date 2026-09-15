@@ -254,6 +254,53 @@ class TestInstallerTriggers:
         assert trigger_registry.get_trigger_type("lifecycle_probe") is not None
         assert trigger_registry.instances_for_package("tpkg") == []
 
+    def test_trigger_disabled_by_config_not_instantiated(
+        self, tmp_path, db_conn, monkeypatch,
+    ):
+        """Config can switch a trigger off without touching the manifest."""
+        import carpenter.config as _config
+
+        triggers_yaml = dedent("""\
+            triggers:
+              - name: poller
+                type: lifecycle_probe
+                module: triggers/probe.py
+              - name: other
+                type: lifecycle_probe
+                module: triggers/probe.py
+        """)
+        src = _make_source(tmp_path, "tpkg", triggers_yaml=triggers_yaml)
+        dest = tmp_path / "installed" / "tpkg"
+        monkeypatch.setattr(_config, "CONFIG", {
+            **_config.CONFIG,
+            "packages": {"tpkg": {"triggers": {"poller": {"enabled": False}}}},
+        })
+
+        result = install_package(src, dest, conn=db_conn)
+        db_conn.commit()
+
+        assert result.triggers_installed == 1
+        names = [t.name for t in trigger_registry.instances_for_package("tpkg")]
+        assert names == ["other"]
+
+    def test_config_override_ignores_other_packages_and_malformed_values(
+        self, monkeypatch,
+    ):
+        import carpenter.config as _config
+
+        monkeypatch.setattr(_config, "CONFIG", {
+            **_config.CONFIG,
+            "packages": {
+                "tpkg": {"triggers": {"a": {"enabled": False}, "b": {"enabled": "no"}}},
+                "broken": {"triggers": ["not", "a", "dict"]},
+            },
+        })
+
+        assert installer._trigger_disabled_by_config("tpkg", "a") is True
+        assert installer._trigger_disabled_by_config("tpkg", "b") is False
+        assert installer._trigger_disabled_by_config("other", "a") is False
+        assert installer._trigger_disabled_by_config("broken", "a") is False
+
     def test_package_without_triggers_section(self, tmp_path, db_conn):
         src = tmp_path / "src" / "plain"
         src.mkdir(parents=True)
