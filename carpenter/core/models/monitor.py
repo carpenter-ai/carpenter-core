@@ -66,8 +66,7 @@ def check_health():
             if model_id not in _state.notified_circuits:
                 _state.notified_circuits.add(model_id)
                 notifications.notify(
-                    f"Circuit breaker OPEN for {model_id} "
-                    f"({state.consecutive_failures} consecutive failures)",
+                    _circuit_open_message(state),
                     priority="urgent",
                     category="circuit_breaker",
                 )
@@ -116,8 +115,10 @@ def check_health():
             if prov_state.provider not in _state.notified_provider_down:
                 _state.notified_provider_down.add(prov_state.provider)
                 notifications.notify(
-                    f"Provider outage: all {prov_state.model_count} model(s) for "
-                    f"'{prov_state.provider}' are CIRCUIT_OPEN",
+                    f"All {prov_state.model_count} {prov_state.provider} model(s) "
+                    f"Carpenter uses are failing every request, so work that needs "
+                    f"{prov_state.provider} will fail until one of them succeeds "
+                    f"again. See the preceding model alerts for the reason.",
                     priority="urgent",
                     category="provider_outage",
                 )
@@ -131,6 +132,20 @@ def check_health():
     for provider in recovered_providers:
         _state.notified_provider_down.discard(provider)
         logger.info("health_monitor: provider %s recovered from outage", provider)
+
+
+def _circuit_open_message(state) -> str:
+    """Explain an open circuit breaker in terms of what the user will notice."""
+    message = (
+        f"Model {state.model_id} has failed its last "
+        f"{state.consecutive_failures} requests in a row, so Carpenter now "
+        f"treats it as down: tasks that fail on it switch straight to another "
+        f"model (or fail) instead of retrying. This clears by itself once a "
+        f"request to it succeeds."
+    )
+    if state.last_error:
+        message += f"\n\nLast error: {state.last_error}"
+    return message
 
 
 def reset():

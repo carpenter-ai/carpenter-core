@@ -186,7 +186,7 @@ def classify_error(
             type="ClientError",
             retry_count=retry_count,
             source_location="invocation._call_with_retries",
-            message=f"API request error (HTTP {status_code}). This may indicate a configuration issue.",
+            message=_format_client_error_message(status_code, exception),
             status_code=status_code,
             model=model,
             provider=provider,
@@ -203,6 +203,40 @@ def classify_error(
         provider=provider,
         raw_error=raw_error,
     )
+
+
+def _format_client_error_message(status_code: int, exception: Exception) -> str:
+    """Build the ClientError message, quoting the provider's reason if it gave one.
+
+    A bare "HTTP 400" hides the cause: the same status covers a malformed
+    request and an exhausted account spending limit.
+    """
+    reason = _extract_api_error_message(exception)
+    if reason:
+        return f"API request rejected (HTTP {status_code}): {reason}"
+    return f"API request error (HTTP {status_code}). This may indicate a configuration issue."
+
+
+def _extract_api_error_message(exception: Exception) -> str | None:
+    """Extract the human-readable error message from a provider's JSON error body.
+
+    Understands the Anthropic/OpenAI shape ``{"error": {"message": ...}}``.
+    Returns None if the body is missing or has any other shape.
+    """
+    response = getattr(exception, 'response', None)
+    if response is None or not callable(getattr(response, 'json', None)):
+        return None
+    try:
+        body = response.json()
+    except ValueError:
+        return None
+    if not isinstance(body, dict):
+        return None
+    error = body.get('error')
+    message = error.get('message') if isinstance(error, dict) else None
+    if isinstance(message, str) and message.strip():
+        return message.strip()
+    return None
 
 
 def _extract_status_code(exception: Exception) -> int | None:

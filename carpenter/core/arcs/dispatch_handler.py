@@ -301,7 +301,10 @@ async def handle_arc_dispatch(work_id: int, payload: dict):
 
         # Record failed model call (if model was used)
         failed_model_id = _selected_model_id or error_info.model
-        _record_model_call(failed_model_id, success=False, error_type=error_info.type)
+        _record_model_call(
+            failed_model_id, success=False, error_type=error_info.type,
+            error_message=_failure_reason(error_info),
+        )
 
         # ── Model failover: try next-best model before retry/escalation ──
         # If we have fallback models from policy-based selection and the
@@ -387,6 +390,7 @@ async def handle_arc_dispatch(work_id: int, payload: dict):
 # Re-exported from model_fallback / judge_verification for backward compatibility.
 from .model_fallback import (  # noqa: E402
     _PROVIDER_ERROR_TYPES,
+    _failure_reason,
     _is_provider_error,
     _record_model_call,
     _try_fallback_models,

@@ -47,10 +47,27 @@ def test_circuit_breaker_notification(mock_notif, mock_health):
 
     mock_notif.notify.assert_called_once()
     call_args = mock_notif.notify.call_args
-    assert "Circuit breaker OPEN" in call_args[0][0]
+    assert "failed its last 5 requests" in call_args[0][0]
     assert "claude-sonnet" in call_args[0][0]
+    assert "Last error" not in call_args[0][0]
     assert call_args[1]["priority"] == "urgent"
     assert call_args[1]["category"] == "circuit_breaker"
+
+
+@patch("carpenter.core.models.monitor.get_all_model_health")
+@patch("carpenter.core.models.monitor.notifications")
+def test_circuit_breaker_notification_includes_last_error(mock_notif, mock_health):
+    """The reason for the failures is quoted so the user can act on it."""
+    mock_health.return_value = [
+        _make_state("claude-sonnet", ModelHealth.CIRCUIT_OPEN,
+                    consecutive_failures=5, success_rate=0.0,
+                    last_error="API request rejected (HTTP 400): usage limit reached"),
+    ]
+
+    health_monitor.check_health()
+
+    message = mock_notif.notify.call_args[0][0]
+    assert "Last error: API request rejected (HTTP 400): usage limit reached" in message
 
 
 @patch("carpenter.core.models.monitor.get_all_model_health")
@@ -226,7 +243,7 @@ def test_provider_outage_notification(mock_notif, mock_health, mock_prov):
 
     mock_notif.notify.assert_called_once()
     call_args = mock_notif.notify.call_args
-    assert "Provider outage" in call_args[0][0]
+    assert "All 3 anthropic model(s)" in call_args[0][0]
     assert "anthropic" in call_args[0][0]
     assert call_args[1]["priority"] == "urgent"
     assert call_args[1]["category"] == "provider_outage"
