@@ -229,6 +229,42 @@ class TestClassifyError:
         assert error.status_code == 400
         assert "400" in error.message
 
+    def test_classify_400_client_quotes_provider_reason(self):
+        """A 400 with a JSON error body carries the provider's own explanation."""
+        mock_response = Mock()
+        mock_response.status_code = 400
+        mock_response.json.return_value = {
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error",
+                "message": "You have reached your specified API usage limits.",
+            },
+        }
+
+        mock_exception = Mock()
+        mock_exception.response = mock_response
+
+        error = classify_error(mock_exception, retry_count=1)
+
+        assert error.type == "ClientError"
+        assert error.message == (
+            "API request rejected (HTTP 400): "
+            "You have reached your specified API usage limits."
+        )
+
+    def test_classify_400_client_non_json_body(self):
+        """A 400 whose body is not JSON falls back to the generic message."""
+        mock_response = Mock()
+        mock_response.status_code = 400
+        mock_response.json.side_effect = ValueError("not json")
+
+        mock_exception = Mock()
+        mock_exception.response = mock_response
+
+        error = classify_error(mock_exception, retry_count=1)
+
+        assert "configuration issue" in error.message
+
     def test_classify_422_client(self):
         """Test classification of 422 unprocessable entity."""
         mock_response = Mock()

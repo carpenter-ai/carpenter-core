@@ -49,6 +49,7 @@ def _record_model_call(
     model_id: str | None,
     success: bool,
     error_type: str | None = None,
+    error_message: str | None = None,
 ) -> None:
     """Record a model call outcome for health tracking.
 
@@ -62,9 +63,21 @@ def _record_model_call(
             model_id=model_id,
             success=success,
             error_type=error_type,
+            error_message=error_message,
         )
     except (ImportError, KeyError, ValueError):
         pass  # Don't fail dispatch over health tracking
+
+
+def _failure_reason(error_info) -> str | None:
+    """Pick the most informative description of a failure for health tracking.
+
+    A classified error's ``message`` already explains itself. An UnknownError's
+    message is generic, so the original exception text says more.
+    """
+    if error_info.type == "UnknownError":
+        return error_info.raw_error or error_info.message
+    return error_info.message or error_info.raw_error
 
 
 async def _try_fallback_models(
@@ -141,6 +154,7 @@ async def _try_fallback_models(
             # Record the fallback model failure
             _record_model_call(
                 fallback.model_id, success=False, error_type=fb_error.type,
+                error_message=_failure_reason(fb_error),
             )
 
             if _is_provider_error(fb_error):

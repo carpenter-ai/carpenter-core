@@ -8,6 +8,7 @@ from carpenter.core.models.health import (
     ModelHealthState,
     ProviderHealthState,
     _health_cache,
+    _last_errors,
     all_cloud_models_circuit_open,
     get_provider_health,
     get_all_provider_health,
@@ -20,8 +21,10 @@ from carpenter.core.models.registry import ModelEntry
 def clear_health_cache():
     """Clear the health cache before and after each test."""
     _health_cache.clear()
+    _last_errors.clear()
     yield
     _health_cache.clear()
+    _last_errors.clear()
 
 
 def _make_state(model_id, health, **kwargs):
@@ -199,3 +202,13 @@ class TestRecordModelCallProvider:
             assert row["provider"] == "anthropic"
         finally:
             db.close()
+
+
+def test_last_error_tracks_most_recent_failure_and_clears_on_success():
+    """last_error carries the latest failure reason until a call succeeds."""
+    record_model_call("anthropic:m", success=False, error_message="first")
+    record_model_call("anthropic:m", success=False, error_message="second")
+    assert _health_cache["anthropic:m"].last_error == "second"
+
+    record_model_call("anthropic:m", success=True)
+    assert _health_cache["anthropic:m"].last_error is None

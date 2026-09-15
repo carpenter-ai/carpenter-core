@@ -49,6 +49,8 @@ class ModelHealthState:
         circuit_open_until: Timestamp when circuit will half-open (None if not open)
         last_success_at: Timestamp of last successful call
         last_failure_at: Timestamp of last failed call
+        last_error: Reason given for the most recent failure, if known
+                    (in-memory only; None after a restart)
     """
     model_id: str
     health: ModelHealth
@@ -59,6 +61,7 @@ class ModelHealthState:
     circuit_open_until: Optional[str] = None
     last_success_at: Optional[str] = None
     last_failure_at: Optional[str] = None
+    last_error: Optional[str] = None
 
 
 @dataclass
@@ -81,6 +84,9 @@ class ProviderHealthState:
 # In-memory cache of model health states (model_id -> ModelHealthState)
 _health_cache: dict[str, ModelHealthState] = {}
 
+# Most recent failure reason per model (model_id -> message), cleared on success
+_last_errors: dict[str, str] = {}
+
 # Config keys and their built-in defaults (used only when config is unavailable)
 _CONFIG_DEFAULTS: dict[str, int] = {
     "model_health_window_size": 20,
@@ -98,6 +104,7 @@ def record_model_call(
     model_id: str,
     success: bool,
     error_type: Optional[str] = None,
+    error_message: Optional[str] = None,
 ) -> None:
     """Record the outcome of a model API call.
 
@@ -107,8 +114,14 @@ def record_model_call(
         model_id: Model identifier
         success: True if call succeeded, False if failed
         error_type: Error type if failed (for analytics)
+        error_message: Human-readable failure reason, surfaced in notifications
     """
     now = datetime.now(timezone.utc).isoformat()
+
+    if success:
+        _last_errors.pop(model_id, None)
+    elif error_message:
+        _last_errors[model_id] = error_message
 
     # Extract provider from model_id (e.g., "anthropic:claude-sonnet" → "anthropic")
     if ":" in model_id:
@@ -411,6 +424,7 @@ def _recalculate_health(
             circuit_open_until=circuit_open_until,
             last_success_at=last_success or (timestamp if success else None),
             last_failure_at=last_failure or (timestamp if success is False else None),
+            last_error=_last_errors.get(model_id),
         )
 
         logger.debug(
