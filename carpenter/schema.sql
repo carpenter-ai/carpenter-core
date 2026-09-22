@@ -159,6 +159,16 @@ CREATE TABLE IF NOT EXISTS model_calls (
 CREATE INDEX IF NOT EXISTS idx_model_calls_model ON model_calls(model_id, called_at DESC);
 CREATE INDEX IF NOT EXISTS idx_model_calls_provider ON model_calls(provider, called_at DESC);
 
+-- Which model-health alerts the user has already been told about, so a
+-- process restart does not re-announce an unchanged outage.  A row is
+-- deleted when the condition clears, which re-arms the alert.
+CREATE TABLE IF NOT EXISTS health_notify_state (
+    kind TEXT NOT NULL,
+    key TEXT NOT NULL,
+    notified_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (kind, key)
+);
+
 -- Cron entries: Python-native cron via croniter.
 -- ``name`` is UNIQUE; ``trigger_manager.add_cron()`` / ``add_once()`` perform
 -- an idempotent upsert on name conflict (re-adding the same name updates the
