@@ -303,3 +303,121 @@ def test_provider_recovery_clears_dedup(mock_notif, mock_health, mock_prov):
     ]
     health_monitor.check_health()
     assert mock_notif.notify.call_count == 2
+
+
+def _simulate_restart(monkeypatch):
+    """Drop the process's in-memory dedup state, keeping the database.
+
+    This is what a daemon restart does: model health is recomputed from the
+    persistent model_calls window, so a model that was circuit-open before
+    is still circuit-open after.
+    """
+    monkeypatch.setattr(
+        health_monitor, "_state", health_monitor._MonitorState()
+    )
+
+
+@patch("carpenter.core.models.monitor.get_all_model_health")
+@patch("carpenter.core.models.monitor.notifications")
+def test_circuit_breaker_silent_across_restart(mock_notif, mock_health, monkeypatch):
+    """A restart must not re-announce a circuit breaker that never cleared."""
+    mock_health.return_value = [
+        _make_state("claude-sonnet", ModelHealth.CIRCUIT_OPEN,
+                    consecutive_failures=5, success_rate=0.0),
+    ]
+    health_monitor.check_health()
+    assert mock_notif.notify.call_count == 1
+
+    _simulate_restart(monkeypatch)
+    health_monitor.check_health()
+    health_monitor.check_health()
+
+    assert mock_notif.notify.call_count == 1
+
+
+@patch("carpenter.core.models.monitor.get_all_model_health")
+@patch("carpenter.core.models.monitor.notifications")
+def test_circuit_breaker_notifies_again_after_recovery_and_restart(
+    mock_notif, mock_health, monkeypatch,
+):
+    """Recovery re-arms the alert, and the re-arming survives a restart too."""
+    mock_health.return_value = [
+        _make_state("claude-sonnet", ModelHealth.CIRCUIT_OPEN,
+                    consecutive_failures=5, success_rate=0.0),
+    ]
+    health_monitor.check_health()
+    assert mock_notif.notify.call_count == 1
+
+    mock_health.return_value = [_make_state("claude-sonnet", ModelHealth.HEALTHY)]
+    health_monitor.check_health()
+
+    _simulate_restart(monkeypatch)
+    mock_health.return_value = [
+        _make_state("claude-sonnet", ModelHealth.CIRCUIT_OPEN,
+                    consecutive_failures=7, success_rate=0.0),
+    ]
+    health_monitor.check_health()
+
+    assert mock_notif.notify.call_count == 2
+
+
+@patch("carpenter.core.models.monitor.get_all_model_health")
+@patch("carpenter.core.models.monitor.notifications")
+def test_unhealthy_silent_across_restart(mock_notif, mock_health, monkeypatch):
+    """The unhealthy alert is deduped across restarts as well."""
+    mock_health.return_value = [
+        _make_state("claude-haiku", ModelHealth.UNHEALTHY, success_rate=0.3),
+    ]
+    health_monitor.check_health()
+    assert mock_notif.notify.call_count == 1
+
+    _simulate_restart(monkeypatch)
+    health_monitor.check_health()
+
+    assert mock_notif.notify.call_count == 1
+
+
+@patch("carpenter.core.models.monitor.get_all_provider_health")
+@patch("carpenter.core.models.monitor.get_all_model_health")
+@patch("carpenter.core.models.monitor.notifications")
+def test_provider_outage_silent_across_restart(
+    mock_notif, mock_health, mock_prov, monkeypatch,
+):
+    """A provider outage is announced once, not once per restart."""
+    mock_health.return_value = []
+    mock_prov.return_value = [
+        ProviderHealthState(
+            provider="anthropic",
+            health=ModelHealth.CIRCUIT_OPEN,
+            model_count=2,
+            circuit_open_count=2,
+        ),
+    ]
+    health_monitor.check_health()
+    assert mock_notif.notify.call_count == 1
+
+    _simulate_restart(monkeypatch)
+    health_monitor.check_health()
+
+    assert mock_notif.notify.call_count == 1
+
+
+@patch("carpenter.core.models.monitor.get_all_model_health")
+@patch("carpenter.core.models.monitor.notifications")
+def test_dedup_state_survives_without_database(mock_notif, mock_health, monkeypatch):
+    """If the dedup table is unreachable, the monitor still alerts and dedups in memory."""
+    import sqlite3 as _sqlite3
+
+    def _boom():
+        raise _sqlite3.OperationalError("no such table: health_notify_state")
+
+    monkeypatch.setattr(health_monitor, "db_transaction", _boom)
+    mock_health.return_value = [
+        _make_state("claude-sonnet", ModelHealth.CIRCUIT_OPEN,
+                    consecutive_failures=5, success_rate=0.0),
+    ]
+
+    health_monitor.check_health()
+    health_monitor.check_health()
+
+    assert mock_notif.notify.call_count == 1

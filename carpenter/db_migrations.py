@@ -1104,6 +1104,28 @@ def _migrate_budget_breaker(conn: sqlite3.Connection, tables: set) -> None:
     conn.commit()
 
 
+def _migrate_health_notify_state(conn: sqlite3.Connection, tables: set) -> None:
+    """Add the model-health alert dedup store.
+
+    The monitor used to track "already told the user about this" in memory
+    only, so every restart re-announced circuit breakers that were still
+    open from before — the same alert, nightly, for weeks. Keeping it in
+    the DB means an alert repeats only when the condition actually clears
+    and recurs.
+    """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS health_notify_state (
+            kind TEXT NOT NULL,
+            key TEXT NOT NULL,
+            notified_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (kind, key)
+        )
+        """
+    )
+    conn.commit()
+
+
 def run_migrations(conn: sqlite3.Connection) -> None:
     """Run all data migrations for existing databases.
 
@@ -1151,3 +1173,4 @@ def run_migrations(conn: sqlite3.Connection) -> None:
     _migrate_package_vectors(conn, tables)
     _migrate_arc_origin(conn, tables)
     _migrate_budget_breaker(conn, tables)
+    _migrate_health_notify_state(conn, tables)
