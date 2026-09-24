@@ -52,10 +52,10 @@ These tests are timing-dependent by nature. They run reliably on the Pi 4 but ma
 ## Running
 
 ```bash
-~/bin/run-tests tests/concurrency/ -v
+python3 -m pytest tests/concurrency/ -v
 ```
 
-**Important**: Always use `~/bin/run-tests`, never `pytest` directly. The wrapper sets `TMPDIR=/dev/shm` to avoid SD card I/O storms.
+`tests/conftest.py` points `TMPDIR` at `/dev/shm` when it is unset, keeping temp-file churn off slow storage such as an SD card.
 
 ## When to Update
 

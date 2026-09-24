@@ -217,9 +217,9 @@ def _recover_on_startup(db) -> None:
     #
     # The previous behavior reset every ``waiting`` arc indiscriminately,
     # which "completed" passive parents out from under their still-
-    # blocking children on every restart (arc 8669 logged 38 such cycles
-    # between 2026-06-21 and 2026-06-28 before the skill-kb-review
-    # SUPERVISOR fix landed). Filtering by ``_retry_count`` arc_state
+    # blocking children on every restart, so a passive parent could cycle
+    # through the same hold indefinitely. The skill-kb-review SUPERVISOR
+    # fix addressed one template; filtering by ``_retry_count`` arc_state
     # generalises that fix to every passive-coordinator template.
     waiting_rows = db.execute(
         "SELECT a.id FROM arcs a "

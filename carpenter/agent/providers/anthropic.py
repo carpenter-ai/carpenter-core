@@ -30,8 +30,8 @@ DEFAULT_MAX_TOKENS = 4096
 # Fable/Mythos 5 families all 400 on them. Opus 4.6, Sonnet 4.6 and Haiku 4.5
 # still accept temperature, which is why they are absent here.
 #
-# This list only listed claude-opus-4-7 until 2026-09-14, so any role pointed
-# at a newer model would have 400'd on every call. It is load-bearing and
+# This list once held only claude-opus-4-7, so any role pointed at a newer
+# model 400'd on every call. It is load-bearing and
 # additive: add a prefix here when adopting a new model rather than
 # discovering it through a failed request.
 TEMPERATURE_UNSUPPORTED_PREFIXES = (

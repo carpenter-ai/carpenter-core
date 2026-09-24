@@ -20,8 +20,8 @@ import pytest
 from carpenter.embeddings.providers.local import LocalEmbeddingProvider
 
 
-# Computed against the pure-numpy forward pass on 2026-05-20 (Pi 5,
-# numpy 2.4.4).  ONNX runtime ≥1.17 with the published model.onnx from
+# Computed against the pure-numpy forward pass (numpy 2.4.4).  ONNX
+# runtime ≥1.17 with the published model.onnx from
 # sentence-transformers/all-MiniLM-L6-v2 must produce the same values
 # at this tolerance — float drift between ONNX builds shows up at ~6
 # decimals; we pin at 4.
