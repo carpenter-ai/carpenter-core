@@ -5,11 +5,10 @@ import os
 # Ensure pytest basetemp uses RAM-backed tmpfs (/dev/shm) instead of the SD
 # card's /tmp.  This MUST happen before ``import tempfile`` because
 # tempfile.gettempdir() caches its result on first call.  Without this, a
-# 15-minute xdist run under /tmp is vulnerable to:
+# long xdist run under /tmp is vulnerable to:
 #   - No cleanup-lock protection (tmp_path_retention_count=0 skips locks)
 #   - Concurrent pytest invocations deleting the basetemp mid-run
-# The ~/bin/run-tests wrapper sets TMPDIR too, but this failsafe covers
-# direct invocations and git-worktree paths the wrapper might not detect.
+# A TMPDIR already set by the caller is respected.
 if "TMPDIR" not in os.environ and os.path.isdir("/dev/shm"):
     os.environ["TMPDIR"] = "/dev/shm"
 

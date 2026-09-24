@@ -447,14 +447,11 @@ matches what's registered in the provider's OAuth console.
 
 ## 5. Testing your package
 
-Run the platform unit suite from the package's parent worktree:
+Run the platform unit suite from a carpenter-core checkout:
 
 ```bash
-cd ~/repos/carpenter-core
-~/bin/run-tests tests/packages/ -v
+python3 -m pytest tests/packages/ -v
 ```
-
-(NEVER `pytest` directly — see `~/.claude/projects/-home-pi/memory/MEMORY.md`.)
 
 For end-to-end testing:
 

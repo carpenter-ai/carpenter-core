@@ -194,9 +194,8 @@ class TestCreateWorkEntry:
 class TestGenerateWorkSummaryApiFailure:
     """A failing AI call must degrade to None, not escape the function.
 
-    Regression for the 354 dead-lettered ``kb.work_summary`` work items on
-    the Pi between 2026-07-10 and 2026-09-14. The org hit its Anthropic
-    spend cap, which returns a **400** (not a 429), so the provider layer
+    Regression for dead-lettered ``kb.work_summary`` work items. An
+    Anthropic spend cap returns a **400** (not a 429), so the provider layer
     correctly declined to retry and re-raised ``httpx.HTTPStatusError``.
     That class was absent from this function's ``except`` tuple, so it
     escaped to the work handler, which retried three times and then

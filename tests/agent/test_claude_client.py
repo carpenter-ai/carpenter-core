@@ -165,9 +165,9 @@ def test_supports_temperature_helper():
     """Sampling params were removed across the whole 4.7-and-later generation.
 
     Not just Opus: Sonnet 5 and the Fable/Mythos 5 families reject
-    temperature too. 4.6-and-earlier models still accept it. Until
-    2026-09-14 this list held only claude-opus-4-7, so pointing any model
-    role at a newer model would have 400'd on every call.
+    temperature too. 4.6-and-earlier models still accept it. When this
+    list held only claude-opus-4-7, pointing any model role at a newer
+    model 400'd on every call.
     """
     for unsupported in (
         "claude-opus-4-7",
