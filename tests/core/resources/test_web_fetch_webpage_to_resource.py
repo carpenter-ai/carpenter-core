@@ -285,3 +285,17 @@ class TestDispatchRegistration:
         from carpenter.api.callbacks import _DISPATCH
         assert "web.fetch_webpage_to_resource" in _DISPATCH
         assert callable(_DISPATCH["web.fetch_webpage_to_resource"])
+
+
+class TestEgressGuard:
+    def test_private_destination_refused_and_no_resource(self):
+        from carpenter.security.egress import EgressDenied
+        arc_id = _make_arc("EXECUTOR")
+        with patch("carpenter.tool_backends.web.httpx") as mock_httpx:
+            with pytest.raises(EgressDenied):
+                web_backend.handle_fetch_webpage_to_resource({
+                    "url": "http://10.0.0.1/secret",
+                    "_caller_arc_id": arc_id,
+                })
+            mock_httpx.get.assert_not_called()
+        assert res_manager.list_resources_for_arc(arc_id, role="output") == []
