@@ -2494,6 +2494,22 @@ def invoke_for_chat(
                 template_name = "chat_new"
                 prior_text = ""
 
+        # The previous conversation's content is about to enter this
+        # conversation's context, so its taint must come too.  Fail
+        # closed: if the taint cannot be copied, drop the carried context.
+        if prior_text and prev_id is not None:
+            try:
+                from ..security.trust import inherit_taint
+                inherit_taint(conv_id, prev_id)
+            except Exception:  # broad catch: fail-closed taint propagation
+                logger.warning(
+                    "Could not propagate taint from conversation %d to %d; "
+                    "dropping prior context",
+                    prev_id, conv_id, exc_info=True,
+                )
+                template_name = "chat_new"
+                prior_text = ""
+
     # Detect arc step mode — arc agents don't need active arcs summary
     # or the dynamic prompt sections meant for interactive conversations.
     _is_arc = _executor_arc_id is not None
