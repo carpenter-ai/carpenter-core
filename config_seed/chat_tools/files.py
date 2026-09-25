@@ -83,15 +83,21 @@ def read_file(tool_input, **kwargs):
     if error:
         return error
     from carpenter.tool_backends import files as files_backend
-    # I2 enforcement on the chat path: chat agents are TRUSTED-only
-    # (docs/design.md §"Agent Types and Capabilities") and cannot
-    # read bytes produced by a non-trusted writer.  handle_read's
-    # cross-trust check requires a _caller_arc_id which the chat tool
-    # cannot supply, so we consult provenance directly here.
-    refusal = files_backend.chat_read_provenance_check(tool_input["path"])
+    # I2 enforcement on the chat path.  The reader is the chat agent (no
+    # arc) or, when an arc agent calls this tool, the platform-injected
+    # executor arc — never anything from tool input.  Trusted readers may
+    # not read files labelled untrusted (security/read_gate.py); REVIEWER
+    # and JUDGE readers keep access to what they review.
+    executor_arc_id = kwargs.get("executor_arc_id")
+    refusal = files_backend.chat_read_provenance_check(
+        tool_input["path"], executor_arc_id=executor_arc_id,
+    )
     if refusal:
         return refusal
-    result = files_backend.handle_read(tool_input)
+    result = files_backend.handle_read({
+        "path": tool_input["path"],
+        "_caller_arc_id": executor_arc_id,
+    })
     return result.get("content", "(empty)")
 
 

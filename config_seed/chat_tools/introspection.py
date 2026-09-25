@@ -60,10 +60,27 @@ def list_tool_calls(tool_input, **kwargs):
         db.close()
     if not rows:
         return "No tool calls found."
+    # Inputs and results from a REVIEWER's or non-trusted arc's
+    # conversation, or a tainted one, are withheld from a trusted reader.
+    # Tool names and timings stay visible.
+    from carpenter.security import read_gate
+    reader = read_gate.reader_for(
+        conversation_id=kwargs.get("conversation_id"),
+        arc_id=kwargs.get("executor_arc_id"),
+    )
+    refused: dict = {}
     lines = []
     for r in rows:
-        input_preview = (r["input_json"] or "")[:80]
-        result_preview = (r["result_text"] or "")[:80]
+        conv = r["conversation_id"]
+        if conv not in refused:
+            refused[conv] = read_gate.check_conversation(
+                reader, conv, f"Tool calls of conversation #{conv}",
+            )
+        if refused[conv]:
+            input_preview = result_preview = "(withheld: untrusted context)"
+        else:
+            input_preview = (r["input_json"] or "")[:80]
+            result_preview = (r["result_text"] or "")[:80]
         dur = f" ({r['duration_ms']}ms)" if r["duration_ms"] is not None else ""
         lines.append(
             f"#{r['id']} conv={r['conversation_id']} {r['tool_name']}{dur}  "
@@ -218,6 +235,22 @@ def get_execution_output(tool_input, **kwargs):
             f"arc.create_batch() with REVIEWER and JUDGE arcs. "
             f"See kb entry [[web/trust-warning]] for the exact pattern."
         )
+        return "\n".join(parts)
+
+    # Output of a non-trusted or REVIEWER arc's code is withheld from a
+    # trusted reader, whatever the code imported (the
+    # import-based taint check above does not see that).
+    from carpenter.security import read_gate
+    reader = read_gate.reader_for(
+        conversation_id=kwargs.get("conversation_id"),
+        arc_id=kwargs.get("executor_arc_id"),
+    )
+    refusal = read_gate.check(
+        reader, f"Output of execution #{execution_id}",
+        read_gate.execution_label(execution_id),
+    )
+    if refusal:
+        parts.append(f"\n  {refusal}")
         return "\n".join(parts)
 
     log_file = row["log_file"]
