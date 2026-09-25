@@ -164,6 +164,57 @@ def handle_set_value(params: dict) -> dict:
     return {"status": "ok", "key": key, "value": value, "previous": previous}
 
 
+# Name segments that mark a config key as holding a secret.  Matched
+# against the ``_``/``.``-separated parts of a key, so ``ui_token`` and
+# ``claude_api_key`` match but ``compaction_threshold_tokens`` does not.
+_SECRET_SEGMENTS = frozenset({
+    "token", "secret", "secrets", "password", "passwd", "passphrase",
+    "apikey", "credential", "credentials",
+})
+_SECRET_SEGMENT_PAIRS = frozenset({
+    ("api", "key"), ("private", "key"), ("encryption", "key"),
+    ("signing", "key"), ("access", "key"), ("client", "secret"),
+})
+_REDACTED = "<redacted>"
+
+
+def _credential_config_keys() -> set[str]:
+    """Config keys populated from credentials (.env / environment)."""
+    keys = set(config_module._CREDENTIAL_MAP.values())
+    registry = getattr(config_module, "CREDENTIAL_REGISTRY", {}) or {}
+    for entry in registry.values():
+        if isinstance(entry, dict) and entry.get("config_key"):
+            keys.add(entry["config_key"])
+    return keys
+
+
+def _is_secret_key(key: str) -> bool:
+    """True if ``key`` (possibly dotted) names a credential or secret."""
+    if not isinstance(key, str):
+        return False
+    lowered = key.lower()
+    credential_keys = {k.lower() for k in _credential_config_keys()}
+    for part in lowered.split("."):
+        if part in credential_keys:
+            return True
+    segments = [seg for seg in lowered.replace(".", "_").replace("-", "_").split("_") if seg]
+    if any(seg in _SECRET_SEGMENTS for seg in segments):
+        return True
+    return any(pair in _SECRET_SEGMENT_PAIRS for pair in zip(segments, segments[1:]))
+
+
+def _redact(value: object) -> object:
+    """Replace secret-named entries inside nested config values."""
+    if isinstance(value, dict):
+        return {
+            k: (_REDACTED if _is_secret_key(k) else _redact(v))
+            for k, v in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact(v) for v in value]
+    return value
+
+
 def _resolve_nested(key: str) -> object:
     """Resolve a possibly-dotted key from the live CONFIG dict."""
     if "." in key:
@@ -178,13 +229,26 @@ def _resolve_nested(key: str) -> object:
 def handle_get_value(params: dict) -> dict:
     """Read a single config value from the live in-memory CONFIG.
 
+    Credentials and other secrets are refused: CONFIG holds the values
+    loaded from ``.env`` and the environment (API keys, the UI token, the
+    forge token), and this tool is callable by any executor code without
+    a reviewed session.  Secret-named entries nested inside a returned
+    dict are redacted.  To check that a credential is set, use
+    ``credentials.verify``.
+
     Params:
         key (str): Config key name.
 
     Returns {"key": ..., "value": ...}.
+    Raises ValueError if ``key`` names a credential or secret.
     """
     key = params.get("key", "")
-    value = _resolve_nested(key)
+    if _is_secret_key(key):
+        raise ValueError(
+            f"Config key {key!r} holds a credential and cannot be read by "
+            "tools. Use credentials.verify to check that it is set."
+        )
+    value = _redact(_resolve_nested(key))
     return {"key": key, "value": value}
 
 
