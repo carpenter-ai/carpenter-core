@@ -364,6 +364,11 @@ DEFAULTS = {
     "web_request_default_timeout": 30.0,  # default HTTP timeout for web tool requests (seconds)
     "web_response_max_chars": 10000,      # max chars returned from web GET/POST responses
     "web_fetch_max_bytes": 1000000,       # max bytes for webpage fetch content (1 MB)
+    # Web tools refuse destinations that are not globally routable
+    # (loopback, private, link-local, ...).  Entries here re-allow them:
+    # exact hostnames, or CIDRs matched against resolved addresses.
+    # See carpenter/security/egress.py.
+    "web_egress_allowlist": [],
     # Tool classification lists — used by the callback API for access control.
     # Each list can be extended (add items) or reduced (remove items) via config.yaml.
     # Format in config.yaml:

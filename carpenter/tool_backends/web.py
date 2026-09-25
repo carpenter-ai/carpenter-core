@@ -7,6 +7,7 @@ import httpx
 from urllib.parse import urlparse
 
 from .. import config
+from ..security.egress import EgressDenied, check_redirect, check_url
 from ..core.resources import (
     create_resource,
     hash_file,
@@ -22,6 +23,8 @@ logger = logging.getLogger(__name__)
 _DEFAULT_WEB_REQUEST_TIMEOUT = 30.0
 _DEFAULT_WEB_RESPONSE_MAX_CHARS = 10000
 _DEFAULT_WEB_FETCH_MAX_BYTES = 1_000_000
+# Redirects are followed by hand so every hop passes the egress guard.
+_MAX_REDIRECTS = 10
 
 
 def _web_request_default_timeout() -> float:
@@ -39,11 +42,32 @@ def _web_fetch_max_bytes() -> int:
     return config.get_config("web_fetch_max_bytes", _DEFAULT_WEB_FETCH_MAX_BYTES)
 
 
+def _get_following_redirects(url: str, **kwargs):
+    """GET ``url``, following redirects only to destinations the guard allows.
+
+    ``check_url(url)`` must already have passed.  Each redirect target is
+    checked before it is requested.
+    """
+    hops = 0
+    while True:
+        response = httpx.get(url, follow_redirects=False, **kwargs)
+        target = check_redirect(response, _MAX_REDIRECTS, hops)
+        if target is None:
+            return response
+        url = target
+        hops += 1
+
+
 def handle_get(params: dict) -> dict:
     """HTTP GET request. Params: url, headers (opt), timeout (opt)."""
     url = params["url"]
     headers = params.get("headers", {})
     timeout = params.get("timeout", _web_request_default_timeout())
+
+    try:
+        check_url(url)
+    except EgressDenied as e:
+        return {"error": str(e)}
 
     try:
         response = httpx.get(url, headers=headers, timeout=timeout)
@@ -65,6 +89,11 @@ def handle_post(params: dict) -> dict:
     timeout = params.get("timeout", _web_request_default_timeout())
     json_data = params.get("json_data")
     data = params.get("data")
+
+    try:
+        check_url(url)
+    except EgressDenied as e:
+        return {"error": str(e)}
 
     try:
         response = httpx.post(
@@ -123,12 +152,14 @@ def handle_fetch_webpage(params: Dict[str, Any]) -> Dict[str, Any]:
     final_headers = {**default_headers, **headers}
 
     try:
-        # Make the HTTP request with follow_redirects=True
-        response = httpx.get(
-            url,
-            headers=final_headers,
-            timeout=timeout,
-            follow_redirects=True
+        check_url(url)
+    except EgressDenied as e:
+        return {"error": str(e)}
+
+    try:
+        # Follow redirects hop by hop so each target passes the egress guard
+        response = _get_following_redirects(
+            url, headers=final_headers, timeout=timeout,
         )
 
         # Check if response is successful
@@ -154,6 +185,8 @@ def handle_fetch_webpage(params: Dict[str, Any]) -> Dict[str, Any]:
             "encoding": response.encoding or "utf-8"
         }
 
+    except EgressDenied as e:
+        return {"error": str(e)}
     except httpx.TimeoutException:
         return {"error": f"Request timed out after {timeout} seconds"}
     except httpx.ConnectError:
@@ -263,6 +296,7 @@ def handle_fetch_webpage_to_resource(params: Dict[str, Any]) -> Dict[str, Any]:
         )
     if parsed.scheme not in ("http", "https"):
         raise ValueError("Only HTTP and HTTPS URLs are supported")
+    check_url(url)
 
     max_bytes = params.get("max_bytes")
     if max_bytes is None:
@@ -287,8 +321,8 @@ def handle_fetch_webpage_to_resource(params: Dict[str, Any]) -> Dict[str, Any]:
     # is honoured exactly.  No sandbox is needed: this module runs in the
     # trusted tool-backend process, and the *output* (raw Resource) carries
     # the untrusted trust marker so downstream readers are already gated.
-    response = httpx.get(
-        url, headers=final_headers, timeout=timeout, follow_redirects=True,
+    response = _get_following_redirects(
+        url, headers=final_headers, timeout=timeout,
     )
 
     # Explicit non-2xx policy: don't create a Resource for failed fetches.
