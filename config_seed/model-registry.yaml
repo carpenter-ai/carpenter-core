@@ -4,7 +4,9 @@
 #   provider:  API backend ("anthropic", "ollama", "tinfoil")
 #   model_id:  Exact model string sent to the provider API
 #   quality_tier: 1-5 (1=basic chat, 5=frontier reasoning)
-#   cost_per_mtok_in/out/cached: USD per million tokens
+#   cost_per_mtok_in/out/cached: USD per million tokens (provider list prices;
+#     cached = cache-hit rate). Keep these current: the budget breaker's
+#     cost_usd metric and the selector's cost score both read them.
 #   context_window: Max context tokens
 #   capabilities: List of capability tags for constraint filtering
 #   measured_speed: Populated automatically from api_calls latency data (seconds per ktok output)
@@ -14,9 +16,9 @@ models:
     provider: anthropic
     model_id: claude-opus-4-7
     quality_tier: 5
-    cost_per_mtok_in: 15.0
-    cost_per_mtok_out: 75.0
-    cached_cost_per_mtok_in: 1.5
+    cost_per_mtok_in: 5.0
+    cost_per_mtok_out: 25.0
+    cached_cost_per_mtok_in: 0.5
     context_window: 200000
     capabilities: [planning, review, implementation, code, security_review]
 
@@ -34,9 +36,9 @@ models:
     provider: anthropic
     model_id: claude-haiku-4-5
     quality_tier: 2
-    cost_per_mtok_in: 0.8
-    cost_per_mtok_out: 4.0
-    cached_cost_per_mtok_in: 0.08
+    cost_per_mtok_in: 1.0
+    cost_per_mtok_out: 5.0
+    cached_cost_per_mtok_in: 0.1
     context_window: 200000
     capabilities: [summarization, documentation, simple_code]
 
