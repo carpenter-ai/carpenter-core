@@ -141,3 +141,25 @@ class TestCreateConversationEntry:
     def test_sanitize_title_collapses_consecutive_special_chars(self):
         """Multiple consecutive special chars become a single hyphen."""
         assert _sanitize_title("foo   @#$   bar") == "foo-bar"
+
+
+class TestTaintedConversationEntries:
+    """A summary written from a tainted conversation must not enter the KB."""
+
+    def test_tainted_conversation_gets_no_entry(self):
+        from carpenter.security.trust import record_taint
+        conv_id = _create_conversation("Fetched a page", "Summary of fetched content.")
+        record_taint(conv_id, "carpenter_tools.act.web")
+        store = get_store()
+        assert create_conversation_entry(conv_id, store) is None
+        assert store.get_entry(f"conversations/{conv_id}-fetched-a-page") is None
+
+    def test_backfill_skips_tainted(self):
+        from carpenter.security.trust import record_taint
+        clean = _create_conversation("Clean one", "Clean summary.")
+        tainted = _create_conversation("Tainted one", "Tainted summary.")
+        record_taint(tainted, "carpenter_tools.act.web")
+        store = get_store()
+        assert backfill_conversations(store) == 1
+        assert store.get_entry(f"conversations/{clean}-clean-one") is not None
+        assert store.get_entry(f"conversations/{tainted}-tainted-one") is None
