@@ -107,7 +107,6 @@ _HARDCODED_T0_PATTERNS: tuple[str, ...] = (
     "*.pem",
     "*_token",
     "*/review_keys/*",
-    "/opt/credentials/*",
 )
 
 

@@ -498,7 +498,8 @@ DEFAULTS = {
     # ``path_overrides``: optional user-supplied list of
     # ``{prefix: "/abs/path", tier: "T0"|"T1"|"T2"}`` entries that ADD to
     # the hardcoded T0/T1 floor.  Entries cannot demote a hardcoded T1
-    # path to T2 — the floor wins.
+    # path to T2 — the floor wins.  Host-specific secret stores belong
+    # here as T0 entries rather than in the hardcoded floor.
     "platform_integrity": {
         "change_workflows": {
             "python": "coding-change",
