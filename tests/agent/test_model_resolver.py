@@ -38,6 +38,12 @@ def mock_escalation_config(monkeypatch):
         },
     }
     monkeypatch.setattr(config, "CONFIG", test_config)
+    # Empty the model registry so estimate_cost_multiplier uses the
+    # escalation.pricing table above. Otherwise it builds the registry from
+    # the models in DEFAULTS and the result depends on the seed prices.
+    from carpenter.core.models import registry
+    monkeypatch.setattr(registry, "_registry", {})
+    monkeypatch.setattr(registry, "_registry_loaded", True)
 
 
 def test_parse_model_string_valid():

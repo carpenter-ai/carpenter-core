@@ -102,9 +102,9 @@ def _load_from_config() -> dict[str, ModelEntry]:
     tier_map = {"low": 2, "medium": 4, "high": 5}
     # Cost tier → approximate pricing (in/out/cached per Mtok)
     pricing_map = {
-        "low": (0.8, 4.0, 0.08),
+        "low": (1.0, 5.0, 0.1),
         "medium": (3.0, 15.0, 0.3),
-        "high": (15.0, 75.0, 1.5),
+        "high": (5.0, 25.0, 0.5),
     }
 
     models = config.CONFIG.get("models", {})
