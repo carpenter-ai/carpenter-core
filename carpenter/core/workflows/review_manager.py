@@ -310,8 +310,16 @@ def _handle_rejection(
 ) -> None:
     """Handle a rejection verdict.
 
-    If rejection is from JUDGE, immediately fail the target arc.
-    Individual reviewer rejections are advisory only.
+    If rejection is from JUDGE and the target has not frozen yet, fail
+    the target.  Individual reviewer rejections are advisory only.
+
+    In a batch built by ``arc.create_batch`` the target always precedes
+    its REVIEWER and JUDGE in step order, so it has already frozen when
+    the JUDGE rejects.  A frozen arc never changes status, so the target
+    is left as it is and the rejection is carried by the JUDGE arc
+    itself: its dispatcher fails it (see
+    ``dispatch_handler._fail_judge_arc``), which blocks later siblings
+    and fails the parent.
     """
     # Check if rejecting arc is a JUDGE
     with db_connection() as db:
@@ -321,9 +329,15 @@ def _handle_rejection(
         ).fetchone()
 
     if row and row["agent_type"] == "JUDGE":
-        # Judge rejected — immediately fail the target
+        # Judge rejected — fail the target if it is still open
         target = arc_manager.get_arc(target_arc_id)
-        if target and target["status"] not in arc_manager.FROZEN_STATUSES:
+        if target and target["status"] in arc_manager.FROZEN_STATUSES:
+            logger.info(
+                "JUDGE arc %d rejected frozen target %d (status=%s); "
+                "the target stays frozen and the JUDGE arc carries the failure",
+                reviewer_arc_id, target_arc_id, target["status"],
+            )
+        elif target:
             try:
                 arc_manager.update_status(target_arc_id, "active")
             except ValueError:

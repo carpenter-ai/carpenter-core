@@ -96,6 +96,11 @@ def escalate_to_next_model(arc_id: int) -> int | None:
     if arc is None:
         return None
 
+    # A JUDGE runs deterministic platform code, not a model, so a
+    # stronger model cannot change its verdict.
+    if arc.get("agent_type") == "JUDGE":
+        return None
+
     current_model = None
     policy_id = arc.get("model_policy_id")
     if policy_id:
@@ -110,6 +115,28 @@ def escalate_to_next_model(arc_id: int) -> int | None:
         return None
 
     return _escalate_arc(arc_id, next_model)
+
+
+def failed_judge_in_subtree(arc_id: int) -> int | None:
+    """Return the id of a failed JUDGE arc in ``arc_id``'s subtree, or None.
+
+    The subtree includes ``arc_id`` itself.
+    """
+    from ...db import db_connection
+
+    with db_connection() as db:
+        row = db.execute(
+            "WITH RECURSIVE subtree(id) AS ("
+            "  SELECT ? "
+            "  UNION ALL "
+            "  SELECT a.id FROM arcs a JOIN subtree s ON a.parent_id = s.id"
+            ") "
+            "SELECT a.id FROM arcs a JOIN subtree ON subtree.id = a.id "
+            "WHERE a.agent_type = 'JUDGE' AND a.status = 'failed' "
+            "ORDER BY a.id LIMIT 1",
+            (arc_id,),
+        ).fetchone()
+    return row["id"] if row else None
 
 
 def _handle_root_failure(arc_id: int) -> None:
@@ -156,6 +183,30 @@ def _handle_root_failure(arc_id: int) -> None:
             )
         except Exception:  # broad catch: notification delivery may raise anything
             logger.exception("Failed to send coding-change failure notification")
+        return
+
+    # Skip escalation when a JUDGE in this tree failed.  A JUDGE fails
+    # only when it did not approve its review target, which is a policy
+    # decision made by deterministic code; re-running the tree on a
+    # stronger model would repeat the rejected work.
+    judge_id = failed_judge_in_subtree(arc_id)
+    if judge_id is not None:
+        logger.info(
+            "Root arc %d failed because JUDGE arc %d did not approve; "
+            "not escalating", arc_id, judge_id,
+        )
+        try:
+            from .. import notifications
+            notifications.notify(
+                f"Root arc #{arc_id} '{arc['name']}' failed: JUDGE arc "
+                f"#{judge_id} did not approve its review target.",
+                priority="normal",
+                category="judge_rejected",
+            )
+        except Exception:  # broad catch: notification delivery may raise anything
+            logger.exception(
+                "Failed to send judge-rejection notification for arc %d", arc_id,
+            )
         return
 
     # Try policy-aware escalation first
