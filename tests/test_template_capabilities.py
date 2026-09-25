@@ -318,6 +318,7 @@ def test_planner_blocked_without_capability():
             {"_caller_arc_id": arc_id, "arc_id": arc_id,
              "path": "test/entry", "content": "hello"},
             session_id="planner-test-session",
+            arc_id=arc_id,
         )
 
 
@@ -334,6 +335,7 @@ def test_planner_allowed_with_kb_write_capability():
             {"_caller_arc_id": arc_id, "arc_id": arc_id,
              "path": "test/entry", "content": "hello"},
             session_id="planner-kb-session",
+            arc_id=arc_id,
         )
     except DispatchError as e:
         # Should NOT be a PLANNER restriction error
@@ -351,6 +353,7 @@ def test_planner_still_blocked_for_ungranted_tools():
             {"_caller_arc_id": arc_id, "arc_id": arc_id,
              "url": "http://example.com"},
             session_id="planner-web-session",
+            arc_id=arc_id,
         )
 
 
@@ -410,6 +413,7 @@ def test_cross_arc_read_blocked_without_system_read():
                 "_target_arc_id": target_id,
                 "key": "secret",
             },
+            arc_id=caller_id,
         )
 
 
@@ -443,6 +447,7 @@ def test_cross_arc_read_allowed_with_system_read():
             "_target_arc_id": target_id,
             "key": "readable",
         },
+        arc_id=caller_id,
     )
     assert result["value"] == "hello"
 

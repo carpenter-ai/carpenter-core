@@ -669,12 +669,23 @@ def _attach_per_turn_context(api_messages: list[dict], context_block: str) -> li
 
     return api_messages
 
-def _truncate_tool_output(result_text: str, tool_name: str) -> str:
+def _truncate_tool_output(
+    result_text: str,
+    tool_name: str,
+    conversation_id: int | None = None,
+    executor_arc_id: int | None = None,
+) -> str:
     """Truncate large tool output to avoid flooding the context window.
 
     If the result exceeds ``tool_output_max_bytes`` (default 32 KB) the full
     output is saved to a date-partitioned file under ``{code_dir}/../tool_output/``
     and a head + tail summary is returned to the agent instead.
+
+    The saved file is labelled with the integrity of the context that
+    produced it (``conversation_id``, ``executor_arc_id``), so a REVIEWER's
+    or untrusted arc's output cannot later be read back into a trusted
+    context by path.  An unlabelled file in that directory reads as
+    untrusted (``security/read_gate.py``).
 
     Small outputs are passed through unchanged.
     """
@@ -694,7 +705,9 @@ def _truncate_tool_output(result_text: str, tool_name: str) -> str:
     out_dir = os.path.join(base_data_dir, "tool_output", date_dir)
     os.makedirs(out_dir, exist_ok=True)
 
-    timestamp = now.strftime("%H%M%S")
+    # Microseconds keep two results from one second apart: each file
+    # carries its own integrity label.
+    timestamp = now.strftime("%H%M%S%f")
     safe_tool_name = tool_name.replace("/", "_").replace("\\", "_")
     filename = f"{timestamp}_{safe_tool_name}_{os.getpid()}.txt"
     out_path = os.path.join(out_dir, filename)
@@ -702,6 +715,15 @@ def _truncate_tool_output(result_text: str, tool_name: str) -> str:
     try:
         with open(out_path, "w", encoding="utf-8") as f:
             f.write(result_text)
+        if conversation_id is not None or executor_arc_id is not None:
+            # With no context to label it by, the file stays unlabelled,
+            # which reads as untrusted.
+            from ..security import read_gate
+            read_gate.record_file_label(
+                out_path,
+                read_gate.context_label(conversation_id, executor_arc_id),
+                writer_arc_id=executor_arc_id,
+            )
     except OSError as e:
         logger.warning("Failed to save truncated tool output to %s: %s", out_path, e)
         # Still truncate even if save fails — the whole point is context protection
@@ -853,7 +875,28 @@ def _execute_chat_tool(
     1. Platform-registered handlers (from platform packages via register_tool_handler)
     2. Platform tools (submit_code, escalate, escalate_current_arc) — inline
     3. Loaded handlers (from user-configurable config/chat_tools/ modules)
+
+    The call runs inside ``read_gate.invocation_context`` so core read
+    checks know which agent is reading even when a tool module does not
+    pass that identity on.
     """
+    from ..security import read_gate
+    with read_gate.invocation_context(conversation_id, executor_arc_id):
+        return _execute_chat_tool_inner(
+            tool_name, tool_input,
+            conversation_id=conversation_id,
+            executor_arc_id=executor_arc_id,
+            executor_conv_id=executor_conv_id,
+        )
+
+
+def _execute_chat_tool_inner(
+    tool_name: str,
+    tool_input: dict,
+    conversation_id: int | None = None,
+    executor_arc_id: int | None = None,
+    executor_conv_id: int | None = None,
+) -> str:
     try:
         # 1. Check registered handlers first (from platform packages)
         if tool_name in _extra_tool_handlers:
@@ -2747,7 +2790,10 @@ def invoke_for_chat(
             tool_timing_map[tool_id] = int((t_end - t_start) * 1000)
 
             # Truncate large tool outputs to protect the context window
-            result_str = _truncate_tool_output(result_str, tool_name)
+            result_str = _truncate_tool_output(
+                result_str, tool_name,
+                conversation_id=conv_id, executor_arc_id=_executor_arc_id,
+            )
 
             tool_result_map[tool_id] = result_str
             tool_result_blocks.append({

@@ -948,6 +948,21 @@ async def _run_arc_agent(
     conv_module.set_conversation_title(
         arc_conv_id, f"[Arc #{arc_id}] {goal[:50]}"
     )
+    # A REVIEWER reads raw untrusted input and a non-trusted arc works on
+    # it, so their working conversations are untrusted from the start.
+    # Taint them now: nothing else would, since they read through
+    # read_file / state, not a tainting import.
+    from ...security import read_gate
+    _taint = read_gate.taint_source_for_arc(arc_id)
+    if _taint:
+        from ...security.trust import record_taint
+        try:
+            record_taint(arc_conv_id, _taint)
+        except Exception:  # broad catch: the "[Arc #N]" title still labels it
+            logger.warning(
+                "Could not taint conversation %d of arc %d",
+                arc_conv_id, arc_id, exc_info=True,
+            )
 
     # Prompt selection (first hit wins):
     # 1. Step-owned prompt — when the step's YAML config sets
