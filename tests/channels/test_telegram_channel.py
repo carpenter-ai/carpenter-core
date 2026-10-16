@@ -106,6 +106,28 @@ class TestTelegramStartStop:
             await c.start({})
 
     @pytest.mark.asyncio
+    async def test_start_reads_token_from_config(self, monkeypatch):
+        """A token from {base_dir}/.env arrives via config, not os.environ."""
+        monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+        c = TelegramChannelConnector(connector_config={"enabled": True})
+
+        mock_response = MagicMock()
+        mock_response.raise_for_status = MagicMock()
+        mock_response.json.return_value = {
+            "ok": True, "result": {"username": "test_bot"},
+        }
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=mock_response)
+        mock_client.aclose = AsyncMock()
+
+        with patch("carpenter.channels.telegram_channel.httpx") as mock_httpx:
+            mock_httpx.AsyncClient.return_value = mock_client
+            await c.start({"telegram_bot_token": "123:FROMCONFIG"})
+
+        assert c._bot_token == "123:FROMCONFIG"
+        await c.stop()
+
+    @pytest.mark.asyncio
     async def test_stop_cancels_poll_task(self):
         """stop() should cancel the polling task."""
         c = TelegramChannelConnector(connector_config={

@@ -93,7 +93,7 @@ def test_sync_credential_registry_creates_file(tmp_path):
     registry_file = tmp_path / "config" / "credential_registry.yaml"
     assert registry_file.is_file()
     content = registry_file.read_text()
-    assert "ANTHROPIC_API_KEY" in content
+    assert "config_key" in content  # the documented example entry
 
 
 def test_sync_credential_registry_does_not_overwrite(tmp_path):

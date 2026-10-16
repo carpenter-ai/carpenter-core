@@ -63,6 +63,10 @@ class TelegramChannelConnector(ChannelConnector):
         Validates the bot token, then starts polling or webhook mode.
         """
         if not self._bot_token:
+            # TELEGRAM_BOT_TOKEN set in {base_dir}/.env reaches config, not
+            # os.environ, so look there too.
+            self._bot_token = str(config.get("telegram_bot_token") or "")
+        if not self._bot_token:
             raise ValueError("Telegram bot_token is required")
 
         self._client = httpx.AsyncClient(timeout=60)

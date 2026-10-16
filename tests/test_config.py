@@ -466,3 +466,51 @@ def test_derived_paths_match_seed_manifest(tmp_path):
     # kb is stored under a nested dict
     kb_entry = next(e for e in SEED_MANIFEST if e.name == "kb")
     assert config["kb"]["dir"] == os.path.join(str(base), kb_entry.default_rel_target)
+
+
+# ── Credential declaration rule ────────────────────────────────────
+
+
+def _seed_credential_registry() -> dict:
+    import yaml
+    from carpenter.db import _config_seed_dir
+    path = _config_seed_dir() / "credential-registry.yaml"
+    return yaml.safe_load(path.read_text()) or {}
+
+
+def test_seed_credential_registry_declares_no_builtin_credential():
+    """Credentials the package reads are declared in _CREDENTIAL_MAP only.
+
+    The seed registry is copied once on first run and never updated, so it
+    must not be (or look like) the declaration of a built-in credential.
+    """
+    from carpenter.config import _CREDENTIAL_MAP
+    overlap = set(_seed_credential_registry()) & set(_CREDENTIAL_MAP)
+    assert not overlap, f"declare these only in _CREDENTIAL_MAP: {overlap}"
+
+
+@pytest.mark.parametrize("env_var,config_key", [
+    ("SIGNAL_WEBHOOK_SECRET", "signal_webhook_secret"),
+    ("TELEGRAM_BOT_TOKEN", "telegram_bot_token"),
+])
+def test_channel_credentials_in_map(env_var, config_key):
+    from carpenter.config import _CREDENTIAL_MAP
+    assert _CREDENTIAL_MAP[env_var] == config_key
+
+
+def test_builtin_credential_loads_from_dot_env_without_registry(tmp_path, monkeypatch):
+    """A built-in credential works on an install whose registry predates it."""
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+    (tmp_path / ".env").write_text("TELEGRAM_BOT_TOKEN=123:abc\n")
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    # An old synced registry that knows nothing about Telegram.
+    (config_dir / "credential_registry.yaml").write_text(
+        "UI_TOKEN:\n  config_key: ui_token\n"
+    )
+    yaml_file = tmp_path / "config.yaml"
+    yaml_file.write_text(f"base_dir: {tmp_path}\n")
+
+    from carpenter.config import load_config
+    cfg = load_config(yaml_path=str(yaml_file))
+    assert cfg["telegram_bot_token"] == "123:abc"
