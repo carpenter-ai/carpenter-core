@@ -431,7 +431,7 @@ The subprocess and Docker executor types were removed. Platform packages (e.g., 
 
 ## Configuration
 
-All instance-specific settings via `~/carpenter/config.yaml` or standard environment variables (e.g., `ANTHROPIC_API_KEY`, `UI_TOKEN`, `TINFOIL_API_KEY`, `SIGNAL_WEBHOOK_SECRET`). Four-layer precedence: env vars > {base_dir}/.env credential file > YAML > built-in defaults. No hardcoded credentials in the package.
+All instance-specific settings via `~/carpenter/config.yaml` or standard environment variables (e.g., `ANTHROPIC_API_KEY`, `UI_TOKEN`, `TINFOIL_API_KEY`, `SIGNAL_WEBHOOK_SECRET`, `TELEGRAM_WEBHOOK_SECRET`). Four-layer precedence: env vars > {base_dir}/.env credential file > YAML > built-in defaults. No hardcoded credentials in the package.
 
 Which env vars count as credentials is declared in one of two places, by a single rule: every credential the package's own code reads is in `_CREDENTIAL_MAP` (`carpenter/config.py`), which ships with each release; `{base_dir}/config/credential_registry.yaml` holds only extra, operator- or integration-defined credentials and is merged over the map at load. The registry file is copied from `config_seed/` once and never updated, so it cannot carry a credential that a later release starts to depend on.
 
