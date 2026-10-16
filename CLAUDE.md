@@ -27,7 +27,7 @@ Pure-Python AI agent platform using the CaMeL pattern.
   - `tool_meta.py` — `@tool()` decorator and package validation
 - `config_seed/` — All default/seed data (copied to `{base_dir}/config/` on first install)
   - `prompts/` — Default system prompt sections (markdown)
-  - `chat_tools/` — Chat tool handler modules (`@chat_tool` decorated, loaded by `chat_tool_loader.py`)
+  - `chat_tools/` — Chat tool handler modules (`@chat_tool` decorated, loaded by `chat_tool_loader.py`). New seed modules are added to an existing install on start; edited ones are kept and logged as drifted, never overwritten. Security checks belong in core, not only in these files
   - `templates/` — Workflow template YAML files
   - `kb/` — Seed knowledge base entries
   - `coding-prompts/` — Coding agent prompt defaults
