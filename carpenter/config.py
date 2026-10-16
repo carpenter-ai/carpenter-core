@@ -545,22 +545,40 @@ DEFAULTS = {
     },
 }
 
-# Credential registry: env_var_name -> {config_key, description, ...}
-# Populated in load_config() from credential_registry.yaml.
+# Credentials: env var name -> config key.
+#
+# Where a credential is declared (one rule, two places):
+#
+# * ``_CREDENTIAL_MAP`` below declares every credential that code in this
+#   package reads -- core and built-in channels alike, required or optional.
+#   It ships with the code, so a credential added in a release reaches every
+#   existing install on upgrade.  It is also what ``setup-credential``,
+#   credential verification and config-tool redaction consult.
+#
+# * ``{base_dir}/config/credential_registry.yaml`` declares *extra*
+#   credentials the package does not know about (operator- or
+#   integration-defined).  It is copied from ``config_seed/`` once, on first
+#   run, and never updated afterwards, which is why it must not be the only
+#   declaration of anything the package itself depends on.  Its entries are
+#   merged over this map in ``load_config()`` (the map is never mutated).
+#
+# Capability packages declare their own env credentials in their manifest
+# (``credential_requirements``); neither place here is involved.
+
+# Contents of credential_registry.yaml, populated in load_config().
 CREDENTIAL_REGISTRY: dict = {}
 
-# Derived map: env_var_name -> config_key (subset of CREDENTIAL_REGISTRY for fast lookup)
-# Populated in load_config() from CREDENTIAL_REGISTRY.
 _CREDENTIAL_MAP: dict[str, str] = {
-    # Tokens / secrets — never put these in config.yaml
-    "UI_TOKEN": "ui_token",
+    # Tokens / secrets -- never put these in config.yaml
+    "UI_TOKEN": "ui_token",  # Bearer token for web UI access (empty = no auth)
     # AI provider credentials
     "ANTHROPIC_API_KEY": "claude_api_key",
     "TINFOIL_API_KEY": "tinfoil_api_key",
     # TLS
-    "TLS_KEY_PASSWORD": "tls_key_password",
+    "TLS_KEY_PASSWORD": "tls_key_password",  # Password for an encrypted TLS key
     # Channels
     "SIGNAL_WEBHOOK_SECRET": "signal_webhook_secret",
+    "TELEGRAM_BOT_TOKEN": "telegram_bot_token",  # Bot API token from @BotFather
     # Git / forge
     "GIT_TOKEN": "git_token",
     "GIT_AUTHOR_NAME": "git_author_name",
