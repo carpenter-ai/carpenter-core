@@ -189,3 +189,75 @@ def test_disabled_by_config_is_noop():
     _insert_calls(5)
     budget.guard_paid_call("claude-haiku-4-5-20251001")  # no raise
     assert budget.autonomous_allowed() == (True, "")
+
+
+# ── unpriced models ─────────────────────────────────────────────────
+
+
+@pytest.fixture
+def instance_registry(tmp_path, monkeypatch):
+    """An instance model_registry.yaml that lists only one cheap model."""
+    import textwrap
+    import carpenter.core.models.registry as reg
+    p = tmp_path / "model_registry.yaml"
+    p.write_text(textwrap.dedent("""\
+        models:
+          cheap:
+            provider: anthropic
+            model_id: cheap-1
+            quality_tier: 2
+            cost_per_mtok_in: 1.0
+            cost_per_mtok_out: 5.0
+            cached_cost_per_mtok_in: 0.1
+            context_window: 200000
+          dear:
+            provider: anthropic
+            model_id: dear-1
+            quality_tier: 5
+            cost_per_mtok_in: 10.0
+            cost_per_mtok_out: 50.0
+            cached_cost_per_mtok_in: 1.0
+            context_window: 200000
+    """))
+    monkeypatch.setattr(reg, "_yaml_path", lambda: str(p))
+    monkeypatch.setattr(reg, "_registry", {})
+    monkeypatch.setattr(reg, "_registry_loaded", False)
+    monkeypatch.setattr(budget, "_warned_unpriced", set())
+    yield p
+    reg._registry = {}
+    reg._registry_loaded = False
+
+
+def test_config_only_model_absent_from_instance_registry_is_not_free(
+    instance_registry, monkeypatch, caplog,
+):
+    """A model defined only in config.yaml, missing from the loaded instance
+    registry, is charged at the registry's highest price, not $0."""
+    monkeypatch.setitem(config.CONFIG, "models", {
+        "extra": {"provider": "anthropic", "model_id": "config-only-1",
+                  "cost_tier": "low"},
+    })
+    _insert_calls(1, model="config-only-1",
+                  input_tokens=1_000_000, output_tokens=1_000_000)
+    with caplog.at_level("WARNING", logger="carpenter.core.budget"):
+        with db_transaction() as db:
+            cost = budget._measure(db, "cost_usd", 3600)
+    # Ceiling of the instance registry: $10 in + $50 out.
+    assert cost == pytest.approx(60.0, rel=1e-3)
+    assert "config-only-1" in caplog.text
+
+
+def test_known_model_still_charged_its_own_price(instance_registry):
+    _insert_calls(1, model="cheap-1",
+                  input_tokens=1_000_000, output_tokens=1_000_000)
+    with db_transaction() as db:
+        cost = budget._measure(db, "cost_usd", 3600)
+    assert cost == pytest.approx(6.0, rel=1e-3)
+
+
+def test_unpriced_model_warns_once(instance_registry, caplog):
+    rows = [{"model": "mystery", "inp": 1, "out": 1, "cc": 0, "cr": 0}] * 3
+    with caplog.at_level("WARNING", logger="carpenter.core.budget"):
+        budget._cost_from_rows(rows)
+        budget._cost_from_rows(rows)
+    assert caplog.text.count("'mystery'") == 1

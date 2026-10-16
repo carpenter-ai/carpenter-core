@@ -202,7 +202,9 @@ def _load_from_config() -> dict[str, ModelEntry]:
             pricing = _price_of(known)
         else:
             pricing = tier_prices.get(cost_tier, ceiling)
-        if "cost_per_mtok_in" in entry or "cost_per_mtok_out" in entry:
+        if any(k in entry for k in (
+            "cost_per_mtok_in", "cost_per_mtok_out", "cached_cost_per_mtok_in",
+        )):
             pricing = (
                 float(entry.get("cost_per_mtok_in", pricing[0])),
                 float(entry.get("cost_per_mtok_out", pricing[1])),
@@ -256,6 +258,16 @@ def get_registry() -> dict[str, ModelEntry]:
     if not _registry_loaded:
         load_registry()
     return dict(_registry)
+
+
+def unknown_model_price() -> tuple[float, float, float]:
+    """Price (in/out/cached USD per Mtok) to charge a model with no entry.
+
+    The most expensive model in the loaded registry, or ``_UNKNOWN_PRICE``
+    if the registry is empty.  Used by cost accounting so that a model
+    missing from the registry is charged conservatively rather than at $0.
+    """
+    return _ceiling_price(get_registry())
 
 
 def get_entry(key: str) -> ModelEntry | None:

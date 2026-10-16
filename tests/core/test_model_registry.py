@@ -357,6 +357,45 @@ class TestConfigFallbackPricing:
         # Unspecified field keeps the registry value.
         assert entries["m"].cached_cost_per_mtok_in == 0.2
 
+    def test_instance_copy_wins_over_seed(self, monkeypatch, tmp_path):
+        """A model in both the instance registry and the seed takes the
+        instance price."""
+        import carpenter.core.models.registry as mod
+        seed = _load_from_yaml(str(mod._seed_yaml_path()))
+        seed_entry = next(e for e in seed.values() if e.cost_per_mtok_out > 0)
+        inst = tmp_path / "model_registry.yaml"
+        inst.write_text(textwrap.dedent(f"""\
+            models:
+              mine:
+                provider: anthropic
+                model_id: "{seed_entry.model_id}"
+                quality_tier: 4
+                cost_per_mtok_in: 0.25
+                cost_per_mtok_out: 1.25
+                cached_cost_per_mtok_in: 0.025
+                context_window: 200000
+        """))
+        monkeypatch.setattr(mod, "_yaml_path", lambda: str(inst))
+        self._config(monkeypatch, {
+            "k": {"model_id": seed_entry.model_id, "cost_tier": "high"},
+        })
+        entries = _load_from_config()
+        assert entries["k"].cost_per_mtok_in == 0.25
+        assert entries["k"].cost_per_mtok_out == 1.25
+        assert entries["k"].cost_per_mtok_out != seed_entry.cost_per_mtok_out
+
+    def test_cached_only_config_price_honoured(self, monkeypatch, price_yaml):
+        import carpenter.core.models.registry as mod
+        monkeypatch.setattr(mod, "_yaml_path", lambda: price_yaml)
+        self._config(monkeypatch, {
+            "m": {"model_id": "mid-1", "cached_cost_per_mtok_in": 0.05},
+        })
+        entries = _load_from_config()
+        assert entries["m"].cached_cost_per_mtok_in == 0.05
+        # The other fields keep the registry price.
+        assert entries["m"].cost_per_mtok_in == 2.0
+        assert entries["m"].cost_per_mtok_out == 11.0
+
     def test_bundled_seed_supplies_prices_without_instance_copy(self, monkeypatch):
         import carpenter.core.models.registry as mod
         monkeypatch.setattr(mod, "_yaml_path", lambda: None)

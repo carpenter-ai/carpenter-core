@@ -202,12 +202,33 @@ def _price_entry(model: str):
     return best
 
 
+# Models already warned about as unpriced, so the warning is once per model.
+_warned_unpriced: set[str] = set()
+
+
 def _cost_from_rows(rows) -> float:
+    from .models import registry
+
     total = 0.0
     for r in rows:
-        entry = _price_entry(r["model"] or "")
-        if entry is None:
-            continue
+        model = r["model"] or ""
+        entry = _price_entry(model)
+        if entry is not None:
+            price_in = entry.cost_per_mtok_in
+            price_out = entry.cost_per_mtok_out
+            price_cached = entry.cached_cost_per_mtok_in
+        else:
+            # No registry entry: charge the most expensive known rate rather
+            # than $0, so an unpriced model can trip the breaker early but
+            # never slips under it.  Add the model to model_registry.yaml
+            # (cost 0 for a local model) to charge it accurately.
+            price_in, price_out, price_cached = registry.unknown_model_price()
+            if model not in _warned_unpriced:
+                _warned_unpriced.add(model)
+                logger.warning(
+                    "Model %r has no model registry entry; budget charges it "
+                    "at the highest registry price", model,
+                )
         inp = (r["inp"] or 0)
         out = (r["out"] or 0)
         cc = (r["cc"] or 0)
@@ -215,10 +236,10 @@ def _cost_from_rows(rows) -> float:
         # Cache *creation* bills ~125% of base input; cache *read* bills the
         # cached rate. Approximation is fine for a safety threshold.
         total += (
-            inp * entry.cost_per_mtok_in
-            + cc * entry.cost_per_mtok_in * 1.25
-            + cr * entry.cached_cost_per_mtok_in
-            + out * entry.cost_per_mtok_out
+            inp * price_in
+            + cc * price_in * 1.25
+            + cr * price_cached
+            + out * price_out
         ) / 1_000_000.0
     return total
 
