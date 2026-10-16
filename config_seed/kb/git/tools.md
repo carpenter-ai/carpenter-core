@@ -4,7 +4,7 @@ Exact function signatures for git operations. Use these — do NOT guess paramet
 
 ## CRITICAL: Never hardcode Forgejo URLs
 
-NEVER hardcode Forgejo URLs (like git.harack.us, git.magi.systems, etc.) in code OR in arc goals. ALWAYS read the URL from config at runtime:
+NEVER hardcode Forgejo URLs (like git.example.com) in code OR in arc goals. ALWAYS read the URL from config at runtime:
 ```python
 from carpenter_tools.read import config
 server_url = config.get_value('git_url')['value']

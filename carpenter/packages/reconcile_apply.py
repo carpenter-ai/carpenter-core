@@ -229,7 +229,7 @@ def apply_reconciled_install(
         )
 
     # mkdtemp honours $TMPDIR (the repo sets TMPDIR=/dev/shm for
-    # test/workspace runs) so we keep staging churn off the SD card.
+    # test/workspace runs) so we keep staging churn off slow flash storage.
     staging_root = Path(tempfile.mkdtemp(prefix="carpenter-reconcile-apply-"))
     try:
         files_written = _materialize_tree(resolved_tree, staging_root)

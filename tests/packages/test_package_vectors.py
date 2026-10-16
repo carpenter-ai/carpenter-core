@@ -8,7 +8,7 @@ Covers:
   - EmbeddingModelMismatchError on dim mismatch and on identity flip
   - Cross-handle search impossibility (no package_name on search())
   - FK CASCADE wipe on package uninstall
-  - Large batch upsert (1k vectors) latency budget on Pi
+  - Large batch upsert (1k vectors) latency budget on low-power hardware
   - embed_and_upsert / embed_and_search happy path with mocked service
   - Filter semantics: exact-match on JSON metadata keys
   - Trigger framework backcompat — built-in triggers still construct
@@ -536,10 +536,10 @@ class TestCascadeDelete:
 
 class TestLargeBatch:
     def test_thousand_vector_batch_under_budget(self, db_conn):
-        """1k 4-dim vectors batch upsert should complete in a few seconds on Pi.
+        """1k 4-dim vectors batch upsert should complete in a few seconds on low-power hardware.
 
-        The budget is generous (5s) to avoid CI flakes; on a healthy Pi
-        this is well under 1s.  The goal is to detect catastrophic
+        The budget is generous (5s) to avoid CI flakes; on typical
+        hardware this is well under 1s.  The goal is to detect catastrophic
         regressions (e.g. accidentally re-opening the DB connection per
         row), not to micro-benchmark.
         """

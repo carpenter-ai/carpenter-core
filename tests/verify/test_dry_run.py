@@ -659,7 +659,7 @@ platform.request_restart(mode="opportunistic", reason="deploy")
     def test_act_webhook_subscribe(self):
         code = """
 from carpenter_tools.act import webhook
-webhook.subscribe("forgejo", ["pull_request"], "create_arc", {}, "ben-harack", "test")
+webhook.subscribe("forgejo", ["pull_request"], "create_arc", {}, "example-owner", "test")
 """
         result = run_dry_run(code, [])
         assert result.passed
@@ -699,7 +699,7 @@ config.models()
     def test_read_git_get_pr(self):
         code = """
 from carpenter_tools.read import git
-git.get_pr("ben-harack", "test", 1)
+git.get_pr("example-owner", "test", 1)
 """
         result = run_dry_run(code, [])
         assert result.passed
@@ -709,7 +709,7 @@ git.get_pr("ben-harack", "test", 1)
     def test_read_git_get_pr_diff(self):
         code = """
 from carpenter_tools.read import git
-git.get_pr_diff("ben-harack", "test", 1)
+git.get_pr_diff("example-owner", "test", 1)
 """
         result = run_dry_run(code, [])
         assert result.passed

@@ -56,7 +56,7 @@ carpenter = ["schema.sql", "agent/*.yaml", "api/static/*.css", "api/static/*.js"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
-# -n 3 leaves one core free on a 4-core Pi so tests don't starve the server.
+# -n 3 leaves one core free on a 4-core host so tests don't starve a running server.
 # Override with: pytest -n auto (all cores) or pytest -n 0 (single-threaded).
 addopts = "--strict-markers -n 3"
 tmp_path_retention_count = 0
