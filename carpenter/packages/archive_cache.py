@@ -182,8 +182,8 @@ def cache_dir() -> Path:
     """Return the local archive-cache root, creating it if missing.
 
     Defaults to ``{base_dir}/cache/package-archives/`` where ``base_dir``
-    comes from ``carpenter.config.CONFIG['base_dir']``.  This path is on
-    the data volume, not the root filesystem.
+    comes from ``carpenter.config.CONFIG['base_dir']``.  This path is under
+    ``base_dir`` (typically a data volume rather than the root filesystem).
     """
     from .. import config
 

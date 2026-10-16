@@ -51,7 +51,7 @@ class EmbeddingService:
         self._batch_size = max(1, int(batch_size))
         self._provider_kind = provider_kind
         # Process-wide lock; ``onnxruntime`` is documented thread-safe but
-        # has been observed to segfault on low-memory ARM hosts under contention (see D5).
+        # has been observed to segfault on some ARM hosts under contention (see D5).
         self._lock = threading.Lock()
         self._warmed_up = False
 
