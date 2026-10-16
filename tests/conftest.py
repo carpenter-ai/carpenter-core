@@ -491,6 +491,26 @@ def _no_title_generation(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _hermetic_egress_resolver(monkeypatch):
+    """Resolve web tool hostnames without DNS.
+
+    The web egress guard resolves every destination hostname.  Tests use
+    placeholder hosts such as ``example.com`` and must not depend on the
+    network, so names resolve to a fixed public address here, except
+    ``localhost``.  Numeric hosts never reach the resolver.  Tests of
+    the guard itself substitute their own resolver.
+    """
+    def _fake_resolve(host, port):
+        if host.lower() in ("localhost", "localhost.localdomain"):
+            return ["127.0.0.1", "::1"]
+        return ["93.184.215.14"]
+
+    monkeypatch.setattr(
+        "carpenter.security.egress._resolve_host", _fake_resolve,
+    )
+
+
+@pytest.fixture(autouse=True)
 def _no_summary_generation(monkeypatch):
     """Prevent background summary generation threads from racing across tests.
 
