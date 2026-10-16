@@ -278,3 +278,34 @@ def get_taint_sources(conversation_id: int) -> list[str]:
         (conversation_id,),
     ).fetchall()
     return [row["source_tool"] for row in rows]
+
+
+def inherit_taint(target_conversation_id: int, source_conversation_id: int) -> bool:
+    """Copy a conversation's taint onto a conversation that carries its content.
+
+    Taint is keyed by conversation id, so any path that moves one
+    conversation's content into another (a boundary rollover, an
+    injected summary or message tail) must copy the taint with it, or
+    the content arrives clean.  Each source tool is copied once; sources
+    the target already has are skipped.
+
+    Args:
+        target_conversation_id: The conversation receiving the content.
+        source_conversation_id: The conversation the content came from.
+
+    Returns:
+        True if the source was tainted (whether or not new rows were
+        written), False if it was clean.
+    """
+    sources = get_taint_sources(source_conversation_id)
+    if not sources:
+        return False
+    existing = set(get_taint_sources(target_conversation_id))
+    for source_tool in sources:
+        if source_tool not in existing:
+            record_taint(target_conversation_id, source_tool)
+    logger.info(
+        "Conversation %d inherited taint from conversation %d (%s)",
+        target_conversation_id, source_conversation_id, ", ".join(sources),
+    )
+    return True

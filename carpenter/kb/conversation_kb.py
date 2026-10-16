@@ -44,6 +44,16 @@ def create_conversation_entry(conversation_id: int, store) -> str | None:
     if not summary:
         return None
 
+    # A summary written from a tainted conversation is itself tainted.
+    # KB entries are read back into other conversations as trusted
+    # context, so writing one here would launder the taint.  Skip it.
+    from ..security.trust import is_conversation_tainted
+    if is_conversation_tainted(conversation_id):
+        logger.info(
+            "Skipping KB entry for tainted conversation %d", conversation_id,
+        )
+        return None
+
     title = row["title"] or "Untitled conversation"
     safe_title = _sanitize_title(title)
     kb_path = f"conversations/{conversation_id}-{safe_title}"

@@ -66,13 +66,23 @@ def get_or_create_conversation() -> int:
     where only one conversation stream exists and context management is
     automatic.
 
+    Archived conversations are never resumed or rolled over.  Arc
+    executor conversations are archived when the arc finishes, so this
+    also keeps an arc's working conversation (which may hold raw
+    untrusted content) from being summarised as if it were the user's.
+
+    When a boundary rolls over, the new conversation inherits the old
+    one's taint: it continues that conversation and may be given its
+    summary or tail as context.
+
     Returns:
         Conversation ID.
     """
     with db_connection() as db:
-        # Find the most recent conversation
+        # Find the most recent live conversation
         row = db.execute(
             "SELECT id, last_message_at FROM conversations "
+            "WHERE archived = FALSE "
             "ORDER BY id DESC LIMIT 1"
         ).fetchone()
 
@@ -95,6 +105,8 @@ def get_or_create_conversation() -> int:
             # Context boundary — start new conversation
             old_conv_id = row["id"]
             new_conv_id = _create_conversation(db)
+            from ..security.trust import inherit_taint
+            inherit_taint(new_conv_id, old_conv_id)
             threading.Thread(
                 target=generate_summary, args=(old_conv_id,), daemon=True
             ).start()
@@ -228,9 +240,9 @@ def get_prior_context(current_conversation_id: int, count: int = 10) -> list[dic
         List of message dicts from the previous conversation.
     """
     with db_connection() as db:
-        # Find the conversation before the current one
+        # Find the live conversation before the current one
         row = db.execute(
-            "SELECT id FROM conversations WHERE id < ? "
+            "SELECT id FROM conversations WHERE id < ? AND archived = FALSE "
             "ORDER BY id DESC LIMIT 1",
             (current_conversation_id,),
         ).fetchone()
@@ -523,8 +535,16 @@ def get_conversation_summary(conversation_id: int) -> str | None:
 def generate_summary(conversation_id: int):
     """Generate a structured summary for a conversation using the cheapest available model.
 
-    Reads all messages, truncates to ~6000 chars, calls the AI to produce a
-    structured summary, and stores the result. Safe to call in a background thread.
+    Reads the conversation's most recent messages up to
+    ``conversation_summary_max_length`` chars (~6000), calls the AI to
+    produce a structured summary, and stores the result.  The budget is
+    spent from the end of the conversation backwards, because pending
+    items and the latest decisions live at the end.  Safe to call in a
+    background thread.
+
+    The summary is stored on the source conversation's own row, so it
+    carries that conversation's taint by id.  It is not copied into the
+    KB when the conversation is tainted (see ``create_conversation_entry``).
     """
     try:
         with db_connection() as db:
@@ -537,19 +557,21 @@ def generate_summary(conversation_id: int):
         if not rows:
             return
 
-        # Build message text, truncating to ~6000 chars total
+        # Build message text from the end backwards, ~6000 chars total
+        summary_max = config.get_config("conversation_summary_max_length", 6000)
+        min_remaining = config.get_config("conversation_summary_min_remaining", 50)
         parts = []
         total = 0
-        for r in rows:
+        for r in reversed(rows):
             line = f"{r['role']}: {r['content']}"
-            summary_max = config.get_config("conversation_summary_max_length", 6000)
             if total + len(line) > summary_max:
                 remaining = summary_max - total
-                if remaining > config.get_config("conversation_summary_min_remaining", 50):
-                    parts.append(line[:remaining] + "...")
+                if remaining > min_remaining:
+                    parts.append("..." + line[-remaining:])
                 break
             parts.append(line)
             total += len(line)
+        parts.reverse()
 
         conversation_text = "\n".join(parts)
         prompt = (
@@ -595,10 +617,10 @@ def generate_summary(conversation_id: int):
 
 
 def get_previous_conversation_id(current_id: int) -> int | None:
-    """Get the ID of the conversation before the current one."""
+    """Get the ID of the live (non-archived) conversation before the current one."""
     with db_connection() as db:
         row = db.execute(
-            "SELECT id FROM conversations WHERE id < ? "
+            "SELECT id FROM conversations WHERE id < ? AND archived = FALSE "
             "ORDER BY id DESC LIMIT 1",
             (current_id,),
         ).fetchone()

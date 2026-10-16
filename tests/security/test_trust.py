@@ -200,3 +200,44 @@ def test_taint_isolation():
 
     assert trust.is_conversation_tainted(conv1)
     assert not trust.is_conversation_tainted(conv2)
+
+
+# ── inherit_taint ────────────────────────────────────────────────────
+
+
+def test_inherit_taint_copies_sources():
+    src = _create_conversation()
+    dst = _create_conversation()
+    trust.record_taint(src, "carpenter_tools.act.web")
+    trust.record_taint(src, "requests")
+
+    assert trust.inherit_taint(dst, src) is True
+    assert trust.is_conversation_tainted(dst)
+    assert trust.get_taint_sources(dst) == ["carpenter_tools.act.web", "requests"]
+
+
+def test_inherit_taint_clean_source_is_noop():
+    src = _create_conversation()
+    dst = _create_conversation()
+    assert trust.inherit_taint(dst, src) is False
+    assert not trust.is_conversation_tainted(dst)
+
+
+def test_inherit_taint_skips_sources_target_already_has():
+    src = _create_conversation()
+    dst = _create_conversation()
+    trust.record_taint(src, "carpenter_tools.act.web")
+    trust.record_taint(dst, "carpenter_tools.act.web")
+
+    trust.inherit_taint(dst, src)
+    trust.inherit_taint(dst, src)
+
+    db = get_db()
+    try:
+        n = db.execute(
+            "SELECT COUNT(*) FROM conversation_taint WHERE conversation_id = ?",
+            (dst,),
+        ).fetchone()[0]
+    finally:
+        db.close()
+    assert n == 1
