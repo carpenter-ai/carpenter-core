@@ -429,8 +429,6 @@ def test_db(tmp_path, monkeypatch):
         "encryption": {
             "enforce": True,
         },
-        "egress_policy": "none",
-        "egress_enforce": False,
         "tls_enabled": False,
         "tls_cert_path": "",
         "tls_key_path": "",
