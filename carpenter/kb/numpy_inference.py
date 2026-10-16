@@ -4,7 +4,7 @@ Implements the full transformer inference pipeline using only numpy and
 safetensors (for weight loading).  Produces identical embeddings to the
 ONNX model — same weights, same architecture, same tokenizer.
 
-Performance: ~0.5 s per query on a Raspberry Pi 4, ~50 ms on x86.
+Performance: ~0.5 s per query on a low-power ARM board, ~50 ms on x86.
 This is the universal fallback when onnxruntime is not available.
 """
 

@@ -215,7 +215,7 @@ A *limit* is one independent rule `{name, metric, window_seconds, threshold, act
   - `shutdown` — latch a kill-switch blocking *all* paid calls until a human clears it. The nuclear option.
 - Limits compose: pair a low `warn` with a higher `cap` on the same metric/window for a staged response.
 
-**State persists in SQLite** (`budget_state` kv table): kill-switch and restrict latches, runtime overrides, warn timestamps. A process restart cannot reset an active breaker — the original incident kept resuming across restarts because state was in-memory only.
+**State persists in SQLite** (`budget_state` kv table): kill-switch and restrict latches, runtime overrides, warn timestamps. A process restart cannot reset an active breaker, which in-memory state would allow.
 
 **Chokepoints wired**: `anthropic.call()` (paid call gate), `arc dispatch` (autonomous), `cron/timer firing` (autonomous), `trigger-driven arc creation` (autonomous). `BudgetExceededError` is classified fatal so the retry loop breaks immediately.
 
@@ -487,6 +487,6 @@ Each table has an independent `enabled` toggle and `retention_days` (default 30)
 
 **`messages` retention is a no-op unless conversations get auto-archived upstream.** The predicate only touches messages whose parent conversation has `archived=1`. If your deployment never archives conversations, message pruning will not free any space no matter what retention_days you set — tune conversation archival (a separate concern) if you want this table's sweep to actually do work.
 
-**Disk space caveat**: SQLite reuses freed pages, so the `.db` file will not shrink after a sweep unless `db_retention.vacuum_after: true` is set or long-running growth eventually overwrites the freed pages. The nightly rsync snapshot backups still benefit from the changed page contents even without VACUUM.
+**Disk space caveat**: SQLite reuses freed pages, so the `.db` file will not shrink after a sweep unless `db_retention.vacuum_after: true` is set or long-running growth eventually overwrites the freed pages. File-level backups (e.g. rsync snapshots) still benefit from the changed page contents even without VACUUM.
 
 Emits `db.retention.swept` events with per-table `{projected, deleted}` counts for observability. Set `db_retention.dry_run: true` to log projected counts without executing any DELETE.

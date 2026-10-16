@@ -31,7 +31,7 @@ until both of the following are configured:
    "you@example.com" } } }` in `config.yaml` or the equivalent env override).
 2. SMTP credentials for the `carpenter-imap-email` package, resolved via
    the platform's per-package credential store at
-   `/media/jabenta/carpenter/data/config/packages/carpenter-imap-email/.env`.
+   `{base_dir}/config/packages/carpenter-imap-email/.env`.
    Required keys: `EMAIL_SMTP_HOST`, `EMAIL_SMTP_USERNAME`,
    `EMAIL_SMTP_PASSWORD`. Optional: `EMAIL_SMTP_PORT` (default 587) and
    `EMAIL_SMTP_FROM` (defaults to `EMAIL_SMTP_USERNAME`).

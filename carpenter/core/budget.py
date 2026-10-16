@@ -33,7 +33,7 @@ metric/window for a two-stage response.
 
 State (kill-switch, restrict latch, runtime overrides, warn timestamps)
 lives in the ``budget_state`` table so a process restart cannot reset an
-active breaker — the original incident kept resuming across restarts.
+active breaker; in-memory state would let a tripped breaker reset on restart.
 """
 
 from __future__ import annotations

@@ -1610,7 +1610,7 @@ def install_package(
 
     # Reconcile prerequisite: cache the installed version's PRISTINE tree
     # into the local archive cache (keyed by name/version on disk under
-    # ``{base_dir}``, off the SD card).  Upgrades diff this ``shipped_old``
+    # ``{base_dir}``, off the root filesystem).  Upgrades diff this ``shipped_old``
     # tree against the new version's tree to classify user edits.  We
     # archive the freshly-materialised install dir (``dest_path``) so the
     # cached tree's hash matches the recorded ``installed_packages.hash``.

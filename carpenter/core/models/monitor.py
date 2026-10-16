@@ -9,7 +9,7 @@ so a restart cannot re-announce a situation the user has already been told
 about. Health itself is derived from the persistent ``model_calls`` window,
 so a model that was circuit-open before a restart is still circuit-open
 after one; with in-memory-only dedup that produced a fresh "model is down"
-alert on every restart, for weeks, with nothing having changed. An alert
+alert on every restart, with nothing having changed. An alert
 fires again only after the model recovers and then fails anew.
 """
 

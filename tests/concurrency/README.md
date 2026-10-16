@@ -43,11 +43,11 @@ Tests arc state updates and status transitions under concurrent access.
 
 All tests use `ThreadPoolExecutor` to run synchronous functions concurrently (work_queue and arc state APIs are sync).
 
-Concurrency level: N=10 workers (enough to expose races without overloading the Pi).
+Concurrency level: N=10 workers (enough to expose races without overloading a low-power host).
 
 ## Stability
 
-These tests are timing-dependent by nature. They run reliably on the Pi 4 but may behave differently on faster hardware or under different load. The tolerance ranges (e.g., "1-3 claimed results") account for timing variance while still catching regressions.
+These tests are timing-dependent by nature. They run reliably on low-power ARM hardware but may behave differently on faster machines or under different load. The tolerance ranges (e.g., "1-3 claimed results") account for timing variance while still catching regressions.
 
 ## Running
 

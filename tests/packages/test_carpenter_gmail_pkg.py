@@ -37,9 +37,8 @@ def _find_email_package() -> Path | None:
       2. ``../carpenter-packages/packages/carpenter-gmail`` relative
          to the carpenter-core checkout — checked for both the
          resolved repo path and ``__file__``'s lexical parents so the
-         symlinked-install layout (e.g. carpenter-core → /media/.../repo)
-         still discovers a sibling carpenter-packages clone under
-         ~/repos/.
+         symlinked-install layout (e.g. carpenter-core → a checkout elsewhere)
+         still discovers a sibling carpenter-packages clone.
     """
     import os
 

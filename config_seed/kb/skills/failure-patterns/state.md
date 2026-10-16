@@ -31,7 +31,7 @@ Failures related to the database, encryption, arc state machine, and platform st
 - Multiple platform instances pointing at the same database file.
 - A long-running execution that holds a write transaction open.
 - Database backup tools that lock the file.
-- The SD card (on Raspberry Pi) being slow, extending lock hold times.
+- Slow storage (e.g. SD card or other flash media) extending lock hold times.
 
 **Escape**:
 1. Retry the operation. Most database locks are transient and resolve in milliseconds.
@@ -42,7 +42,7 @@ Failures related to the database, encryption, arc state machine, and platform st
 
 **Prevention**: Keep database transactions short. Close connections promptly via `db.close()`. Do not hold write transactions across network calls or long computations. The platform's batched transaction pattern (queuing audit events, single commit) was designed to minimize lock hold time.
 
-**Escalation**: Chronic database locking on SD card deployments may require moving the database to a faster storage medium. Inform the user.
+**Escalation**: Chronic database locking on slow-storage deployments may require moving the database to a faster storage medium. Inform the user.
 
 ---
 

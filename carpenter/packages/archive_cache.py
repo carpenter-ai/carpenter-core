@@ -12,7 +12,8 @@ Design
 * Each package version's pristine tree is stored as a deterministic
   gzipped tar archive in a local cache under
   ``{base_dir}/cache/package-archives/<name>/<version>.tar.gz``.  This
-  cache lives on the HDD/SSD (``base_dir``), **not** the SD card.
+  cache lives under ``base_dir``, **not** on the root filesystem, which
+  may be slow flash storage.
 * The remote host that supplies an archive (a GitHub release asset,
   etc.) is **untrusted storage**.  The trust anchor is the local root
   hash already recorded in ``installed_packages.hash`` and computed by
@@ -31,7 +32,7 @@ paths, ``..`` components escaping the extract root, or non-file/dir types
 (devices, fifos, symlinks/hardlinks pointing outside the tree) are
 rejected.  Expansion happens in a temporary directory that honours
 ``TMPDIR`` (the repo sets ``TMPDIR=/dev/shm`` for test/workspace runs to
-keep temp churn off the SD card).
+keep temp churn off slow flash storage).
 """
 
 from __future__ import annotations
@@ -182,7 +183,7 @@ def cache_dir() -> Path:
 
     Defaults to ``{base_dir}/cache/package-archives/`` where ``base_dir``
     comes from ``carpenter.config.CONFIG['base_dir']``.  This path is on
-    the HDD/SSD, not the SD card.
+    the data volume, not the root filesystem.
     """
     from .. import config
 
@@ -283,7 +284,7 @@ def _expand_to_tree(archive_path: Path) -> dict[str, bytes]:
             f"archive {archive_path} does not exist",
         )
     # tempfile.mkdtemp honours $TMPDIR; the repo sets TMPDIR=/dev/shm to
-    # keep temp churn off the SD card.
+    # keep temp churn off slow flash storage.
     tmp_root = Path(tempfile.mkdtemp(prefix="carpenter-archive-"))
     try:
         try:

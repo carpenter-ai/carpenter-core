@@ -1109,7 +1109,7 @@ def _migrate_health_notify_state(conn: sqlite3.Connection, tables: set) -> None:
 
     The monitor used to track "already told the user about this" in memory
     only, so every restart re-announced circuit breakers that were still
-    open from before — the same alert, nightly, for weeks. Keeping it in
+    open from before, even though nothing had changed. Keeping it in
     the DB means an alert repeats only when the condition actually clears
     and recurs.
     """
