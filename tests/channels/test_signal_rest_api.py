@@ -453,3 +453,139 @@ class TestSignalRestApiRejectUnauthorized:
         payload = call_kwargs[1]["json"]
         assert payload["recipients"] == ["+9999999999"]
         assert "not authorized" in payload["message"]
+
+
+class TestSignalRestApiWebhookAuth:
+    """Shared-secret authentication on the inbound webhook."""
+
+    SECRET = "s3cret-value-for-tests"
+
+    _BODY = {
+        "method": "receive",
+        "params": {
+            "envelope": {
+                "source": "+5555555555",
+                "dataMessage": {"message": "Forged?"},
+            },
+        },
+    }
+
+    def _client_for(self, secret: str):
+        from starlette.testclient import TestClient
+        from starlette.applications import Starlette
+
+        c = SignalChannelConnector(connector_config=_rest_api_config())
+        c._webhook_secret = secret
+        c._setup_webhook()
+        return c, TestClient(Starlette(routes=c.routes))
+
+    def test_correct_secret_in_query_is_delivered(self):
+        c, client = self._client_for(self.SECRET)
+        with patch.object(c, "deliver_inbound", new_callable=AsyncMock) as mock_deliver:
+            resp = client.post(f"/hooks/signal?secret={self.SECRET}", json=self._BODY)
+        assert resp.status_code == 200
+        mock_deliver.assert_called_once_with(
+            channel_user_id="+5555555555", text="Forged?", display_name=None,
+        )
+
+    def test_correct_secret_in_header_is_delivered(self):
+        c, client = self._client_for(self.SECRET)
+        with patch.object(c, "deliver_inbound", new_callable=AsyncMock) as mock_deliver:
+            resp = client.post(
+                "/hooks/signal", json=self._BODY,
+                headers={"X-Webhook-Secret": self.SECRET},
+            )
+        assert resp.status_code == 200
+        mock_deliver.assert_called_once()
+
+    @pytest.mark.parametrize("url,headers", [
+        ("/hooks/signal", {}),                                   # missing
+        ("/hooks/signal?secret=", {}),                           # empty
+        ("/hooks/signal?secret=wrong", {}),                      # wrong query
+        ("/hooks/signal", {"X-Webhook-Secret": "wrong"}),        # wrong header
+        ("/hooks/signal?secret=s3cret-value-for-test", {}),      # prefix
+        ("/hooks/signal?secret=s3cret-value-for-testsX", {}),    # suffix
+        ("/hooks/signal?token=s3cret-value-for-tests", {}),      # wrong param
+        ("/hooks/signal?secret=%C3%A9", {}),                     # non-ASCII
+    ])
+    def test_bad_secret_rejected_and_not_processed(self, url, headers):
+        c, client = self._client_for(self.SECRET)
+        with patch.object(c, "_handle_receive", new_callable=AsyncMock) as mock_handle, \
+             patch.object(c, "deliver_inbound", new_callable=AsyncMock) as mock_deliver:
+            resp = client.post(url, json=self._BODY, headers=headers)
+        assert resp.status_code == 401
+        mock_handle.assert_not_called()
+        mock_deliver.assert_not_called()
+
+    def test_rejected_before_body_is_parsed(self):
+        """A bad secret is rejected even when the body is not valid JSON."""
+        c, client = self._client_for(self.SECRET)
+        resp = client.post(
+            "/hooks/signal", content=b"not json",
+            headers={"content-type": "application/json"},
+        )
+        assert resp.status_code == 401
+
+    def test_rejection_does_not_log_secret(self, caplog):
+        c, client = self._client_for(self.SECRET)
+        with caplog.at_level("DEBUG", logger="carpenter.channels.signal_channel"):
+            client.post("/hooks/signal?secret=wrong-guess", json=self._BODY)
+        assert "Rejected Signal webhook" in caplog.text
+        assert self.SECRET not in caplog.text
+        assert "wrong-guess" not in caplog.text
+
+    def test_unset_secret_accepts_without_auth(self):
+        """Backward compatibility: no secret configured = webhook open."""
+        c, client = self._client_for("")
+        with patch.object(c, "deliver_inbound", new_callable=AsyncMock) as mock_deliver:
+            resp = client.post("/hooks/signal", json=self._BODY)
+        assert resp.status_code == 200
+        mock_deliver.assert_called_once()
+
+    @staticmethod
+    def _mock_httpx_client():
+        mock_response = MagicMock()
+        mock_response.raise_for_status = MagicMock()
+        mock_client = AsyncMock(spec=httpx.AsyncClient)
+        mock_client.get = AsyncMock(return_value=mock_response)
+        mock_client.aclose = AsyncMock()
+        return mock_client
+
+    @pytest.mark.asyncio
+    async def test_start_reads_secret_from_platform_config(self, caplog):
+        c = SignalChannelConnector(connector_config=_rest_api_config())
+        with patch("httpx.AsyncClient", return_value=self._mock_httpx_client()), \
+             caplog.at_level("WARNING", logger="carpenter.channels.signal_channel"):
+            await c.start({"signal_webhook_secret": self.SECRET})
+        assert c._webhook_secret == self.SECRET
+        assert "UNAUTHENTICATED" not in caplog.text
+        assert self.SECRET not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_start_warns_when_secret_unset(self, caplog):
+        c = SignalChannelConnector(connector_config=_rest_api_config())
+        with patch("httpx.AsyncClient", return_value=self._mock_httpx_client()), \
+             caplog.at_level("WARNING", logger="carpenter.channels.signal_channel"):
+            await c.start({})
+        assert c._webhook_secret == ""
+        assert "UNAUTHENTICATED" in caplog.text
+        assert "SIGNAL_WEBHOOK_SECRET" in caplog.text
+
+    def test_secret_ignored_in_connector_yaml(self):
+        """The secret is a credential; connector YAML cannot set it."""
+        c = SignalChannelConnector(connector_config=_rest_api_config(
+            webhook_secret="from-yaml", signal_webhook_secret="from-yaml",
+        ))
+        assert c._webhook_secret == ""
+
+
+class TestSignalWebhookSecretCredential:
+    def test_env_var_maps_to_config_key(self):
+        from carpenter.config import _CREDENTIAL_MAP, DEFAULTS
+        assert _CREDENTIAL_MAP["SIGNAL_WEBHOOK_SECRET"] == "signal_webhook_secret"
+        assert DEFAULTS["signal_webhook_secret"] == ""
+
+    def test_env_var_loaded(self, monkeypatch):
+        from carpenter.config import _load_env
+        monkeypatch.setenv("SIGNAL_WEBHOOK_SECRET", "abc")
+        assert _load_env()["signal_webhook_secret"] == "abc"

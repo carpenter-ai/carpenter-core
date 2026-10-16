@@ -23,6 +23,9 @@ _OPEN_PREFIXES = (
     # the per-flow opaque ``state`` token that the callback handler
     # constant-time-compares against the stored value.
     "/api/oauth/",
+    # Channel connector webhooks (signal-cli-rest-api, Telegram) cannot
+    # carry the UI token either; each handler must authenticate its own
+    # caller (e.g. the Signal connector's signal_webhook_secret).
     "/hooks/",
 )
 
