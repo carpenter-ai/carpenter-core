@@ -10,6 +10,7 @@ import json
 import logging
 import sqlite3
 import time
+import traceback
 
 from ...db import get_db, db_connection, db_transaction
 from . import CODING_CHANGE_PREFIX, manager as arc_manager, retry as arc_retry
@@ -188,8 +189,11 @@ async def handle_arc_dispatch(work_id: int, payload: dict):
 
             # JUDGE arcs: run deterministic platform code, not LLM agents
             if agent_type == "JUDGE":
-                await _run_judge_checks(arc_id)
-                arc_manager.freeze_arc(arc_id)
+                approved = await _run_judge_checks(arc_id)
+                if approved:
+                    arc_manager.freeze_arc(arc_id)
+                else:
+                    _fail_judge_arc(arc_id)
                 _propagate_completion(arc_id)
                 logger.info("Arc %d dispatched successfully (action: judge_policy_checks)", arc_id)
                 return
@@ -873,15 +877,21 @@ def _find_arc_conversation(arc_id: int, _depth: int = 0) -> int | None:
     return None
 
 
-async def _run_judge_checks(arc_id: int) -> None:
+async def _run_judge_checks(arc_id: int) -> bool:
     """Run deterministic policy checks for a JUDGE arc.
 
     Reads the reviewer's structured output, runs policy validations,
     and promotes or rejects the target arc based on results.
+
+    Returns True only when an approve verdict was recorded.  Every other
+    outcome -- a reject, a JUDGE with no review target, or an exception
+    while checking -- returns False (fail-closed), and a
+    ``judge_rejected`` history entry on the JUDGE arc records why.
     """
     from ...security.judge import run_policy_checks
     from ..workflows import review_manager
 
+    target_arc_id = None
     try:
         result = run_policy_checks(arc_id)
 
@@ -891,7 +901,8 @@ async def _run_judge_checks(arc_id: int) -> None:
 
         if target_arc_id is None:
             logger.warning("JUDGE arc %d has no review target", arc_id)
-            return
+            _record_judge_rejection(arc_id, None, "JUDGE has no review target")
+            return False
 
         if result.approved:
             logger.info(
@@ -905,21 +916,69 @@ async def _run_judge_checks(arc_id: int) -> None:
                 decision="approve",
                 reason=result.reason or "All policy checks passed",
             )
-        else:
-            logger.info(
-                "JUDGE arc %d rejected target %d: %s (%d/%d checks failed)",
-                arc_id, target_arc_id, result.reason,
-                len(result.failed_checks), len(result.checks),
-            )
-            # Submit rejection verdict
-            review_manager.submit_verdict(
-                reviewer_arc_id=arc_id,
-                target_arc_id=target_arc_id,
-                decision="reject",
-                reason=result.reason or "Policy check(s) failed",
-            )
-    except Exception:  # broad catch: policy checks may involve plugin code
+            return True
+
+        reason = result.reason or "Policy check(s) failed"
+        logger.info(
+            "JUDGE arc %d rejected target %d: %s (%d/%d checks failed)",
+            arc_id, target_arc_id, reason,
+            len(result.failed_checks), len(result.checks),
+        )
+        # Submit rejection verdict
+        review_manager.submit_verdict(
+            reviewer_arc_id=arc_id,
+            target_arc_id=target_arc_id,
+            decision="reject",
+            reason=reason,
+        )
+        _record_judge_rejection(arc_id, target_arc_id, reason)
+        return False
+    except Exception as exc:  # broad catch: policy checks may involve plugin code
+        # Fail closed: a JUDGE that cannot finish its checks has not approved.
         logger.exception("JUDGE policy checks failed for arc %d", arc_id)
+        _record_judge_rejection(
+            arc_id, target_arc_id,
+            f"JUDGE checks raised {type(exc).__name__}: {exc}",
+            traceback_text=traceback.format_exc(),
+        )
+        return False
+
+
+def _record_judge_rejection(
+    judge_arc_id: int,
+    target_arc_id: int | None,
+    reason: str,
+    traceback_text: str | None = None,
+) -> None:
+    """Append a ``judge_rejected`` history entry to the JUDGE arc."""
+    content = {"target_arc_id": target_arc_id, "reason": reason}
+    if traceback_text:
+        content["traceback"] = traceback_text
+    try:
+        arc_manager.add_history(judge_arc_id, "judge_rejected", content)
+    except sqlite3.Error:
+        logger.exception(
+            "Failed to record judge_rejected history for arc %d", judge_arc_id,
+        )
+
+
+def _fail_judge_arc(judge_arc_id: int) -> None:
+    """Fail a JUDGE arc whose verdict was not an approval.
+
+    The JUDGE's review target has always frozen by the time the JUDGE
+    runs (it precedes the JUDGE in step order), and a frozen arc never
+    changes status.  The JUDGE arc is the part of the review chain that
+    is still open when the verdict arrives, so it carries the result:
+    ``failed`` is not a DONE status, so later siblings stay blocked and
+    the parent rolls up to ``failed`` through the normal
+    :func:`arc_manager.freeze_arc` path instead of ``completed``.
+    """
+    arc = arc_manager.get_arc(judge_arc_id)
+    if arc is None or arc["status"] in arc_manager.FROZEN_STATUSES:
+        return
+    if arc["status"] == "pending":
+        arc_manager.update_status(judge_arc_id, "active")
+    arc_manager.update_status(judge_arc_id, "failed")
 
 
 async def _run_arc_agent(
