@@ -14,9 +14,9 @@ models:
     provider: anthropic
     model_id: claude-opus-4-7
     quality_tier: 5              # 1-5 scale
-    cost_per_mtok_in: 15.0       # USD per million input tokens
-    cost_per_mtok_out: 75.0      # USD per million output tokens
-    cached_cost_per_mtok_in: 1.5 # Prompt-cached input rate
+    cost_per_mtok_in: 5.0        # USD per million input tokens
+    cost_per_mtok_out: 25.0      # USD per million output tokens
+    cached_cost_per_mtok_in: 0.5 # Prompt-cached input rate
     context_window: 200000
     capabilities:
       - planning
