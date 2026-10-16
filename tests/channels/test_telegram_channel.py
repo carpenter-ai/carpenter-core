@@ -375,3 +375,167 @@ class TestTelegramResolveChatId:
     def test_returns_none_for_unknown_conversation(self, db):
         c = TelegramChannelConnector()
         assert c._resolve_chat_id(999) is None
+
+
+class TestTelegramWebhookAuth:
+    """X-Telegram-Bot-Api-Secret-Token verification on the webhook."""
+
+    SECRET = "s3cret-Value_for-tests"
+    HEADER = "X-Telegram-Bot-Api-Secret-Token"
+
+    _UPDATE = {
+        "update_id": 1,
+        "message": {
+            "message_id": 1,
+            "from": {"id": 12345, "username": "alice"},
+            "chat": {"id": 12345, "type": "private"},
+            "text": "Forged?",
+        },
+    }
+
+    def _client_for(self, secret: str):
+        from starlette.applications import Starlette
+        from starlette.testclient import TestClient
+
+        c = TelegramChannelConnector(connector_config={
+            "bot_token": "123:ABC", "mode": "webhook",
+        })
+        c._webhook_secret = secret
+        c._build_webhook_routes()
+        return c, TestClient(Starlette(routes=c.routes))
+
+    def test_correct_secret_is_processed(self):
+        c, client = self._client_for(self.SECRET)
+        with patch.object(c, "_handle_update", new_callable=AsyncMock) as mock_handle:
+            resp = client.post(
+                "/hooks/telegram", json=self._UPDATE,
+                headers={self.HEADER: self.SECRET},
+            )
+        assert resp.status_code == 200
+        mock_handle.assert_called_once_with(self._UPDATE)
+
+    @pytest.mark.parametrize("headers", [
+        {},                                                  # missing
+        {"X-Telegram-Bot-Api-Secret-Token": ""},             # empty
+        {"X-Telegram-Bot-Api-Secret-Token": "wrong"},        # wrong
+        {"X-Telegram-Bot-Api-Secret-Token": "s3cret-Value_for-test"},    # prefix
+        {"X-Telegram-Bot-Api-Secret-Token": "s3cret-Value_for-testsX"},  # suffix
+        {"X-Webhook-Secret": "s3cret-Value_for-tests"},      # wrong header
+    ])
+    def test_bad_secret_rejected_and_not_processed(self, headers):
+        c, client = self._client_for(self.SECRET)
+        with patch.object(c, "_handle_update", new_callable=AsyncMock) as mock_handle, \
+             patch.object(c, "deliver_inbound", new_callable=AsyncMock) as mock_deliver:
+            resp = client.post("/hooks/telegram", json=self._UPDATE, headers=headers)
+        assert resp.status_code == 401
+        mock_handle.assert_not_called()
+        mock_deliver.assert_not_called()
+
+    def test_secret_in_query_string_not_accepted(self):
+        """Telegram only sends the header; a query parameter is not a substitute."""
+        c, client = self._client_for(self.SECRET)
+        with patch.object(c, "_handle_update", new_callable=AsyncMock) as mock_handle:
+            resp = client.post(
+                f"/hooks/telegram?secret={self.SECRET}", json=self._UPDATE,
+            )
+        assert resp.status_code == 401
+        mock_handle.assert_not_called()
+
+    def test_rejected_before_body_is_parsed(self):
+        c, client = self._client_for(self.SECRET)
+        resp = client.post(
+            "/hooks/telegram", content=b"not json",
+            headers={"content-type": "application/json"},
+        )
+        assert resp.status_code == 401
+
+    def test_rejection_does_not_log_secret(self, caplog):
+        c, client = self._client_for(self.SECRET)
+        with caplog.at_level("DEBUG", logger="carpenter.channels.telegram_channel"):
+            client.post(
+                "/hooks/telegram", json=self._UPDATE,
+                headers={self.HEADER: "wrong-guess"},
+            )
+        assert "Rejected Telegram webhook" in caplog.text
+        assert self.SECRET not in caplog.text
+        assert "wrong-guess" not in caplog.text
+
+    def test_unset_secret_accepts_without_auth(self):
+        """Backward compatibility: no secret configured = webhook open."""
+        c, client = self._client_for("")
+        with patch.object(c, "_handle_update", new_callable=AsyncMock) as mock_handle:
+            resp = client.post("/hooks/telegram", json=self._UPDATE)
+        assert resp.status_code == 200
+        mock_handle.assert_called_once()
+
+    def test_secret_ignored_in_connector_yaml(self):
+        """The secret is a credential; connector YAML cannot set it."""
+        c = TelegramChannelConnector(connector_config={
+            "bot_token": "123:ABC", "mode": "webhook",
+            "webhook_secret": "from-yaml", "secret_token": "from-yaml",
+            "telegram_webhook_secret": "from-yaml",
+        })
+        assert c._webhook_secret == ""
+
+    @staticmethod
+    def _connector_with_api():
+        c = TelegramChannelConnector(connector_config={
+            "bot_token": "123:ABC", "mode": "webhook",
+        })
+        api = AsyncMock(return_value={})
+        return c, api
+
+    @pytest.mark.asyncio
+    async def test_setup_registers_secret_token(self, caplog):
+        c, api = self._connector_with_api()
+        with patch.object(c, "_api", api), \
+             caplog.at_level("DEBUG", logger="carpenter.channels.telegram_channel"):
+            await c._setup_webhook({"telegram_webhook_secret": self.SECRET})
+        api.assert_awaited_once()
+        method, kwargs = api.await_args.args[0], api.await_args.kwargs
+        assert method == "setWebhook"
+        assert kwargs["secret_token"] == self.SECRET
+        assert c._webhook_secret == self.SECRET
+        assert c.routes
+        assert "UNAUTHENTICATED" not in caplog.text
+        assert self.SECRET not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_setup_warns_when_secret_unset(self, caplog):
+        c, api = self._connector_with_api()
+        with patch.object(c, "_api", api), \
+             caplog.at_level("WARNING", logger="carpenter.channels.telegram_channel"):
+            await c._setup_webhook({})
+        assert "secret_token" not in api.await_args.kwargs
+        assert "UNAUTHENTICATED" in caplog.text
+        assert "TELEGRAM_WEBHOOK_SECRET" in caplog.text
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("bad", ["has space", "x" * 257, "émoji", "a/b"])
+    async def test_setup_rejects_secret_telegram_would_refuse(self, bad):
+        c, api = self._connector_with_api()
+        with patch.object(c, "_api", api):
+            with pytest.raises(ValueError, match="TELEGRAM_WEBHOOK_SECRET") as exc:
+                await c._setup_webhook({"telegram_webhook_secret": bad})
+        assert bad not in str(exc.value)
+        api.assert_not_awaited()
+        assert c.routes is None
+
+
+class TestTelegramWebhookSecretCredential:
+    def test_env_var_maps_to_config_key(self):
+        from carpenter.config import _CREDENTIAL_MAP, DEFAULTS
+        assert _CREDENTIAL_MAP["TELEGRAM_WEBHOOK_SECRET"] == "telegram_webhook_secret"
+        assert DEFAULTS["telegram_webhook_secret"] == ""
+
+    def test_env_var_loaded(self, monkeypatch):
+        from carpenter.config import _load_env
+        monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "abc")
+        assert _load_env()["telegram_webhook_secret"] == "abc"
+
+    def test_refused_by_config_get_value(self, monkeypatch):
+        from carpenter import config as carpenter_config
+        from carpenter.tool_backends import config_tool
+        monkeypatch.setitem(carpenter_config.CONFIG, "telegram_webhook_secret", "s")
+        with pytest.raises(ValueError):
+            config_tool.handle_get_value({"key": "telegram_webhook_secret"})

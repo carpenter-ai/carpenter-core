@@ -8,11 +8,25 @@ Webhook mode requires a publicly reachable domain with TLS (Telegram only
 sends webhooks over HTTPS). It is not part of the standard install flow;
 users who want it can set ``mode: webhook`` and ``webhook_path`` in
 config.yaml after setting up TLS.
+
+Webhook authentication
+----------------------
+The webhook path sits under ``/hooks/``, which the UI-token middleware does
+not gate, and a Telegram update's sender id is whatever the caller wrote.
+When the ``telegram_webhook_secret`` config key is set (credential env var
+``TELEGRAM_WEBHOOK_SECRET``), the connector registers it with Telegram as
+setWebhook's ``secret_token``, and every webhook request must carry it in
+the ``X-Telegram-Bot-Api-Secret-Token`` header; anything else gets a 401
+and is never processed.  When the secret is unset the webhook stays open,
+for backward compatibility, and a warning is logged at start.  Polling mode
+has no webhook and is unaffected.
 """
 
 import asyncio
+import hmac
 import logging
 import os
+import re
 from datetime import datetime
 
 import httpx
@@ -26,6 +40,11 @@ logger = logging.getLogger(__name__)
 
 TELEGRAM_API = "https://api.telegram.org"
 TELEGRAM_MAX_LENGTH = 4096
+
+# Header in which Telegram echoes setWebhook's secret_token.
+WEBHOOK_SECRET_HEADER = "X-Telegram-Bot-Api-Secret-Token"
+# Telegram accepts 1-256 characters from this set for secret_token.
+_SECRET_TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{1,256}")
 
 
 class TelegramChannelConnector(ChannelConnector):
@@ -54,6 +73,9 @@ class TelegramChannelConnector(ChannelConnector):
         self._bot_username: str | None = None
         self._last_healthy: datetime | None = None
         self._consecutive_errors = 0
+        # Webhook shared secret; a credential, so read from platform config
+        # at start, never from the connector's YAML block.
+        self._webhook_secret = ""
         # Webhook router (set during start if mode=webhook)
         self.routes = None
 
@@ -281,11 +303,44 @@ class TelegramChannelConnector(ChannelConnector):
         finally:
             conn.close()
 
+    def _webhook_authorized(self, request) -> bool:
+        """Return True if *request* may be processed by the webhook.
+
+        With no secret configured every request is allowed (legacy
+        behaviour, warned about at start).  Otherwise the request must
+        carry the exact secret in ``X-Telegram-Bot-Api-Secret-Token``.
+        Comparison is constant-time; any error denies.
+        """
+        expected = self._webhook_secret
+        if not expected:
+            return True
+        try:
+            provided = request.headers.get(WEBHOOK_SECRET_HEADER) or ""
+            if not provided:
+                return False
+            return hmac.compare_digest(
+                provided.encode("utf-8"), expected.encode("utf-8"),
+            )
+        except Exception:
+            # Fail closed: an unparseable request is not an authorized one.
+            # The traceback carries no header values.
+            logger.warning(
+                "Telegram webhook secret check failed; denying request",
+                exc_info=True,
+            )
+            return False
+
     async def _setup_webhook(self, config: dict) -> None:
         """Register webhook with Telegram and create Starlette routes."""
-        from starlette.requests import Request
-        from starlette.responses import Response
-        from starlette.routing import Route
+        secret = str(config.get("telegram_webhook_secret") or "")
+        if secret and not _SECRET_TOKEN_RE.fullmatch(secret):
+            # Telegram would reject it in setWebhook anyway; say why without
+            # echoing the value.
+            raise ValueError(
+                "TELEGRAM_WEBHOOK_SECRET must be 1-256 characters of "
+                "A-Z, a-z, 0-9, '_' or '-'"
+            )
+        self._webhook_secret = secret
 
         # Build webhook URL from platform config
         host = config.get("tls_domain", "localhost")
@@ -294,12 +349,38 @@ class TelegramChannelConnector(ChannelConnector):
         webhook_url = f"{scheme}://{host}:{port}{self._webhook_path}"
 
         # Register webhook with Telegram
-        await self._api("setWebhook", url=webhook_url)
+        if secret:
+            await self._api("setWebhook", url=webhook_url, secret_token=secret)
+        else:
+            logger.warning(
+                "Telegram webhook %s is UNAUTHENTICATED: anyone who can reach "
+                "this server can post an update that appears to come from an "
+                "allowed user. Set TELEGRAM_WEBHOOK_SECRET to have it "
+                "registered with Telegram and checked on every request.",
+                self._webhook_path,
+            )
+            await self._api("setWebhook", url=webhook_url)
 
-        # Create route
+        self._build_webhook_routes()
+
+    def _build_webhook_routes(self) -> None:
+        """Create the Starlette route for the webhook endpoint."""
+        from starlette.requests import Request
+        from starlette.responses import Response
+        from starlette.routing import Route
+
         connector = self  # closure reference
 
         async def telegram_webhook(request: Request):
+            # Authenticate before reading the body.  Never log the secret.
+            if not connector._webhook_authorized(request):
+                logger.warning(
+                    "Rejected Telegram webhook request from %s: missing or "
+                    "invalid secret token",
+                    request.client.host if request.client else "unknown",
+                )
+                return Response(status_code=401)
+
             body = await request.json()
             try:
                 await connector._handle_update(body)

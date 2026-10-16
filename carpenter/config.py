@@ -98,6 +98,11 @@ DEFAULTS = {
     # Secret: set SIGNAL_WEBHOOK_SECRET in {base_dir}/.env or the environment,
     # never in config.yaml.  Empty = webhook unauthenticated (warned at start).
     "signal_webhook_secret": "",
+    # Shared secret for the Telegram channel's webhook mode, registered as
+    # setWebhook's secret_token.  Secret: set TELEGRAM_WEBHOOK_SECRET in
+    # {base_dir}/.env or the environment, never in config.yaml.
+    # Empty = webhook unauthenticated (warned at start).
+    "telegram_webhook_secret": "",
     "allow_insecure_bind": False,
     "default_thread_pool_size": 16,
     "work_handler_thread_pool_size": 3,
@@ -579,6 +584,7 @@ _CREDENTIAL_MAP: dict[str, str] = {
     # Channels
     "SIGNAL_WEBHOOK_SECRET": "signal_webhook_secret",
     "TELEGRAM_BOT_TOKEN": "telegram_bot_token",  # Bot API token from @BotFather
+    "TELEGRAM_WEBHOOK_SECRET": "telegram_webhook_secret",
     # Git / forge
     "GIT_TOKEN": "git_token",
     "GIT_AUTHOR_NAME": "git_author_name",
