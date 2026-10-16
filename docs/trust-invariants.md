@@ -49,9 +49,26 @@ approved verdict unlocks the content for trusted downstream readers.
   uses to decide whether to surface content.
 - `core/resources/manager.py` `derive_resource()` and `mark_template_verdict()`
   — only a reviewed template pipeline can produce an `approved` Resource.
+- `security/read_gate.py` — the same rule for every other read tool that
+  hands stored content to an agent. The reader's role comes from the
+  platform-injected identity; the item's label comes from its provenance
+  (the arc that wrote it, its conversation's taint, the Resource that owns
+  a file, the execution that wrote a log). **A REVIEWER arc is trusted by
+  level, but everything it writes is labelled untrusted**, because its
+  context holds the raw input it reviews. A trusted reader is refused
+  untrusted items; REVIEWER, JUDGE and non-trusted readers are not. Used by
+  `read_file` / `files.read` (Resource blobs, truncated tool output, code
+  files and execution logs, per-arc workspaces), `state.get` / `get_state`,
+  `read_arc_result`, `get_arc_detail`, the arc completion notice,
+  `get_conversation_messages`, `list_tool_calls` and
+  `get_execution_output`. Refusals never echo content and are logged to
+  `trust_audit_log` as `trusted_read_refused`.
+- `core/arcs/dispatch_handler.py` `_run_arc_agent()` — a REVIEWER's or
+  non-trusted arc's working conversation is tainted when it is created.
 
 **Tests:** `tests/test_taint_invariants.py::TestI2`,
-`tests/core/resources/test_read_resource_tool.py`
+`tests/core/resources/test_read_resource_tool.py`,
+`tests/security/test_trusted_reads.py`
 
 ---
 

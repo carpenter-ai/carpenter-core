@@ -63,6 +63,21 @@ def _collect_pending_reviews(parent_arc_id: int) -> list[str]:
     return urls
 
 
+def _chat_visible_response(arc_id: int) -> tuple[str, str | None]:
+    """Return ``(text, withheld_note)`` for relaying an arc's result to chat.
+
+    The chat context is trusted, so a response written in an untrusted
+    context (a REVIEWER's, or a non-trusted arc's) is never relayed; the
+    note says so instead.  ``withheld_note`` is None when nothing was
+    withheld.
+    """
+    from ...security import read_gate
+    text, refused = read_gate.agent_response_for(read_gate.reader_for(), arc_id)
+    if text or refused is None:
+        return text, None
+    return "", read_gate.withheld(f"Result of arc #{arc_id}", refused)
+
+
 def _build_resource_preview(arc_id: int, arc_name: str) -> str | None:
     """Build a completion message from the arc's ``_primary_resource_id``.
 
@@ -132,16 +147,9 @@ def _build_resource_preview(arc_id: int, arc_name: str) -> str | None:
         f"(verdict={verdict_descr}). Raw summary from _agent_response "
         "shown below.]"
     )
-    body_response = get_arc_state(arc_id, "_agent_response", "") or ""
-    if not body_response:
-        children = arc_manager.get_children(arc_id) or []
-        for child in reversed(children):
-            child_resp = get_arc_state(
-                child["id"], "_agent_response", ""
-            ) or ""
-            if child_resp:
-                body_response = child_resp
-                break
+    body_response, withheld_note = _chat_visible_response(arc_id)
+    if withheld_note:
+        return f'{note}\n[Arc "{arc_name}" completed.]\n{withheld_note}'
     full_length = len(body_response)
     was_truncated = full_length > RESULT_PREVIEW_MAX
     if was_truncated:
@@ -268,21 +276,11 @@ async def handle_arc_chat_notify(work_id: int, payload: dict) -> None:
         if resource_msg is not None:
             msg = resource_msg
         else:
-            result = get_arc_state(arc_id, "_agent_response", "") or ""
-            # If root arc has no response, check children (agent response is
-            # stored on the child arc that actually ran the agent)
-            if not result:
-                children = arc_manager.get_children(arc_id) or []
-                # Iterate in reverse step_order so the JUDGE/REVIEWER
-                # response (the most refined summary) is preferred over
-                # the EXECUTOR's.
-                for child in reversed(children):
-                    child_resp = get_arc_state(
-                        child["id"], "_agent_response", ""
-                    ) or ""
-                    if child_resp:
-                        result = child_resp
-                        break
+            # The arc's own response, else its children's newest first
+            # (the agent response is stored on the child arc that ran the
+            # agent).  Responses written in an untrusted context are
+            # withheld from chat.
+            result, withheld_note = _chat_visible_response(arc_id)
             full_length = len(result)
             was_truncated = full_length > RESULT_PREVIEW_MAX
             if was_truncated:
@@ -298,6 +296,8 @@ async def handle_arc_chat_notify(work_id: int, payload: dict) -> None:
                 msg += "\n[Be concise.]"
             else:
                 msg = f'[Arc "{name}" completed.]'
+                if withheld_note:
+                    msg += f"\n{withheld_note}"
     else:
         msg = f'[Arc "{name}" failed.]'
 

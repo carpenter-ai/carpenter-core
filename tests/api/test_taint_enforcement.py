@@ -23,6 +23,7 @@ class TestPlannerRestrictions:
         result = validate_and_dispatch(
             "arc.get_plan",
             {"_caller_arc_id": arc_id, "arc_id": arc_id},
+            arc_id=arc_id,
         )
         assert isinstance(result, dict)
 
@@ -34,6 +35,7 @@ class TestPlannerRestrictions:
                 "web.get",
                 {"_caller_arc_id": arc_id, "arc_id": arc_id, "url": "http://example.com"},
                 session_id=session_id,
+                arc_id=arc_id,
             )
 
     def test_planner_cannot_set_state(self):
@@ -44,6 +46,7 @@ class TestPlannerRestrictions:
                 "state.set",
                 {"_caller_arc_id": arc_id, "arc_id": arc_id, "key": "x", "value": "y"},
                 session_id=session_id,
+                arc_id=arc_id,
             )
 
     def test_planner_can_create_arc(self):
@@ -53,6 +56,7 @@ class TestPlannerRestrictions:
             "arc.create",
             {"_caller_arc_id": planner, "arc_id": planner, "name": "new-child"},
             session_id=session_id,
+            arc_id=planner,
         )
         assert "arc_id" in result
 
@@ -71,6 +75,7 @@ class TestReviewerRestrictions:
                 "web.get",
                 {"_caller_arc_id": arc_id, "arc_id": arc_id, "url": "http://example.com"},
                 session_id=session_id,
+                arc_id=arc_id,
             )
 
     def test_reviewer_can_read_files(self):
@@ -84,6 +89,7 @@ class TestReviewerRestrictions:
             result = validate_and_dispatch(
                 "files.read",
                 {"_caller_arc_id": arc_id, "arc_id": arc_id, "path": path},
+                arc_id=arc_id,
             )
             assert result["content"] == "test"
         finally:
@@ -115,6 +121,7 @@ class TestTrustAuditLog:
                 "web.get",
                 {"_caller_arc_id": arc_id, "arc_id": arc_id, "url": "http://example.com"},
                 session_id=session_id,
+                arc_id=arc_id,
             )
         from carpenter.core.trust.audit import get_trust_events
         events = get_trust_events(arc_id=arc_id, event_type="access_denied")

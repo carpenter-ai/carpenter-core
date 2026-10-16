@@ -84,10 +84,23 @@ def list_arcs(tool_input, **kwargs):
 def get_arc_detail(tool_input, **kwargs):
     from carpenter.core.arcs import manager as arc_manager
     from carpenter.db import get_db
+    from carpenter.security import read_gate
     arc_id = tool_input["arc_id"]
     arc = arc_manager.get_arc(arc_id)
     if arc is None:
         return f"Arc #{arc_id} not found."
+
+    # State values and history content of a REVIEWER or non-trusted arc
+    # were written from an untrusted context.  A trusted reader sees the
+    # keys and entry types, not the values.
+    reader = read_gate.reader_for(
+        conversation_id=kwargs.get("conversation_id"),
+        arc_id=kwargs.get("executor_arc_id"),
+    )
+    refusal = read_gate.check(
+        reader, f"State and history of arc #{arc_id}",
+        read_gate.arc_label(arc_id),
+    )
 
     # Arc summary
     parts = [
@@ -120,8 +133,13 @@ def get_arc_detail(tool_input, **kwargs):
         db.close()
     if state_rows:
         parts.append("\nState:")
+        if refusal:
+            parts.append(f"  {refusal}")
         for row in state_rows:
             key = row["key"]
+            if refusal:
+                parts.append(f"  {key}: (withheld)")
+                continue
             val = row["value_json"]
             max_len = config.get_config("arc_state_value_max_length", 300)
             if len(val) > max_len:
@@ -133,6 +151,12 @@ def get_arc_detail(tool_input, **kwargs):
     if history:
         parts.append(f"\nHistory ({len(history)} entries):")
         for h in history:
+            if refusal:
+                parts.append(
+                    f"  [{h['created_at']}] {h['entry_type']} by "
+                    f"{h.get('actor', '?')}: (withheld)"
+                )
+                continue
             content = h.get("content_json", "{}")
             if isinstance(content, str):
                 try:
@@ -188,7 +212,7 @@ def get_arc_detail(tool_input, **kwargs):
 )
 def read_arc_result(tool_input, **kwargs):
     from carpenter.core.arcs import manager as arc_manager
-    from carpenter.core.workflows._arc_state import get_arc_state
+    from carpenter.security import read_gate
 
     arc_id = tool_input["arc_id"]
     offset = tool_input.get("offset", 0)
@@ -204,19 +228,18 @@ def read_arc_result(tool_input, **kwargs):
             f"read_arc_result only works for completed arcs."
         )
 
-    # Try root arc's _agent_response first
-    result = get_arc_state(arc_id, "_agent_response", "") or ""
+    # The root arc's _agent_response, else its children's (same order as
+    # arc_notify_handler).  A response written in an untrusted context (a
+    # REVIEWER's, or a non-trusted arc's) is withheld from a trusted reader.
+    reader = read_gate.reader_for(
+        conversation_id=kwargs.get("conversation_id"),
+        arc_id=kwargs.get("executor_arc_id"),
+    )
+    result, refused = read_gate.agent_response_for(reader, arc_id)
 
-    # If root arc has no response, check children (same logic as arc_notify_handler)
-    if not result:
-        children = arc_manager.get_children(arc_id) or []
-        for child in reversed(children):
-            child_resp = get_arc_state(child["id"], "_agent_response", "") or ""
-            if child_resp:
-                result = child_resp
-                break
-
-    if not result:
+    if not result and refused is not None:
+        body = read_gate.withheld(f"Result of arc #{arc_id}", refused)
+    elif not result:
         body = f"Arc #{arc_id} has no result content."
     else:
         total_len = len(result)

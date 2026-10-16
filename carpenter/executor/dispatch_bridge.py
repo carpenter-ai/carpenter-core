@@ -105,6 +105,11 @@ def validate_and_dispatch(
         params["_caller_arc_id"] = arc_id
         if "arc_id" not in params:
             params["arc_id"] = arc_id
+    else:
+        # No arc context (the chat agent's own code).  The caller identity
+        # is still platform-owned: code must not claim to be an arc, e.g.
+        # a REVIEWER, to pass a read gate.
+        params.pop("_caller_arc_id", None)
 
     # ── Package-capability gate (per-package, fail-closed) ──────────
     # A package's registered capability verb is permitted ONLY for that

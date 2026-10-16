@@ -89,9 +89,21 @@ def get_conversation_messages(tool_input, **kwargs):
         db.close()
     if not rows:
         return f"No messages in conversation #{conv_id}."
+    # A REVIEWER's or non-trusted arc's transcript, or a tainted
+    # conversation, is shown as metadata only to a trusted reader.
+    from carpenter.security import read_gate
+    reader = read_gate.reader_for(
+        conversation_id=kwargs.get("conversation_id"),
+        arc_id=kwargs.get("executor_arc_id"),
+    )
+    refusal = read_gate.check_conversation(
+        reader, conv_id, f"Content of conversation #{conv_id}",
+    )
     lines = [f"Conversation #{conv_id} ({len(rows)} messages):"]
+    if refusal:
+        lines.append(refusal)
     for r in rows:
-        content_preview = (r["content"] or "")[:200]
+        content_preview = "(withheld)" if refusal else (r["content"] or "")[:200]
         has_json = " [structured]" if r["content_json"] else ""
         arc = f" arc=#{r['arc_id']}" if r["arc_id"] else ""
         lines.append(

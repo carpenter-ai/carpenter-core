@@ -54,7 +54,34 @@ def handle_get(params: dict) -> dict:
             return {"value": _ENCRYPTED_MARKER + "(encrypted)", "encrypted": True}
 
         value = json.loads(value_str)
-        return {"value": value}
+
+    _gate_state_read(params, arc_id, key, value)
+    return {"value": value}
+
+
+def _gate_state_read(params: dict, arc_id, key: str, value) -> None:
+    """Refuse a trusted reader a state value written in an untrusted context.
+
+    Values of a REVIEWER or non-trusted arc (such as ``_agent_response``,
+    which is stored unencrypted), and the withheld output of a tainted
+    execution kept under arc 0, may not reach a trusted context.  An arc
+    may always read its own state.  The reader is the platform-injected
+    ``_caller_arc_id``, else the running chat tool's agent.
+    """
+    from ..security import read_gate
+    reader_arc_id = params.get("_caller_arc_id")
+    if reader_arc_id is None:
+        reader_arc_id = read_gate.current_arc_id()
+    if reader_arc_id is not None and arc_id == reader_arc_id:
+        return
+    label = read_gate.state_label(arc_id, value)
+    if label.trusted:
+        return
+    reader = read_gate.reader_for(arc_id=reader_arc_id)
+    refusal = read_gate.check(reader, f"State {key!r} of arc #{arc_id}", label)
+    if refusal:
+        from ..executor.dispatch_bridge import DispatchError
+        raise DispatchError(refusal, status_code=403)
 
 
 def handle_set(params: dict) -> dict:

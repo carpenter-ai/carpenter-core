@@ -17,12 +17,12 @@ The fix:
     of the target.  An ``arc_history`` event of type ``file_written`` is
     appended on the writer's arc.
 
-2.  ``handle_read`` looks up the writer's integrity_level for the same
-    realpath.  If a row exists AND the writer was non-trusted AND the
-    reader is trusted, the read is refused with a ``DispatchError``
-    (status_code=403).  The error never echoes file bytes — only the
-    path the reader supplied (which it already knows) and the writer's
-    integrity level.
+2.  ``handle_read`` asks ``security/read_gate`` for the file's label
+    (its provenance row, or the platform store it lives in) and the
+    reader's role.  A trusted reader is refused an untrusted file with a
+    ``DispatchError`` (status_code=403).  The error never echoes file
+    bytes — only the path the reader supplied (which it already knows)
+    and a platform-written reason.
 
 3.  Non-trusted writers are constrained to a workspace allowlist:
     ``{workspaces_dir}/arc-{arc_id}/...`` or
@@ -92,42 +92,6 @@ def _arc_trust_context(arc_id: int | None) -> tuple[str | None, str | None]:
         if row is None:
             return (None, None)
         return (row["integrity_level"] or "trusted", row["agent_type"])
-
-
-def _is_cross_trust_read_refused(
-    writer_integrity: str,
-    caller_integrity: str | None,
-    caller_agent_type: str | None,
-) -> bool:
-    """Return True iff the (writer, caller) pair violates I2.
-
-    Policy (per ``docs/design.md`` §"Agent Types and Capabilities" +
-    ``docs/trust-invariants.md`` §I2 + §I3):
-
-    - Trusted CHAT / PLANNER / EXECUTOR readers MUST NOT see bytes
-      produced by a non-trusted writer.  These run LLM agents in a
-      trusted context and reading raw untrusted bytes would smuggle
-      attacker-controlled content into that LLM's context window.
-    - REVIEWER readers ARE permitted.  REVIEWERs are LLM agents
-      specifically chartered to extract from untrusted sources via a
-      constrained schema, and the surrounding review pipeline contains
-      the data via structured verdicts before any U->T promotion.
-    - JUDGE readers ARE permitted.  JUDGEs are not LLMs at all — they
-      run deterministic platform code (``security/judge.py``,
-      ``core/arc_dispatch_handler.py::_run_judge_checks``) so there is
-      no LLM context to poison.  In practice JUDGE's ``allowed_tools``
-      does not currently include ``files.read``, so this is policy
-      correctness rather than a live capability change; if a future
-      change exposes ``files.read`` to JUDGE, the predicate is already
-      consistent with I3.
-    """
-    if writer_integrity == "trusted":
-        return False
-    if caller_integrity != "trusted":
-        return False
-    if caller_agent_type in ("REVIEWER", "JUDGE"):
-        return False
-    return True
 
 
 def _workspace_allowed_prefixes(arc_id: int) -> list[str]:
@@ -212,33 +176,23 @@ def _record_provenance(
         )
 
 
-def _lookup_provenance(realpath: str) -> dict | None:
-    """Return the provenance row for ``realpath`` (or None)."""
-    with db_connection() as db:
-        row = db.execute(
-            "SELECT writer_arc_id, writer_integrity_level, written_at "
-            "FROM file_provenance WHERE path = ?",
-            (realpath,),
-        ).fetchone()
-        if row is None:
-            return None
-        return dict(row)
-
-
-def chat_read_provenance_check(path: str) -> str | None:
+def chat_read_provenance_check(
+    path: str, executor_arc_id: int | None = None,
+) -> str | None:
     """Return a refusal message if a chat-tool ``read_file`` on ``path``
     would violate I2, else None.
 
-    Chat agents are implicitly TRUSTED (per ``docs/design.md``
-    §"Agent Types and Capabilities": "CHAT — Context is TRUSTED only")
-    and have no caller-arc id to inject into ``handle_read``, so the
-    cross-trust check there is unreachable on the chat path.  Chat tools
-    must therefore consult ``file_provenance`` directly before reading.
+    The chat tool is used by the chat agent (no arc, TRUSTED per
+    ``docs/design.md`` §"Agent Types and Capabilities") and by arc agents
+    (``executor_arc_id`` set by the platform, never by tool input).  The
+    reader's role and the file's label both come from
+    :mod:`carpenter.security.read_gate`: a trusted reader is refused any
+    file the platform labels untrusted, including Resource blobs, truncated
+    tool output and execution logs that carry no ``file_provenance`` row.
+    REVIEWER and JUDGE readers keep access to what they review.
 
-    Returns a denial string (matching the ``_check_path`` style used by
-    sibling chat tools) when the path's recorded writer is non-trusted;
-    the bytes themselves are never opened.  Predates-enforcement files
-    (no provenance row) read freely.
+    The bytes are never opened on a refusal.  Files the platform does not
+    track (no label) read freely.
     """
     realpath = os.path.realpath(path)
     # Platform-integrity tier check (I12).  T0 paths are invisible —
@@ -256,33 +210,36 @@ def chat_read_provenance_check(path: str) -> str | None:
             "(credentials, platform database, or other restricted "
             "platform state)."
         )
-    prov = _lookup_provenance(realpath)
-    if prov is None:
+    from ..security import read_gate
+    if executor_arc_id is None:
+        executor_arc_id = read_gate.current_arc_id()
+    reader = read_gate.reader_for(arc_id=executor_arc_id)
+    label = read_gate.path_label(realpath)
+    if read_gate.may_read(reader, label):
         return None
-    writer_integrity = prov["writer_integrity_level"]
-    if writer_integrity == "trusted":
-        return None
+    read_gate.audit_refusal(reader, f"file {realpath}", label)
     logger.warning(
-        "chat read_file refused: file at %s written by %s arc %s; "
-        "chat context is TRUSTED-only (I2)",
-        realpath,
-        writer_integrity,
-        prov["writer_arc_id"],
+        "chat read_file refused: %s is labelled %s (%s); reader is %s",
+        realpath, label.level, label.reason, reader.role,
     )
     # Refusal message must NOT echo file bytes.  Path is information
     # the caller already has.
     return (
-        "Access denied: this file was written by a non-trusted arc; "
-        "chat agents may not read it (I2 — trusted context isolation)."
+        f"Access denied: this file holds content from a non-trusted "
+        f"context ({label.reason}); a trusted context may not read it "
+        "(I2 — trusted context isolation). To use it, review it with a "
+        "REVIEWER + JUDGE batch."
     )
 
 
 def handle_read(params: dict) -> dict:
     """Read a file, enforcing cross-trust provenance refusal.
 
-    If a non-trusted arc previously wrote to this path (per the
-    ``file_provenance`` table) and the caller is a trusted arc, refuse
-    with a 403-style DispatchError.  The error must NOT echo file bytes.
+    If the file is labelled untrusted (``security/read_gate.path_label``:
+    a non-trusted or REVIEWER writer in ``file_provenance``, a raw
+    Resource, unlabelled tool output, an untrusted arc's code, log or
+    workspace) and the caller is a trusted reader, refuse with a
+    403-style DispatchError.  The error must NOT echo file bytes.
 
     Symlink-TOCTOU hardening (PR #293 follow-up): if the supplied path
     lexically lives inside a per-arc workspace AND ``realpath(path)``
@@ -300,7 +257,7 @@ def handle_read(params: dict) -> dict:
     realpath = os.path.realpath(path)
 
     caller_arc_id = params.get("_caller_arc_id")
-    caller_integrity, caller_agent_type = _arc_trust_context(caller_arc_id)
+    caller_integrity, _ = _arc_trust_context(caller_arc_id)
 
     # Symlink-TOCTOU hardening.  Triggers only for workspace paths to
     # avoid affecting trusted reads of legitimately-symlinked config or
@@ -349,34 +306,35 @@ def handle_read(params: dict) -> dict:
         )
 
     # Cross-trust read refusal — I2 enforcement on the dispatch-bridge
-    # path.  Forward-looking: files with no provenance row predate
-    # enforcement and read freely.  REVIEWER carve-out is in the
-    # predicate (see ``_is_cross_trust_read_refused``).  Chat-tool reads
-    # do not flow through here — they are enforced separately in
-    # ``chat_read_provenance_check`` because the chat tool has no
-    # ``_caller_arc_id`` to inject (chat is implicitly TRUSTED per
-    # ``docs/design.md``).
-    prov = _lookup_provenance(realpath)
-    if prov is not None:
-        writer_integrity = prov["writer_integrity_level"]
-        if _is_cross_trust_read_refused(
-            writer_integrity, caller_integrity, caller_agent_type
-        ):
-            logger.warning(
-                "files.read refused: trusted %s arc %s reading file "
-                "written by %s arc %s at %s",
-                caller_agent_type or "?",
-                caller_arc_id,
-                writer_integrity,
-                prov["writer_arc_id"],
-                realpath,
-            )
-            DispatchError = _get_dispatch_error_cls()
-            raise DispatchError(
-                "file path was written by a non-trusted arc; "
-                "trusted arcs may not read it",
-                status_code=403,
-            )
+    # path.  The file's label comes from its provenance: a
+    # ``file_provenance`` row, or the platform store it lives in (Resource
+    # blobs, truncated tool output, code files and logs, per-arc
+    # workspaces).  A trusted reader — a trusted non-REVIEWER/JUDGE arc,
+    # or no caller arc at all (the chat agent's own submit_code) — is
+    # refused an untrusted file.  Files the platform does not track read
+    # freely.
+    from ..security import read_gate
+    reader_arc_id = caller_arc_id
+    if reader_arc_id is None:
+        # No arc from the dispatch bridge: the chat agent, or a chat tool
+        # calling this backend directly.  The platform-set invocation
+        # context says which agent that is.
+        reader_arc_id = read_gate.current_arc_id()
+    reader = read_gate.reader_for(arc_id=reader_arc_id)
+    label = read_gate.path_label(realpath)
+    if not read_gate.may_read(reader, label):
+        read_gate.audit_refusal(reader, f"file {realpath}", label)
+        logger.warning(
+            "files.read refused: %s reader (arc %s) reading %s, labelled "
+            "%s (%s)",
+            reader.role, caller_arc_id, realpath, label.level, label.reason,
+        )
+        DispatchError = _get_dispatch_error_cls()
+        raise DispatchError(
+            "file path holds content from a non-trusted context "
+            f"({label.reason}); trusted readers may not read it",
+            status_code=403,
+        )
 
     with open(path, 'r') as f:
         return {"content": f.read()}
@@ -500,6 +458,11 @@ def handle_write(params: dict) -> dict:
         # vanished), record as the most conservative ('untrusted') so a
         # later trusted reader will be refused — fail-closed.
         recorded_integrity = caller_integrity or "untrusted"
+        # A REVIEWER is a trusted-level arc whose context holds the raw
+        # input it reviews, so what it writes is not trusted either.
+        from ..security import read_gate
+        if not read_gate.arc_label(caller_arc_id).trusted:
+            recorded_integrity = "untrusted"
         _record_provenance(
             target_realpath, caller_arc_id, recorded_integrity
         )
