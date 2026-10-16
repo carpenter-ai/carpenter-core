@@ -254,6 +254,12 @@ DEFAULTS = {
     "encryption": {
         "enforce": True,  # Require cryptography library for tainted arcs (fail-closed)
     },
+    # JUDGE policy allowlists: default-deny lists of values that CONSTRAINED
+    # data may take before it crosses a trust boundary (seeded into the
+    # policy store; see carpenter/security/policies.py).  They validate
+    # *values*, not network access: a domain here is not thereby reachable
+    # by web tools, and web_egress_allowlist does not make a value pass a
+    # JUDGE.  See "Allowlists" in docs/security-model.md.
     "security": {
         "email_allowlist": [],
         "domain_allowlist": [],
@@ -303,8 +309,6 @@ DEFAULTS = {
         },
     },
     "executor_memory_limit_mb": 300,  # Legacy (unused with restricted executor)
-    "egress_policy": "auto",   # Legacy (unused with restricted executor)
-    "egress_enforce": True,    # Legacy (unused with restricted executor)
     # TLS/SSL configuration
     "tls_enabled": False,
     "tls_cert_path": "",
@@ -371,6 +375,8 @@ DEFAULTS = {
     # Web tools refuse destinations that are not globally routable
     # (loopback, private, link-local, ...).  Entries here re-allow them:
     # exact hostnames, or CIDRs matched against resolved addresses.
+    # This is the only network-egress allowlist; it is unrelated to the
+    # JUDGE value allowlists under ``security`` (domain_allowlist etc.).
     # See carpenter/security/egress.py.
     "web_egress_allowlist": [],
     # Tool classification lists — used by the callback API for access control.
@@ -701,6 +707,34 @@ _DERIVED_PATH_DEFAULTS = {
 }
 
 
+# Top-level keys that no longer do anything.  Setting one in config.yaml
+# logs a warning at load so the operator knows it is ignored, instead of
+# believing it still enforces something.  key -> what to use instead.
+_REMOVED_KEYS: dict[str, str] = {
+    "egress_policy": (
+        "executor code cannot open network connections in the restricted "
+        "executor, so there is no executor egress policy to choose; web "
+        "tool egress is controlled by web_egress_allowlist"
+    ),
+    "egress_enforce": (
+        "executor code cannot open network connections in the restricted "
+        "executor, so there is nothing to enforce; web tool egress is "
+        "controlled by web_egress_allowlist"
+    ),
+}
+
+
+def _warn_removed_keys(yaml_overrides: dict, yaml_path: str) -> None:
+    """Warn about config.yaml keys that are set but no longer used."""
+    for key, instead in _REMOVED_KEYS.items():
+        if key in yaml_overrides:
+            _log.warning(
+                "Config key %r in %s is no longer used and is ignored: %s. "
+                "Remove it from the file.",
+                key, yaml_path, instead,
+            )
+
+
 def _derive_paths_from_base_dir(
     config: dict, base_dir: str, yaml_overrides: dict,
 ) -> None:
@@ -750,6 +784,7 @@ def load_config(yaml_path: str | None = None) -> dict:
     # write back to the same path without re-deriving it from env vars.
     _loaded_yaml_path = yaml_path
     yaml_overrides = _load_yaml(yaml_path)
+    _warn_removed_keys(yaml_overrides, yaml_path)
     config.update(yaml_overrides)
 
     # Resolve base_dir early (needed for .env and registry paths)

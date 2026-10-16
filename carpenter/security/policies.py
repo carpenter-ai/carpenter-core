@@ -13,6 +13,11 @@ Policy types:
 - enum: Enumerated string values
 - bool: Boolean values (stored as "true" or "false")
 - pattern: Regex patterns (stored as pattern strings)
+
+These allowlists validate *values* at trust boundaries.  They are not a
+network control: whether a web tool may reach a host is decided by
+``security/egress.py`` (``web_egress_allowlist``), and the two never feed
+each other.  See "Allowlists" in docs/security-model.md.
 """
 
 import logging

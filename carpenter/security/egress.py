@@ -20,6 +20,13 @@ A hostname entry allows that host whatever it resolves to.  A CIDR entry
 allows resolved addresses inside it.  ``0.0.0.0/0`` and ``::/0`` restore
 the old unrestricted behaviour.
 
+This is the platform's only network-egress allowlist.  It is separate from
+the JUDGE value allowlists (``security.domain_allowlist``,
+``security.url_allowlist`` and the ``domain``/``url`` policy types in
+``security/policies.py``), which decide whether a CONSTRAINED value may
+cross a trust boundary, not whether a host is reachable.  See "Allowlists"
+in docs/security-model.md.
+
 The check resolves the hostname and inspects every address it resolves
 to, so numeric forms such as ``http://2130706433/`` are caught.  It is
 not a defence against DNS rebinding: the HTTP client resolves the name

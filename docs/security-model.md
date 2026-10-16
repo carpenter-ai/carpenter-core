@@ -76,6 +76,22 @@ review:
   reviewer_model: "anthropic:claude-sonnet-4-6"
 ```
 
+## Allowlists
+
+Two allowlist mechanisms exist. They answer different questions and are deliberately separate.
+
+| | `web_egress_allowlist` | `security.*_allowlist` (JUDGE policies) |
+|---|---|---|
+| Question | May a `web.*` tool connect to this destination? | May this CONSTRAINED value cross a trust boundary? |
+| Default | Allow every public address; deny loopback, private, link-local and other non-global ones | Deny everything not listed |
+| Entries | Exact hostnames, or CIDRs matched against the resolved addresses | Typed values: `email`, `domain` (exact or suffix), `url` (prefix), `filepath`, `command` |
+| Enforced by | `security/egress.py`, on every request and redirect hop, in the platform process | The JUDGE (`security/policies.py`), deterministically, when a non-trusted arc's output is validated |
+| Stored in | `config.yaml` only | `config.yaml` (`security.*`) as seed, plus the policy store in the database |
+
+Listing a domain in `security.domain_allowlist` does not make it reachable by web tools, and listing a host in `web_egress_allowlist` does not make it pass a JUDGE. Merging the two would weaken both: the egress guard is default-allow for the public internet, so treating its entries as JUDGE policy values would be a default-allow judge, while treating JUDGE domains as egress entries would let a policy value (often editable at runtime) open a path to internal addresses.
+
+Executor code itself cannot open network connections (the restricted executor refuses network imports), so there is no executor egress allowlist. The former `egress_policy` / `egress_enforce` keys had no effect and have been removed; setting them in `config.yaml` logs a warning.
+
 ## Read-Only Isolation: Capability, Not Path Confinement
 
 Read-only agents operate on real files directly, with no workspace copy and no path boundary. The security invariant lives in the **tool capability tier**, not in filesystem confinement:
