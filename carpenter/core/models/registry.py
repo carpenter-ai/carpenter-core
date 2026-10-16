@@ -7,7 +7,9 @@ as ``config_seed/model-registry.yaml`` and is synced to
 credential_registry.yaml).
 
 Falls back to building entries from ``config.CONFIG["models"]`` when the
-YAML file is missing.
+YAML file is missing. Prices are data, never code: that fallback still takes
+each model's price from the registry YAML (the instance copy, else the
+bundled seed), so the seed file is the single place list prices live.
 """
 
 import logging
@@ -94,18 +96,99 @@ def _load_from_yaml(yaml_path: str) -> dict[str, ModelEntry]:
         return {}
 
 
+# Cost tier -> quality tier, used only when a config-defined model is not
+# found in the registry YAML.
+_TIER_QUALITY = {"low": 2, "medium": 4, "high": 5}
+
+# Last-resort price (in/out/cached USD per Mtok), used only when no registry
+# YAML can be read at all -- not even the bundled seed, which means a broken
+# install. It is deliberately high rather than current: costing a model too
+# high trips the budget breaker early, costing it at zero disables it.
+_UNKNOWN_PRICE = (15.0, 75.0, 1.5)
+
+
+def _seed_yaml_path() -> Path:
+    """Return the bundled ``config_seed/model-registry.yaml`` path."""
+    from ...db import _config_seed_dir
+    return _config_seed_dir() / "model-registry.yaml"
+
+
+def _price_of(entry: ModelEntry) -> tuple[float, float, float]:
+    return (
+        entry.cost_per_mtok_in,
+        entry.cost_per_mtok_out,
+        entry.cached_cost_per_mtok_in,
+    )
+
+
+def _reference_prices() -> dict[str, ModelEntry]:
+    """Load the registry YAML that supplies prices for config-defined models.
+
+    Prefers the instance copy (``{base_dir}/config/model_registry.yaml``) and
+    falls back to the bundled seed, so prices always come from data rather
+    than from code.
+    """
+    for path in (_yaml_path(), str(_seed_yaml_path())):
+        if path and Path(path).exists():
+            entries = _load_from_yaml(path)
+            if entries:
+                return entries
+    return {}
+
+
+def _tier_prices(
+    reference: dict[str, ModelEntry],
+) -> dict[str, tuple[float, float, float]]:
+    """Derive a price per cost tier from the reference registry.
+
+    Each tier takes the most expensive registry model at that tier's quality
+    level, so an unknown model is never under-costed relative to its peers.
+    """
+    result = {}
+    for tier, quality in _TIER_QUALITY.items():
+        peers = [e for e in reference.values() if e.quality_tier == quality]
+        if peers:
+            result[tier] = _price_of(max(peers, key=lambda e: e.cost_per_mtok_out))
+    return result
+
+
+def _ceiling_price(reference: dict[str, ModelEntry]) -> tuple[float, float, float]:
+    """The highest price in the reference registry.
+
+    Used for a model whose price cannot be determined any other way. Charging
+    it at the most expensive known rate keeps the budget breaker
+    conservative: an unknown model can trip the breaker early, never late.
+    """
+    if not reference:
+        return _UNKNOWN_PRICE
+    return _price_of(max(reference.values(), key=lambda e: e.cost_per_mtok_out))
+
+
 def _load_from_config() -> dict[str, ModelEntry]:
-    """Build ModelEntry objects from config.CONFIG['models'] as fallback."""
+    """Build ModelEntry objects from config.CONFIG['models'] as fallback.
+
+    ``config.CONFIG['models']`` carries no prices of its own. Each model's
+    price is resolved, in order, from:
+
+    1. explicit ``cost_per_mtok_in`` / ``cost_per_mtok_out`` /
+       ``cached_cost_per_mtok_in`` fields on the config entry;
+    2. the registry YAML entry with the same ``model_id``;
+    3. the registry's most expensive model at the entry's ``cost_tier``;
+    4. the registry's most expensive model overall;
+    5. ``_UNKNOWN_PRICE``, only if no registry YAML is readable at all.
+    """
     from ... import config
 
-    # Cost tier → quality_tier mapping
-    tier_map = {"low": 2, "medium": 4, "high": 5}
-    # Cost tier → approximate pricing (in/out/cached per Mtok)
-    pricing_map = {
-        "low": (1.0, 5.0, 0.1),
-        "medium": (3.0, 15.0, 0.3),
-        "high": (5.0, 25.0, 0.5),
-    }
+    reference = _reference_prices()
+    by_model_id = {e.model_id: e for e in reference.values() if e.model_id}
+    tier_prices = _tier_prices(reference)
+    ceiling = _ceiling_price(reference)
+    if not reference:
+        logger.warning(
+            "No model registry YAML could be read; costing config-defined "
+            "models at the conservative last-resort price %s",
+            _UNKNOWN_PRICE,
+        )
 
     models = config.CONFIG.get("models", {})
     result = {}
@@ -113,12 +196,23 @@ def _load_from_config() -> dict[str, ModelEntry]:
         if not isinstance(entry, dict):
             continue
         cost_tier = entry.get("cost_tier", "medium")
-        pricing = pricing_map.get(cost_tier, (3.0, 15.0, 0.3))
+        model_id = entry.get("model_id", "")
+        known = by_model_id.get(model_id)
+        if known is not None:
+            pricing = _price_of(known)
+        else:
+            pricing = tier_prices.get(cost_tier, ceiling)
+        if "cost_per_mtok_in" in entry or "cost_per_mtok_out" in entry:
+            pricing = (
+                float(entry.get("cost_per_mtok_in", pricing[0])),
+                float(entry.get("cost_per_mtok_out", pricing[1])),
+                float(entry.get("cached_cost_per_mtok_in", pricing[2])),
+            )
         result[key] = ModelEntry(
             key=key,
             provider=entry.get("provider", ""),
-            model_id=entry.get("model_id", ""),
-            quality_tier=tier_map.get(cost_tier, 3),
+            model_id=model_id,
+            quality_tier=_TIER_QUALITY.get(cost_tier, 3),
             cost_per_mtok_in=pricing[0],
             cost_per_mtok_out=pricing[1],
             cached_cost_per_mtok_in=pricing[2],
