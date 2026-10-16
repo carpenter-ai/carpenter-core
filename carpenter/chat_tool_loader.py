@@ -18,6 +18,7 @@ import logging
 import os
 import shutil
 import sys
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -324,11 +325,38 @@ def _read_seed_record(chat_tools_dir: Path) -> set[str]:
     return {n for n in names if n and not n.startswith("#")}
 
 
+def _atomic_write(dst: Path, data: bytes, stat_from: Path | None = None) -> None:
+    """Write ``data`` to ``dst`` through a temp file and ``os.replace``.
+
+    A crash mid-write leaves either the old file or no file, never a
+    truncated module that would fail to import at the next start.  The
+    temp name does not end in ``.py``, so the loader never picks it up.
+    """
+    fd, tmp = tempfile.mkstemp(dir=dst.parent, prefix=f".{dst.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        if stat_from is not None:
+            shutil.copystat(stat_from, tmp)
+        os.replace(tmp, dst)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def _write_seed_record(chat_tools_dir: Path, names: set[str]) -> None:
-    (chat_tools_dir / SEED_RECORD_NAME).write_text(
-        "# Seed chat tool files installed here once. A file listed here is\n"
-        "# not reinstalled if you delete it.\n"
-        + "".join(f"{n}\n" for n in sorted(names))
+    _atomic_write(
+        chat_tools_dir / SEED_RECORD_NAME,
+        (
+            "# Seed chat tool files installed here once. A file listed here is\n"
+            "# not reinstalled if you delete it.\n"
+            + "".join(f"{n}\n" for n in sorted(names))
+        ).encode(),
     )
 
 
@@ -367,7 +395,7 @@ def install_chat_tool_defaults(chat_tools_dir: str) -> dict:
                 if src.read_bytes() != dst.read_bytes():
                     drifted.append(src.name)
             elif src.name not in recorded:
-                shutil.copy2(src, dst)
+                _atomic_write(dst, src.read_bytes(), stat_from=src)
                 copied.append(src.name)
             record.add(src.name)
         if record != recorded:

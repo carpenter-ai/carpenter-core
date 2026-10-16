@@ -180,6 +180,32 @@ class TestInstallDefaults:
         assert result["copied"] == 0
         assert not (target / "budget.py").exists()
 
+    def test_deleted_drifted_tool_is_not_reinstalled(self, tmp_path):
+        """A module the operator edited and then deleted stays deleted."""
+        target = tmp_path / "ct"
+        install_chat_tool_defaults(str(target))
+        (target / "budget.py").write_text("# local edit\n")
+        assert install_chat_tool_defaults(str(target))["drifted"] == ["budget.py"]
+        (target / "budget.py").unlink()
+        result = install_chat_tool_defaults(str(target))
+        assert result == {"status": "exists", "copied": 0, "drifted": []}
+        assert not (target / "budget.py").exists()
+
+    def test_error_path(self, tmp_path, monkeypatch):
+        """A write failure returns status error and leaves no partial module."""
+        import carpenter.chat_tool_loader as ctl
+        target = tmp_path / "ct"
+
+        def fail(*args, **kwargs):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(ctl.os, "replace", fail)
+        result = install_chat_tool_defaults(str(target))
+        assert result["status"] == "error"
+        assert "disk full" in result["error"]
+        assert result["copied"] == 0
+        assert list(target.iterdir()) == []
+
     def test_record_is_not_loaded_as_a_module(self, tmp_path):
         """The record file sits beside the modules without being imported."""
         target = tmp_path / "ct"
