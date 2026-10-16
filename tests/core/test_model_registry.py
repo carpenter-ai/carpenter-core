@@ -267,3 +267,168 @@ class TestGetRegistryAutoLoads:
         assert "test-model" in reg
 
 
+
+
+class TestConfigFallbackPricing:
+    """Prices for config-defined models come from registry data, not code."""
+
+    @pytest.fixture
+    def price_yaml(self, tmp_path):
+        p = tmp_path / "model_registry.yaml"
+        p.write_text(textwrap.dedent("""\
+            models:
+              big:
+                provider: anthropic
+                model_id: big-1
+                quality_tier: 5
+                cost_per_mtok_in: 7.0
+                cost_per_mtok_out: 35.0
+                cached_cost_per_mtok_in: 0.7
+                context_window: 200000
+              mid:
+                provider: anthropic
+                model_id: mid-1
+                quality_tier: 4
+                cost_per_mtok_in: 2.0
+                cost_per_mtok_out: 11.0
+                cached_cost_per_mtok_in: 0.2
+                context_window: 200000
+              local:
+                provider: ollama
+                model_id: local-1
+                quality_tier: 1
+                cost_per_mtok_in: 0.0
+                cost_per_mtok_out: 0.0
+                cached_cost_per_mtok_in: 0.0
+                context_window: 8000
+        """))
+        return str(p)
+
+    def _config(self, monkeypatch, models):
+        monkeypatch.setattr(
+            "carpenter.config.CONFIG", {"models": models, "base_dir": ""},
+        )
+
+    def test_price_matched_by_model_id(self, monkeypatch, price_yaml):
+        import carpenter.core.models.registry as mod
+        monkeypatch.setattr(mod, "_yaml_path", lambda: price_yaml)
+        self._config(monkeypatch, {
+            "m": {"model_id": "mid-1", "cost_tier": "high"},
+            "l": {"model_id": "local-1", "cost_tier": "low"},
+        })
+        entries = _load_from_config()
+        assert entries["m"].cost_per_mtok_in == 2.0
+        assert entries["m"].cost_per_mtok_out == 11.0
+        assert entries["m"].cached_cost_per_mtok_in == 0.2
+        assert entries["l"].cost_per_mtok_out == 0.0
+
+    def test_unknown_model_uses_tier_price_from_registry(self, monkeypatch, price_yaml):
+        import carpenter.core.models.registry as mod
+        monkeypatch.setattr(mod, "_yaml_path", lambda: price_yaml)
+        self._config(monkeypatch, {
+            "x": {"model_id": "unlisted", "cost_tier": "medium"},
+        })
+        entries = _load_from_config()
+        assert entries["x"].cost_per_mtok_out == 11.0
+
+    def test_unknown_tier_falls_back_to_most_expensive(self, monkeypatch, price_yaml):
+        import carpenter.core.models.registry as mod
+        monkeypatch.setattr(mod, "_yaml_path", lambda: price_yaml)
+        self._config(monkeypatch, {
+            # No registry model at quality 2, so "low" has no tier price.
+            "x": {"model_id": "unlisted", "cost_tier": "low"},
+        })
+        entries = _load_from_config()
+        assert entries["x"].cost_per_mtok_out == 35.0
+
+    def test_explicit_config_price_wins(self, monkeypatch, price_yaml):
+        import carpenter.core.models.registry as mod
+        monkeypatch.setattr(mod, "_yaml_path", lambda: price_yaml)
+        self._config(monkeypatch, {
+            "m": {
+                "model_id": "mid-1",
+                "cost_per_mtok_in": 1.5,
+                "cost_per_mtok_out": 9.0,
+            },
+        })
+        entries = _load_from_config()
+        assert entries["m"].cost_per_mtok_in == 1.5
+        assert entries["m"].cost_per_mtok_out == 9.0
+        # Unspecified field keeps the registry value.
+        assert entries["m"].cached_cost_per_mtok_in == 0.2
+
+    def test_instance_copy_wins_over_seed(self, monkeypatch, tmp_path):
+        """A model in both the instance registry and the seed takes the
+        instance price."""
+        import carpenter.core.models.registry as mod
+        seed = _load_from_yaml(str(mod._seed_yaml_path()))
+        seed_entry = next(e for e in seed.values() if e.cost_per_mtok_out > 0)
+        inst = tmp_path / "model_registry.yaml"
+        inst.write_text(textwrap.dedent(f"""\
+            models:
+              mine:
+                provider: anthropic
+                model_id: "{seed_entry.model_id}"
+                quality_tier: 4
+                cost_per_mtok_in: 0.25
+                cost_per_mtok_out: 1.25
+                cached_cost_per_mtok_in: 0.025
+                context_window: 200000
+        """))
+        monkeypatch.setattr(mod, "_yaml_path", lambda: str(inst))
+        self._config(monkeypatch, {
+            "k": {"model_id": seed_entry.model_id, "cost_tier": "high"},
+        })
+        entries = _load_from_config()
+        assert entries["k"].cost_per_mtok_in == 0.25
+        assert entries["k"].cost_per_mtok_out == 1.25
+        assert entries["k"].cost_per_mtok_out != seed_entry.cost_per_mtok_out
+
+    def test_cached_only_config_price_honoured(self, monkeypatch, price_yaml):
+        import carpenter.core.models.registry as mod
+        monkeypatch.setattr(mod, "_yaml_path", lambda: price_yaml)
+        self._config(monkeypatch, {
+            "m": {"model_id": "mid-1", "cached_cost_per_mtok_in": 0.05},
+        })
+        entries = _load_from_config()
+        assert entries["m"].cached_cost_per_mtok_in == 0.05
+        # The other fields keep the registry price.
+        assert entries["m"].cost_per_mtok_in == 2.0
+        assert entries["m"].cost_per_mtok_out == 11.0
+
+    def test_bundled_seed_supplies_prices_without_instance_copy(self, monkeypatch):
+        import carpenter.core.models.registry as mod
+        monkeypatch.setattr(mod, "_yaml_path", lambda: None)
+        seed = _load_from_yaml(str(mod._seed_yaml_path()))
+        assert seed, "bundled model-registry.yaml must load"
+        seed_entry = next(iter(seed.values()))
+        self._config(monkeypatch, {
+            "k": {"model_id": seed_entry.model_id, "cost_tier": "medium"},
+        })
+        entries = _load_from_config()
+        assert entries["k"].cost_per_mtok_in == seed_entry.cost_per_mtok_in
+        assert entries["k"].cost_per_mtok_out == seed_entry.cost_per_mtok_out
+
+    def test_default_config_models_all_priced_by_seed(self, monkeypatch):
+        """Every model in the shipped default config has a seed price."""
+        import carpenter.core.models.registry as mod
+        from carpenter.config import DEFAULTS
+        seed = _load_from_yaml(str(mod._seed_yaml_path()))
+        seed_ids = {e.model_id for e in seed.values()}
+        for key, entry in DEFAULTS["models"].items():
+            assert entry["model_id"] in seed_ids, key
+
+    def test_no_registry_uses_conservative_price(self, monkeypatch, tmp_path):
+        import carpenter.core.models.registry as mod
+        monkeypatch.setattr(mod, "_yaml_path", lambda: None)
+        monkeypatch.setattr(mod, "_seed_yaml_path", lambda: tmp_path / "missing.yaml")
+        self._config(monkeypatch, {"x": {"model_id": "y", "cost_tier": "low"}})
+        entries = _load_from_config()
+        assert entries["x"].cost_per_mtok_out == mod._UNKNOWN_PRICE[1]
+        assert entries["x"].cost_per_mtok_out > 0
+
+    def test_no_price_literals_in_code(self):
+        """The cost-tier price table must not come back as code."""
+        import inspect
+        import carpenter.core.models.registry as mod
+        assert "pricing_map" not in inspect.getsource(mod)
