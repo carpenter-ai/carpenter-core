@@ -6,9 +6,22 @@ Two modes:
 - rest_api: Connects to signal-cli-rest-api (Docker container) over HTTP.
   Receives inbound messages via webhook; sends outbound via POST.
   Uses httpx (already a dependency).
+
+Webhook authentication (rest_api mode)
+--------------------------------------
+The webhook path sits under ``/hooks/``, which the UI-token middleware does
+not gate, and the sender number in a webhook payload is whatever the caller
+wrote.  When the ``signal_webhook_secret`` config key is set (credential env
+var ``SIGNAL_WEBHOOK_SECRET``), every webhook request must carry that secret,
+either as the ``secret`` query parameter or the ``X-Webhook-Secret`` header;
+anything else gets a 401 and is never processed.  signal-cli-rest-api's
+``RECEIVE_WEBHOOK_URL`` cannot add headers, so point it at
+``.../hooks/signal?secret=<value>``.  When the secret is unset the webhook
+stays open, for backward compatibility, and a warning is logged at start.
 """
 
 import asyncio
+import hmac
 import json
 import logging
 import os
@@ -23,6 +36,10 @@ from .formatting import split_message
 logger = logging.getLogger(__name__)
 
 SIGNAL_MAX_LENGTH = 6000
+
+# Where a webhook caller may present the shared secret.
+WEBHOOK_SECRET_QUERY_PARAM = "secret"
+WEBHOOK_SECRET_HEADER = "X-Webhook-Secret"
 
 
 class SignalChannelConnector(ChannelConnector):
@@ -61,6 +78,9 @@ class SignalChannelConnector(ChannelConnector):
         # REST API mode fields
         self._rest_api_url = cc.get("rest_api_url", "")
         self._webhook_path = cc.get("webhook_path", "/hooks/signal")
+        # Shared secret for the inbound webhook.  Read from the platform
+        # config (a credential, not connector YAML) in _start_rest_api().
+        self._webhook_secret: str = ""
         self._client = None  # httpx.AsyncClient
         self.routes = None   # Starlette Route list (set during start if rest_api)
 
@@ -113,6 +133,16 @@ class SignalChannelConnector(ChannelConnector):
             raise ConnectionError(
                 f"Cannot reach signal-cli-rest-api at {self._rest_api_url}: {e}"
             ) from e
+
+        self._webhook_secret = str(config.get("signal_webhook_secret") or "")
+        if not self._webhook_secret:
+            logger.warning(
+                "Signal webhook %s is UNAUTHENTICATED: anyone who can reach "
+                "this server can post a message that appears to come from an "
+                "allowed number. Set SIGNAL_WEBHOOK_SECRET and append "
+                "?%s=<secret> to signal-cli-rest-api's RECEIVE_WEBHOOK_URL.",
+                self._webhook_path, WEBHOOK_SECRET_QUERY_PARAM,
+            )
 
         self._setup_webhook()
         self._last_healthy = datetime.now()
@@ -322,6 +352,32 @@ class SignalChannelConnector(ChannelConnector):
 
     # -- Internal: REST API mode --
 
+    def _webhook_authorized(self, request) -> bool:
+        """Return True if *request* may be processed by the webhook.
+
+        With no secret configured every request is allowed (legacy
+        behaviour, warned about at start).  Otherwise the request must
+        present the exact secret in the query parameter or the header.
+        Comparison is constant-time; any error denies.
+        """
+        expected = self._webhook_secret
+        if not expected:
+            return True
+        try:
+            provided = (
+                request.query_params.get(WEBHOOK_SECRET_QUERY_PARAM)
+                or request.headers.get(WEBHOOK_SECRET_HEADER)
+                or ""
+            )
+            if not provided:
+                return False
+            return hmac.compare_digest(
+                provided.encode("utf-8"), expected.encode("utf-8"),
+            )
+        except Exception:
+            # Fail closed: an unparseable request is not an authorized one.
+            return False
+
     def _setup_webhook(self) -> None:
         """Create Starlette routes for the webhook endpoint."""
         from starlette.requests import Request
@@ -331,6 +387,15 @@ class SignalChannelConnector(ChannelConnector):
         connector = self  # closure reference
 
         async def signal_webhook(request: Request):
+            # Authenticate before reading the body.  Never log the secret.
+            if not connector._webhook_authorized(request):
+                logger.warning(
+                    "Rejected Signal webhook request from %s: missing or "
+                    "invalid secret",
+                    request.client.host if request.client else "unknown",
+                )
+                return Response(status_code=401)
+
             body = await request.json()
             try:
                 # signal-cli-rest-api forwards JSON-RPC messages:

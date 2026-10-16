@@ -121,6 +121,20 @@ Session records are retained indefinitely in the database for audit purposes.
 | **Execution sessions** | Unreviewed/expired code from acting | Code that bypasses review or has expired session could invoke action callbacks |
 | **Callback token** | External callers from invoking callbacks | Any HTTP client on the network could call action tools |
 
+## Inbound Channel Webhooks
+
+Paths under `/hooks/` (channel connectors) and `/api/webhooks/` are exempt from the UI-token middleware, because the services that call them cannot carry the UI bearer token. Each handler must therefore authenticate its caller itself; the payload alone proves nothing.
+
+**Signal (`rest_api` mode).** The sender number in a webhook payload is whatever the caller wrote, so the `allowed_numbers` allowlist only means something if the caller is known to be signal-cli-rest-api. Set the credential `SIGNAL_WEBHOOK_SECRET` (in `{base_dir}/.env` or the environment; config key `signal_webhook_secret`, never `config.yaml`) and give the same value to the webhook caller:
+
+```
+RECEIVE_WEBHOOK_URL=http://<carpenter-host>:<port>/hooks/signal?secret=<value>
+```
+
+The secret may also be sent as an `X-Webhook-Secret` header, which is preferable when the caller can set headers, since a query string can end up in HTTP access logs. Requests without the exact secret (constant-time comparison) get `401` and are never parsed or delivered. If the secret is unset, the webhook accepts every request, as before, and the connector logs a warning at start; set it on any deployment where the server's port is reachable by anything other than signal-cli-rest-api. Subprocess mode has no webhook and is unaffected.
+
+**Other webhooks.** `/api/webhooks/{webhook_id}` is addressed by a 128-bit random id generated per subscription, which acts as the bearer secret. The Telegram connector's `webhook` mode (`/hooks/telegram`) does not yet verify Telegram's `X-Telegram-Bot-Api-Secret-Token` header.
+
 ## Adding New Tools
 
 1. Determine if the tool is read-only or an action

@@ -94,6 +94,10 @@ DEFAULTS = {
     # IMPORTANT: do NOT set ui_token in config.yaml — it is a secret token.
     # Set UI_TOKEN in {base_dir}/.env or as an environment variable instead.
     "ui_token": "",
+    # Shared secret for the Signal channel's rest_api-mode inbound webhook.
+    # Secret: set SIGNAL_WEBHOOK_SECRET in {base_dir}/.env or the environment,
+    # never in config.yaml.  Empty = webhook unauthenticated (warned at start).
+    "signal_webhook_secret": "",
     "allow_insecure_bind": False,
     "default_thread_pool_size": 16,
     "work_handler_thread_pool_size": 3,
@@ -544,6 +548,8 @@ _CREDENTIAL_MAP: dict[str, str] = {
     "TINFOIL_API_KEY": "tinfoil_api_key",
     # TLS
     "TLS_KEY_PASSWORD": "tls_key_password",
+    # Channels
+    "SIGNAL_WEBHOOK_SECRET": "signal_webhook_secret",
     # Git / forge
     "GIT_TOKEN": "git_token",
     "GIT_AUTHOR_NAME": "git_author_name",
