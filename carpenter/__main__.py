@@ -148,6 +148,10 @@ def main():
         _cmd_setup_credential(sys.argv[2:])
         return
 
+    if len(sys.argv) > 1 and sys.argv[1] == "budget":
+        from .cli_budget import cmd_budget
+        sys.exit(cmd_budget(sys.argv[2:]))
+
     if len(sys.argv) > 1 and sys.argv[1] == "packages":
         from .cli_packages import cmd_packages
         sys.exit(cmd_packages(sys.argv[2:]))

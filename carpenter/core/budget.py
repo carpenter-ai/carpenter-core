@@ -282,7 +282,7 @@ def _latch(kind: str, limit: dict, value: float, db, pending: list) -> None:
         limit,
         f"[budget] {verb} — limit '{limit.get('name')}': "
         f"{limit.get('metric')}={value:.2f} >= {limit.get('threshold')}. "
-        f"Clear via the budget chat tool or `carpenter budget resume`.",
+        f"Clear via the budget chat tool or `python3 -m carpenter budget resume`.",
     ))
     logger.critical(
         "Budget breaker %s by limit %s (%s=%.2f >= %s)",
@@ -372,7 +372,7 @@ def guard_paid_call(model: str | None = None) -> None:
         raise BudgetExceededError(
             "Carpenter API budget kill-switch is active — all paid model "
             "calls are blocked. Clear it via the budget chat tool or "
-            "`carpenter budget resume`."
+            "`python3 -m carpenter budget resume`."
         )
     summary = _evaluate()
     if summary.get("block_all"):
