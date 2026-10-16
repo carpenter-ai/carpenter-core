@@ -297,6 +297,10 @@ class LoadedTool:
 # ── Module-level state ─────────────────────────────────────────────
 
 _loaded_tools: dict[str, LoadedTool] = {}
+# Names registered through register_extension_tool (capability packages,
+# platform layers).  They have no file in the chat tools directory, so a
+# hot reload must carry them over from the current set.
+_extension_tool_names: set[str] = set()
 _mtimes: dict[str, float] = {}
 _chat_tools_dir: str = ""
 
@@ -586,6 +590,7 @@ def register_extension_tool(
         )
 
     _loaded_tools[name] = tool
+    _extension_tool_names.add(name)
     logger.info("Registered extension tool: %s", name)
 
 
@@ -666,6 +671,14 @@ def _check_and_reload():
             logger.error("Chat tool reload validation: %s", err)
         logger.warning("Chat tool reload validation failed, keeping previous set")
         return
+
+    # Carry over extension tools.  They were validated when registered
+    # (with their package's write opt-in), so they are added after the
+    # file-tool validation above.  A file tool of the same name wins, as it
+    # does at startup, where register_extension_tool skips taken names.
+    for name, tool in _loaded_tools.items():
+        if name in _extension_tool_names and name not in new_tools:
+            new_tools[name] = tool
 
     # Diff for logging
     old_names = set(_loaded_tools.keys())
