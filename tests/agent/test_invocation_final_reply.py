@@ -233,6 +233,29 @@ class TestFinalReplyLoop:
         stored = json.loads(tr["content_json"])[0]["content"]
         assert "truncated" in stored
 
+    def test_arc_step_treats_final_reply_as_plain_result(
+        self, mock_client, tool_handlers,
+    ):
+        """In an arc step the loop keeps going until the model finishes."""
+        from carpenter.core.arcs import manager as arc_manager
+
+        arc_id = arc_manager.create_arc(name="step")
+        tool_handlers["submit_order"] = FinalReply(ACK)
+        mock_client.call.side_effect = [
+            _tool_use(("tu_1", "submit_order")),
+            _text("Step complete: order submitted."),
+        ]
+        mock_client.extract_code_from_text.return_value = None
+
+        result = invocation.invoke_for_chat(
+            "Run the step", api_key="k", _executor_arc_id=arc_id,
+        )
+
+        assert mock_client.call.call_count == 2
+        assert _assistant_texts(result["conversation_id"]) == [
+            "Step complete: order submitted.",
+        ]
+
     def test_history_is_well_formed_on_next_turn(self, mock_client, tool_handlers):
         tool_handlers["submit_order"] = FinalReply(ACK)
         mock_client.call.side_effect = [

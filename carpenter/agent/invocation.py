@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .. import config, constants
+from ..chat_tool_loader import FinalReply
 from ..core import code_manager
 from ..db import get_db, db_connection, db_transaction
 from . import templates, conversation, model_resolver, api_standard, error_classifier
@@ -2304,7 +2305,6 @@ def _build_message_id_map(
 
 def _is_final_reply(result) -> bool:
     """True if a tool result is a non-empty :class:`FinalReply`."""
-    from ..chat_tool_loader import FinalReply
     return isinstance(result, FinalReply) and bool(result.strip())
 
 
@@ -2814,7 +2814,9 @@ def invoke_for_chat(
 
             # A tool that returned FinalReply supplies this turn's reply.
             # Capture it before truncation, which returns a plain str.
-            if _is_final_reply(result_str):
+            # Chat turns only: an arc step must keep running until the
+            # model finishes the step, so there it is a plain result.
+            if not _is_arc and _is_final_reply(result_str):
                 final_replies.append(str(result_str))
 
             # Truncate large tool outputs to protect the context window

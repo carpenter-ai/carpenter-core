@@ -54,6 +54,14 @@ Channel connectors send the latest assistant message
 (`ChannelConnector._run_and_respond`), which is this reply, so the
 channel delivers exactly that text, once.
 
+### Chat turns only
+
+`invoke_for_chat` also runs arc steps (an arc's agent working through
+its step, with `_executor_arc_id` set). There, ending after one batch
+of tool calls would cut the step short, so `FinalReply` is treated as a
+plain result: the text goes back to the model as the tool result and
+the step continues as usual.
+
 ### Errors
 
 The choice is made per call, by the return type. If the tool returns a
