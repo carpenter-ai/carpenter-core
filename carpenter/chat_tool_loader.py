@@ -185,6 +185,36 @@ _PLATFORM_TOOL_DEFS = [
 ]
 
 
+# ── Final-reply result type ────────────────────────────────────────
+
+class FinalReply(str):
+    """A tool result that is also the user-facing reply for this turn.
+
+    A chat tool handler (including a package or extension tool) returns
+    ``FinalReply(text)`` instead of a plain string when its result must
+    reach the user verbatim.  The invocation loop then:
+
+    * records ``text`` as the tool result, so the model sees it in the
+      conversation history on later turns;
+    * persists ``text`` as the assistant message for this turn; and
+    * ends the turn without another model call, so the model cannot
+      rephrase or embellish it.
+
+    It is a ``str`` subclass, so anything that treats tool results as
+    strings keeps working.  The choice is per call: return a plain string
+    (or raise) on failure, and the normal flow continues so the model can
+    explain the error.  An empty or whitespace-only ``FinalReply`` is
+    treated as a plain result.
+
+    See ``docs/tool-final-reply.md``.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return f"FinalReply({str.__repr__(self)})"
+
+
 # ── Decorator ──────────────────────────────────────────────────────
 
 def chat_tool(
