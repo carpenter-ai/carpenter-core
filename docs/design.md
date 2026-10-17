@@ -219,7 +219,7 @@ A *limit* is one independent rule `{name, metric, window_seconds, threshold, act
 
 **Chokepoints wired**: `anthropic.call()` (paid call gate), `arc dispatch` (autonomous), `cron/timer firing` (autonomous), `trigger-driven arc creation` (autonomous). `BudgetExceededError` is classified fatal so the retry loop breaks immediately.
 
-**Operator control**: the `budget_status` and `budget_control` chat tools (the latter in the `PLATFORM_TOOLS` allowlist so only the chat agent can call it) expose `resume`, `set_threshold` (with optional TTL), `enable`/`disable`. Threshold overrides expire on schedule so a temporary expansion auto-reverts.
+**Operator control**: `python3 -m carpenter budget` (`status`, `resume`, `set-threshold NAME VALUE [--ttl SECONDS]`, `enable`, `disable`). The same actions are exposed to chat through `budget_status` (read-only) and `budget_control`. `budget_control` is operator-only (`OPERATOR_ONLY_TOOLS`): core refuses it to arc agents, and the chat agent can run it only after a human confirms each call, so it is unavailable on a platform without a confirmation handler. Threshold overrides expire on schedule so a temporary expansion auto-reverts.
 
 **Notification routing**: each limit's `notify` block (per-limit `enabled` + `priority`) is delivered via the unified notification system. A top-level `notify_human` master-switch gates all human messaging (off by default in the seed config). Limit messages always log even when human notify is suppressed.
 

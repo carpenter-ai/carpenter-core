@@ -42,6 +42,24 @@ PLATFORM_TOOLS = frozenset({
     "budget_control",
 })
 
+# Operator-only tools.  Core requires a human to confirm every call to one
+# of these, whatever the tool module declares, and never runs them for an
+# arc agent.  Chat tool modules are user-owned and can lag behind the seed
+# or drop ``requires_user_confirm``, so the module flag alone cannot be the
+# enforcement point.  See ``invocation._dispatch_chat_tool_call``.
+OPERATOR_ONLY_TOOLS = frozenset({
+    "budget_control",
+    "install_package",
+    "uninstall_package",
+})
+
+# Where the operator does the same thing without the chat agent.
+OPERATOR_ONLY_ALTERNATIVES = {
+    "budget_control": "python3 -m carpenter budget",
+    "install_package": "python3 -m carpenter packages install",
+    "uninstall_package": "python3 -m carpenter packages uninstall",
+}
+
 _VALID_BOUNDARIES = frozenset({"chat", "platform"})
 
 # ── Capability vocabulary ──────────────────────────────────────────

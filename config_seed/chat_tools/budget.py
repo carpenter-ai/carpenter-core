@@ -88,6 +88,8 @@ def budget_status(tool_input, **kwargs):
     },
     capabilities=["database_write"],
     trust_boundary="platform",
+    # Core enforces this by name as well (chat_tool_registry.OPERATOR_ONLY_TOOLS).
+    requires_user_confirm=True,
 )
 def budget_control(tool_input, **kwargs):
     action = tool_input.get("action")

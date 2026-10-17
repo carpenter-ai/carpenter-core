@@ -207,9 +207,15 @@ def _select_chat_tools(context_budget: int | None = None) -> list[dict]:
     if context_budget is None:
         context_budget = _DEFAULT_CONTEXT_WINDOW
 
-    from ..chat_tool_loader import get_tool_defs_for_api, get_always_available_names
+    from ..chat_tool_loader import (
+        get_tool_defs_for_api, get_always_available_names, get_confirmation_handler,
+    )
 
     tool_defs = get_tool_defs_for_api()
+    # Without a confirmation handler, operator-only tools are refused at
+    # dispatch; don't offer them.
+    if get_confirmation_handler() is None:
+        tool_defs = _drop_operator_only_tools(tool_defs)
     registry_core = get_always_available_names()
 
     # For small context windows, use a minimal core set (5 tools) to leave
@@ -267,6 +273,17 @@ def _select_chat_tools(context_budget: int | None = None) -> list[dict]:
     selected_non_core = non_core_tools[:remaining_slots] if remaining_slots > 0 else []
 
     return sorted(core_tools + selected_non_core, key=lambda t: t["name"])
+
+
+def _drop_operator_only_tools(tools: list[dict]) -> list[dict]:
+    """Remove operator-only tools from an agent's offered tool set.
+
+    Used for arc agents, and for the chat agent when no confirmation
+    handler is registered.  Dispatch refuses the calls in both cases
+    anyway; not offering them keeps the agent from trying.
+    """
+    from ..chat_tool_registry import OPERATOR_ONLY_TOOLS
+    return [t for t in tools if t["name"] not in OPERATOR_ONLY_TOOLS]
 
 
 def _maybe_add_reviewer_emit_tool(
@@ -2341,10 +2358,24 @@ def _dispatch_chat_tool_call(
 
     # Check if tool requires user confirmation.
     from ..chat_tool_loader import get_loaded_tools, get_confirmation_handler
+    from ..chat_tool_registry import OPERATOR_ONLY_TOOLS, OPERATOR_ONLY_ALTERNATIVES
     loaded_tools = get_loaded_tools()
     tool_def = loaded_tools.get(tool_name)
 
-    if not (tool_def and tool_def.requires_user_confirm):
+    # Operator-only tools: enforced here, by name, whatever the (user-owned)
+    # tool module declares.  An arc agent never runs them; the chat agent
+    # runs them only after a human confirms.
+    operator_only = tool_name in OPERATOR_ONLY_TOOLS
+    if operator_only and executor_arc_id is not None:
+        logger.warning(
+            "Refused operator-only tool %s for arc %s", tool_name, executor_arc_id,
+        )
+        return (
+            f"Error: '{tool_name}' is operator-only and cannot be called by "
+            "an arc agent. Ask the user to do this."
+        )
+
+    if not operator_only and not (tool_def and tool_def.requires_user_confirm):
         # No confirmation required, execute normally.
         return _execute_chat_tool(
             tool_name, tool_input, conversation_id=conv_id,
@@ -2353,6 +2384,17 @@ def _dispatch_chat_tool_call(
         )
 
     confirmation_handler = get_confirmation_handler()
+    if confirmation_handler is None and operator_only:
+        logger.warning(
+            "Operator-only tool %s refused: no confirmation handler registered",
+            tool_name,
+        )
+        return (
+            f"Error: '{tool_name}' is operator-only. Every call needs a human "
+            "to confirm it, and this platform has no confirmation handler, so "
+            "the chat agent cannot run it. Tell the user they can run "
+            f"`{OPERATOR_ONLY_ALTERNATIVES.get(tool_name, 'the operator CLI')}` themselves."
+        )
     if confirmation_handler is None:
         logger.warning(
             "Tool %s requires confirmation but no handler registered",
@@ -2646,6 +2688,11 @@ def invoke_for_chat(
     # code-generation via submit_code.
     if _is_arc:
         tools = _maybe_add_reviewer_emit_tool(tools, _executor_arc_id)
+    # Operator-only tools are refused at dispatch for arc agents; don't
+    # offer them.  (_select_chat_tools already drops them for everyone
+    # when no confirmation handler is registered.)
+    if _is_arc:
+        tools = _drop_operator_only_tools(tools)
 
     collected_text = []
     total_tokens = 0
