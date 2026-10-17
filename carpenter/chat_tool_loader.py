@@ -383,6 +383,7 @@ def install_chat_tool_defaults(chat_tools_dir: str) -> dict:
         return {"status": "no_defaults", "copied": 0, "drifted": []}
 
     seed_files = sorted(p for p in seed_dir.glob("*.py") if p.is_file())
+    existing_install = target.is_dir()
     try:
         target.mkdir(parents=True, exist_ok=True)
         recorded = _read_seed_record(target)
@@ -404,7 +405,17 @@ def install_chat_tool_defaults(chat_tools_dir: str) -> dict:
         logger.error("Failed to install chat tool defaults: %s", e)
         return {"status": "error", "error": str(e), "copied": 0, "drifted": []}
 
-    if copied:
+    if copied and existing_install:
+        # New tools in an existing install change what the agent can do, and
+        # an install from before the record existed also regains any seed
+        # module the operator had deleted; say so where it will be seen.
+        logger.warning(
+            "Added %d seed chat tool file(s) to existing install %s: %s. "
+            "Delete any you do not want; a deleted seed module is not "
+            "reinstalled (see %s).",
+            len(copied), target, ", ".join(copied), SEED_RECORD_NAME,
+        )
+    elif copied:
         logger.info(
             "Installed %d seed chat tool file(s) to %s: %s",
             len(copied), target, ", ".join(copied),

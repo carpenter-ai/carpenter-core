@@ -145,14 +145,16 @@ class TestInstallDefaults:
         assert result["copied"] == 1
         assert (target / "budget.py").is_file()
 
-    def test_existing_install_without_record_gets_missing_files(self, tmp_path):
+    def test_existing_install_without_record_gets_missing_files(self, tmp_path, caplog):
         """An install from before the record existed gains every missing tool."""
         target = tmp_path / "ct"
         target.mkdir()
         (target / "utilities.py").write_text(
             (SEED_DIR / "utilities.py").read_text()
         )
-        result = install_chat_tool_defaults(str(target))
+        with caplog.at_level("WARNING", logger="carpenter.chat_tool_loader"):
+            result = install_chat_tool_defaults(str(target))
+        assert "existing install" in caplog.text and "budget.py" in caplog.text
         seed_names = {p.name for p in SEED_DIR.glob("*.py")}
         assert {p.name for p in target.glob("*.py")} == seed_names
         assert result["copied"] == len(seed_names) - 1
