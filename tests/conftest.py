@@ -697,6 +697,7 @@ def _load_chat_tools(test_db):
     loader._loaded_tools = {}
     loader._mtimes = {}
     loader._chat_tools_dir = ""
+    loader._extension_tools.clear()
 
 
 

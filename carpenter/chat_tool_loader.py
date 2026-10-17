@@ -297,10 +297,11 @@ class LoadedTool:
 # ── Module-level state ─────────────────────────────────────────────
 
 _loaded_tools: dict[str, LoadedTool] = {}
-# Names registered through register_extension_tool (capability packages,
-# platform layers).  They have no file in the chat tools directory, so a
-# hot reload must carry them over from the current set.
-_extension_tool_names: set[str] = set()
+# Tools registered through register_extension_tool (capability packages,
+# platform layers), kept apart from _loaded_tools.  They have no file in the
+# chat tools directory, so a hot reload re-adds them from here; a file tool
+# of the same name shadows one only while that file exists.
+_extension_tools: dict[str, LoadedTool] = {}
 _mtimes: dict[str, float] = {}
 _chat_tools_dir: str = ""
 
@@ -402,6 +403,8 @@ def load_chat_tools(chat_tools_dir: str) -> dict[str, LoadedTool]:
     """
     global _loaded_tools, _mtimes, _chat_tools_dir
     _chat_tools_dir = chat_tools_dir
+    # A full load starts the tool set over; extension tools register after it.
+    _extension_tools.clear()
 
     tools: dict[str, LoadedTool] = {}
     mtimes: dict[str, float] = {}
@@ -590,7 +593,7 @@ def register_extension_tool(
         )
 
     _loaded_tools[name] = tool
-    _extension_tool_names.add(name)
+    _extension_tools[name] = tool
     logger.info("Registered extension tool: %s", name)
 
 
@@ -672,12 +675,13 @@ def _check_and_reload():
         logger.warning("Chat tool reload validation failed, keeping previous set")
         return
 
-    # Carry over extension tools.  They were validated when registered
-    # (with their package's write opt-in), so they are added after the
-    # file-tool validation above.  A file tool of the same name wins, as it
-    # does at startup, where register_extension_tool skips taken names.
-    for name, tool in _loaded_tools.items():
-        if name in _extension_tool_names and name not in new_tools:
+    # Re-add registered extension tools.  They were validated when
+    # registered (with their package's write opt-in), so they are added
+    # after the file-tool validation above.  A file tool of the same name
+    # wins while it exists; once that file is gone the extension tool is
+    # back.
+    for name, tool in _extension_tools.items():
+        if name not in new_tools:
             new_tools[name] = tool
 
     # Diff for logging

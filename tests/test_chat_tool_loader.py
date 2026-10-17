@@ -320,16 +320,30 @@ class TestReloadKeepsExtensionTools:
         _check_and_reload()
         assert get_handler("pkg_example_read")({}) == "from file"
 
-    def test_cleared_extension_tool_is_not_resurrected(self, tmp_path):
-        import carpenter.chat_tool_loader as loader
-
+    def test_extension_tool_restored_when_shadowing_file_is_deleted(self, tmp_path):
         target = self._setup(tmp_path)
-        loader._loaded_tools.pop("pkg_example_read")
-        (target / "utilities.py").touch()
-        os.utime(target / "utilities.py", (time.time() + 5, time.time() + 5))
+        clash = target / "clash.py"
+        clash.write_text(
+            "from carpenter.chat_tool_loader import chat_tool\n"
+            "@chat_tool(description='x', input_schema={'type': 'object', "
+            "'properties': {}, 'required': []})\n"
+            "def pkg_example_read(tool_input, **kwargs):\n"
+            "    return 'from file'\n"
+        )
+        _check_and_reload()
+        assert get_handler("pkg_example_read")({}) == "from file"
+        clash.unlink()
+        _check_and_reload()
+        assert get_handler("pkg_example_read")({}) == "from package"
+
+    def test_full_load_drops_extension_tools(self, tmp_path):
+        """A full load starts over; extensions re-register after it."""
+        target = self._setup(tmp_path)
+        load_chat_tools(str(target))
+        assert get_handler("pkg_example_read") is None
+        (target / "extra.py").write_text("x = 1\n")
         _check_and_reload()
         assert get_handler("pkg_example_read") is None
-        assert get_handler("pkg_example_send") is not None
 
 
 class TestLoadedToolDataclass:
