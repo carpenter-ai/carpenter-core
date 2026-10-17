@@ -93,6 +93,27 @@ def test_arc_agents_are_not_offered_operator_only_tools():
     assert invocation._drop_operator_only_tools(tools) == [{"name": "read_file"}]
 
 
+def test_every_operator_only_tool_names_an_alternative():
+    from carpenter.chat_tool_registry import OPERATOR_ONLY_ALTERNATIVES
+    assert set(OPERATOR_ONLY_ALTERNATIVES) == OPERATOR_ONLY_TOOLS
+
+
+def test_not_offered_without_confirmation_handler(monkeypatch):
+    from carpenter import chat_tool_loader
+    defs = [dict(BUDGET_DEF), {"name": "read_file", "description": "r",
+                                "input_schema": {"type": "object"}}]
+    monkeypatch.setattr(chat_tool_loader, "get_tool_defs_for_api", lambda: defs)
+    set_confirmation_handler(None)
+    names = {t["name"] for t in invocation._select_chat_tools(200_000)}
+    assert "budget_control" not in names and "read_file" in names
+    set_confirmation_handler(lambda n, i: True)
+    try:
+        names = {t["name"] for t in invocation._select_chat_tools(200_000)}
+    finally:
+        set_confirmation_handler(None)
+    assert "budget_control" in names
+
+
 def test_seed_budget_control_declares_confirmation():
     from pathlib import Path
     from carpenter.chat_tool_loader import load_chat_tools

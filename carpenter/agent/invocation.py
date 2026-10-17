@@ -207,9 +207,15 @@ def _select_chat_tools(context_budget: int | None = None) -> list[dict]:
     if context_budget is None:
         context_budget = _DEFAULT_CONTEXT_WINDOW
 
-    from ..chat_tool_loader import get_tool_defs_for_api, get_always_available_names
+    from ..chat_tool_loader import (
+        get_tool_defs_for_api, get_always_available_names, get_confirmation_handler,
+    )
 
     tool_defs = get_tool_defs_for_api()
+    # Without a confirmation handler, operator-only tools are refused at
+    # dispatch; don't offer them.
+    if get_confirmation_handler() is None:
+        tool_defs = _drop_operator_only_tools(tool_defs)
     registry_core = get_always_available_names()
 
     # For small context windows, use a minimal core set (5 tools) to leave
@@ -2387,7 +2393,7 @@ def _dispatch_chat_tool_call(
             f"Error: '{tool_name}' is operator-only. Every call needs a human "
             "to confirm it, and this platform has no confirmation handler, so "
             "the chat agent cannot run it. Tell the user they can run "
-            f"`{OPERATOR_ONLY_ALTERNATIVES[tool_name]}` themselves."
+            f"`{OPERATOR_ONLY_ALTERNATIVES.get(tool_name, 'the operator CLI')}` themselves."
         )
     if confirmation_handler is None:
         logger.warning(
@@ -2682,11 +2688,10 @@ def invoke_for_chat(
     # code-generation via submit_code.
     if _is_arc:
         tools = _maybe_add_reviewer_emit_tool(tools, _executor_arc_id)
-    # Operator-only tools are refused at dispatch for arc agents, and for
-    # everyone when no confirmation handler is registered; don't offer them
-    # in either case.
-    from ..chat_tool_loader import get_confirmation_handler as _get_confirm
-    if _is_arc or _get_confirm() is None:
+    # Operator-only tools are refused at dispatch for arc agents; don't
+    # offer them.  (_select_chat_tools already drops them for everyone
+    # when no confirmation handler is registered.)
+    if _is_arc:
         tools = _drop_operator_only_tools(tools)
 
     collected_text = []

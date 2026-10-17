@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sqlite3
 import sys
 
 
@@ -56,13 +57,20 @@ def cmd_budget(argv: list[str]) -> int:
             file=sys.stderr,
         )
         return 1
-    conn = get_db()
     try:
-        has_table = conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='budget_state'"
-        ).fetchone()
-    finally:
-        conn.close()
+        conn = get_db()
+        try:
+            has_table = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='budget_state'"
+            ).fetchone()
+        finally:
+            conn.close()
+    except sqlite3.Error as e:
+        print(
+            f"ERROR: cannot open {db_path}: {e}. Run this as the server's user.",
+            file=sys.stderr,
+        )
+        return 1
     if not has_table:
         print(
             f"ERROR: {db_path} has no budget_state table; start the server "
