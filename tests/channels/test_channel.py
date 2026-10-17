@@ -162,3 +162,109 @@ class TestChannelBindingsSchema:
         """conversations table should have channel_type column."""
         cols = {row[1] for row in db.execute("PRAGMA table_info(conversations)").fetchall()}
         assert "channel_type" in cols
+
+
+class TestRunAndRespond:
+    """_run_and_respond sends this turn's reply, never an earlier one."""
+
+    @staticmethod
+    def _conv_with_earlier_reply():
+        from carpenter.agent import conversation
+        conv_id = conversation.create_conversation()
+        conversation.add_message(conv_id, "user", "First question")
+        conversation.add_message(conv_id, "assistant", "First answer")
+        conversation.add_message(conv_id, "user", "Second question")
+        return conv_id
+
+    async def test_sends_reply_identified_by_message_id(self, db):
+        from carpenter.agent import conversation
+        conv_id = self._conv_with_earlier_reply()
+        channel = DummyChannel()
+
+        def fake_invoke(*args, **kwargs):
+            msg_id = conversation.add_message(conv_id, "assistant", "Second answer")
+            # A later assistant row must not be picked up instead.
+            conversation.add_message(conv_id, "assistant", "Unrelated later row")
+            return {"conversation_id": conv_id, "response_text": "Second answer",
+                    "code": None, "message_id": msg_id}
+
+        with patch("carpenter.agent.invocation.invoke_for_chat", side_effect=fake_invoke):
+            await channel._run_and_respond("Second question", conv_id)
+
+        assert [t for _, t, _ in channel.sent_messages] == ["Second answer"]
+
+    async def test_model_error_does_not_resend_previous_reply(self, db):
+        from carpenter.agent import conversation
+        from carpenter.channels.channel import FAILURE_NOTICE
+        conv_id = self._conv_with_earlier_reply()
+        channel = DummyChannel()
+
+        def fake_invoke(*args, **kwargs):
+            # What invoke_for_chat does when the model call fails.
+            msg_id = conversation.add_message(conv_id, "system", "Provider unavailable")
+            return {"conversation_id": conv_id, "response_text": "Provider unavailable",
+                    "code": None, "message_id": msg_id, "error": None}
+
+        with patch("carpenter.agent.invocation.invoke_for_chat", side_effect=fake_invoke):
+            await channel._run_and_respond("Second question", conv_id)
+
+        assert [t for _, t, _ in channel.sent_messages] == [FAILURE_NOTICE]
+
+    async def test_no_reply_message_sends_failure_notice(self, db):
+        from carpenter.channels.channel import FAILURE_NOTICE
+        conv_id = self._conv_with_earlier_reply()
+        channel = DummyChannel()
+
+        with patch("carpenter.agent.invocation.invoke_for_chat",
+                   return_value={"conversation_id": conv_id, "response_text": "x",
+                                 "code": None, "message_id": None}):
+            await channel._run_and_respond("Second question", conv_id)
+
+        assert [t for _, t, _ in channel.sent_messages] == [FAILURE_NOTICE]
+
+    async def test_non_assistant_message_id_sends_failure_notice(self, db):
+        from carpenter.agent import conversation
+        from carpenter.channels.channel import FAILURE_NOTICE
+        conv_id = self._conv_with_earlier_reply()
+        channel = DummyChannel()
+
+        def fake_invoke(*args, **kwargs):
+            msg_id = conversation.add_message(conv_id, "tool_call", "")
+            return {"conversation_id": conv_id, "response_text": "",
+                    "code": None, "message_id": msg_id}
+
+        with patch("carpenter.agent.invocation.invoke_for_chat", side_effect=fake_invoke):
+            await channel._run_and_respond("Second question", conv_id)
+
+        assert [t for _, t, _ in channel.sent_messages] == [FAILURE_NOTICE]
+
+    async def test_exception_saves_and_sends_apology(self, db):
+        from carpenter.agent import conversation
+        from carpenter.channels.channel import FAILURE_NOTICE
+        conv_id = self._conv_with_earlier_reply()
+        channel = DummyChannel()
+
+        with patch("carpenter.agent.invocation.invoke_for_chat",
+                   side_effect=RuntimeError("boom")):
+            await channel._run_and_respond("Second question", conv_id)
+
+        assert [t for _, t, _ in channel.sent_messages] == [FAILURE_NOTICE]
+        last = conversation.get_messages(conv_id)[-1]
+        assert (last["role"], last["content"]) == ("assistant", FAILURE_NOTICE)
+
+    async def test_reply_is_formatted_for_channel(self, db):
+        from carpenter.agent import conversation
+        conv_id = self._conv_with_earlier_reply()
+        channel = DummyChannel()
+
+        def fake_invoke(*args, **kwargs):
+            msg_id = conversation.add_message(conv_id, "assistant", "Answer")
+            return {"conversation_id": conv_id, "message_id": msg_id}
+
+        with patch("carpenter.agent.invocation.invoke_for_chat", side_effect=fake_invoke), \
+             patch("carpenter.channels.formatting.format_for_channel",
+                   return_value="FORMATTED") as fmt:
+            await channel._run_and_respond("Second question", conv_id)
+
+        fmt.assert_called_once_with("Answer", "test")
+        assert [t for _, t, _ in channel.sent_messages] == ["FORMATTED"]
