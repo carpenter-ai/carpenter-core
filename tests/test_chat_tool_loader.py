@@ -266,6 +266,86 @@ class TestHotReload:
         assert get_total_count() == original_count
 
 
+class TestReloadKeepsExtensionTools:
+    """Hot reload rebuilds file tools without dropping extension tools."""
+
+    def _setup(self, tmp_path):
+        import carpenter.chat_tool_loader as loader
+        from carpenter.chat_tool_loader import register_extension_tool
+
+        target = str(tmp_path / "ct")
+        install_chat_tool_defaults(target)
+        load_chat_tools(target)
+        register_extension_tool(
+            name="pkg_example_read",
+            description="Extension tool from a package",
+            input_schema={"type": "object", "properties": {}, "required": []},
+            handler=lambda tool_input, **kw: "from package",
+        )
+        register_extension_tool(
+            name="pkg_example_send",
+            description="Opted-in write tool from a package",
+            input_schema={"type": "object", "properties": {}, "required": []},
+            handler=lambda tool_input, **kw: "sent",
+            capabilities=["external_effect"],
+            allow_write_caps=True,
+        )
+        loader._chat_tools_dir = target
+        return Path(target)
+
+    def test_extension_tools_survive_reload(self, tmp_path):
+        target = self._setup(tmp_path)
+        (target / "extra.py").write_text(
+            "from carpenter.chat_tool_loader import chat_tool\n"
+            "@chat_tool(description='x', input_schema={'type': 'object', "
+            "'properties': {}, 'required': []})\n"
+            "def extra_tool(tool_input, **kwargs):\n"
+            "    return 'extra'\n"
+        )
+        _check_and_reload()
+        assert get_handler("extra_tool") is not None
+        assert get_handler("pkg_example_read")({}) == "from package"
+        # The opted-in write tool is not re-validated without its opt-in.
+        assert get_handler("pkg_example_send")({}) == "sent"
+
+    def test_file_tool_wins_name_clash_on_reload(self, tmp_path):
+        target = self._setup(tmp_path)
+        (target / "clash.py").write_text(
+            "from carpenter.chat_tool_loader import chat_tool\n"
+            "@chat_tool(description='x', input_schema={'type': 'object', "
+            "'properties': {}, 'required': []})\n"
+            "def pkg_example_read(tool_input, **kwargs):\n"
+            "    return 'from file'\n"
+        )
+        _check_and_reload()
+        assert get_handler("pkg_example_read")({}) == "from file"
+
+    def test_extension_tool_restored_when_shadowing_file_is_deleted(self, tmp_path):
+        target = self._setup(tmp_path)
+        clash = target / "clash.py"
+        clash.write_text(
+            "from carpenter.chat_tool_loader import chat_tool\n"
+            "@chat_tool(description='x', input_schema={'type': 'object', "
+            "'properties': {}, 'required': []})\n"
+            "def pkg_example_read(tool_input, **kwargs):\n"
+            "    return 'from file'\n"
+        )
+        _check_and_reload()
+        assert get_handler("pkg_example_read")({}) == "from file"
+        clash.unlink()
+        _check_and_reload()
+        assert get_handler("pkg_example_read")({}) == "from package"
+
+    def test_full_load_drops_extension_tools(self, tmp_path):
+        """A full load starts over; extensions re-register after it."""
+        target = self._setup(tmp_path)
+        load_chat_tools(str(target))
+        assert get_handler("pkg_example_read") is None
+        (target / "extra.py").write_text("x = 1\n")
+        _check_and_reload()
+        assert get_handler("pkg_example_read") is None
+
+
 class TestLoadedToolDataclass:
     """Test LoadedTool properties."""
 
