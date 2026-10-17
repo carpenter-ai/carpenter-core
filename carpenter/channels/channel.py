@@ -180,8 +180,7 @@ class ChannelConnector(Connector):
         except Exception:
             logger.exception("Channel invocation failed for conv %s", conv_id)
             try:
-                from ..agent import conversation as conv_mod
-                conv_mod.add_message(conv_id, "assistant", FAILURE_NOTICE)
+                conversation.add_message(conv_id, "assistant", FAILURE_NOTICE)
             except Exception:
                 logger.exception("Failed to save error message")
             try:

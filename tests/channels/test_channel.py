@@ -238,6 +238,21 @@ class TestRunAndRespond:
 
         assert [t for _, t, _ in channel.sent_messages] == [FAILURE_NOTICE]
 
+    async def test_empty_assistant_reply_sends_failure_notice(self, db):
+        from carpenter.agent import conversation
+        from carpenter.channels.channel import FAILURE_NOTICE
+        conv_id = self._conv_with_earlier_reply()
+        channel = DummyChannel()
+
+        def fake_invoke(*args, **kwargs):
+            msg_id = conversation.add_message(conv_id, "assistant", "  ")
+            return {"conversation_id": conv_id, "message_id": msg_id}
+
+        with patch("carpenter.agent.invocation.invoke_for_chat", side_effect=fake_invoke):
+            await channel._run_and_respond("Second question", conv_id)
+
+        assert [t for _, t, _ in channel.sent_messages] == [FAILURE_NOTICE]
+
     async def test_exception_saves_and_sends_apology(self, db):
         from carpenter.agent import conversation
         from carpenter.channels.channel import FAILURE_NOTICE
