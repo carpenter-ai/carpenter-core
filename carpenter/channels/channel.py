@@ -151,33 +151,67 @@ class ChannelConnector(Connector):
         return conv_id
 
     async def _run_and_respond(self, user_message: str, conv_id: int) -> None:
-        """Run AI invocation and deliver the response via send_message."""
+        """Run AI invocation and deliver this turn's reply via send_message.
+
+        The reply is the message ``invoke_for_chat`` reports for this turn
+        (its ``message_id``), not the latest assistant row in the history:
+        when a turn fails, the latest assistant row belongs to an earlier
+        turn. A turn that fails, or ends without a reply to deliver, sends
+        a short failure notice instead.
+        """
         from ..agent import invocation, conversation
 
         try:
-            await asyncio.to_thread(
+            result = await asyncio.to_thread(
                 invocation.invoke_for_chat,
                 user_message,
                 conversation_id=conv_id,
                 _message_already_saved=True,
             )
 
-            # Get the latest assistant message to send back
-            messages = conversation.get_messages(conv_id)
-            assistant_msgs = [m for m in messages if m["role"] == "assistant"]
-            if assistant_msgs:
-                latest = assistant_msgs[-1]
+            reply = _turn_reply(conv_id, result)
+            if reply is None:
+                await self.send_message(conv_id, FAILURE_NOTICE)
+            else:
                 from .formatting import format_for_channel
-                formatted = format_for_channel(latest["content"], self.channel_type)
+                formatted = format_for_channel(reply, self.channel_type)
                 await self.send_message(conv_id, formatted)
 
         except Exception:
             logger.exception("Channel invocation failed for conv %s", conv_id)
             try:
-                from ..agent import conversation as conv_mod
-                conv_mod.add_message(
-                    conv_id, "assistant",
-                    "Sorry, an error occurred while processing your message.",
-                )
+                conversation.add_message(conv_id, "assistant", FAILURE_NOTICE)
             except Exception:
                 logger.exception("Failed to save error message")
+            try:
+                await self.send_message(conv_id, FAILURE_NOTICE)
+            except Exception:
+                logger.exception("Failed to send error message")
+
+
+# Sent when a turn fails or produces no reply. Deliberately generic: error
+# details stay in the conversation history, not in the external channel.
+FAILURE_NOTICE = "Sorry, an error occurred while processing your message."
+
+
+def _turn_reply(conv_id: int, result: dict | None) -> str | None:
+    """Return the reply text for one ``invoke_for_chat`` result, or None.
+
+    None means there is nothing to deliver: the invocation reported an
+    error, or its ``message_id`` is missing, is not an assistant message,
+    or has no text.
+    """
+    from ..agent import conversation
+
+    if not isinstance(result, dict) or "error" in result:
+        return None
+    message_id = result.get("message_id")
+    if message_id is None:
+        return None
+    for msg in conversation.get_messages(conv_id):
+        if msg["id"] == message_id:
+            if msg["role"] != "assistant":
+                return None
+            text = msg.get("content") or ""
+            return text if text.strip() else None
+    return None
