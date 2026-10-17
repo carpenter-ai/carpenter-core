@@ -154,3 +154,27 @@ def test_no_token_leaves_clean_urls():
     assert 'UI_TOKEN = ""' in body
 
 
+
+
+def test_system_message_newlines_rendered_as_breaks():
+    """Multi-line system messages keep their line breaks, escaped first."""
+    conv_id = conversation.create_conversation()
+    conversation.add_message(
+        conv_id, "system",
+        "Arc finished.\nSee <b>results</b>\nReview: /api/review/abc-123",
+    )
+
+    client = _client()
+    response = client.get(f"/api/chat/messages?c={conv_id}")
+    assert response.status_code == 200
+    body = response.text
+    assert "Arc finished.<br>See &lt;b&gt;results&lt;/b&gt;<br>Review: " in body
+    assert '<a href="/api/review/abc-123"' in body
+    assert "<b>results</b>" not in body
+
+
+def test_system_message_escaped_before_breaks():
+    """Markup in a system message cannot forge a line break."""
+    from carpenter.api.ui import _render_system_content
+
+    assert _render_system_content("a<br>b\nc") == "a&lt;br&gt;b<br>c"

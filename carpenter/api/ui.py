@@ -68,7 +68,11 @@ def _render_content(text: str) -> str:
 
 
 def _render_system_content(text: str) -> str:
-    """Render system message content, turning review URLs into clickable links."""
+    """Render system message content.
+
+    Text is escaped first, then relative review URLs become clickable
+    links and newlines become ``<br>``, as for regular messages.
+    """
     escaped = _escape_html(text)
     # Turn relative review URLs into clickable links
     escaped = re.sub(
@@ -76,7 +80,7 @@ def _render_system_content(text: str) -> str:
         r'<a href="\1" target="_blank" style="color:#66d9ef;text-decoration:underline;">\1</a>',
         escaped,
     )
-    return escaped
+    return escaped.replace("\n", "<br>")
 
 
 def _render_message(msg: dict) -> str:
