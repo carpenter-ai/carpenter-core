@@ -200,6 +200,13 @@ needs.  Packages **cannot** declare platform-boundary capabilities
 (e.g. `db_admin`, `judge_internal`); the security validator
 rejects them at install time.
 
+**Verbatim replies.** A tool whose result should reach the user
+exactly as written (for example an "order submitted" acknowledgement)
+can return `FinalReply(text)` instead of a plain string. The text
+becomes the reply for the turn and the model is not called again to
+rephrase it. Return a plain string on errors so the model can explain
+them. See [`docs/tool-final-reply.md`](tool-final-reply.md).
+
 ### 4.2 Data models (`data_models:`)
 
 A data model is a `@dataclass` whose instances are passed to JUDGE

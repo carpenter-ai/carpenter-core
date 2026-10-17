@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .. import config, constants
+from ..chat_tool_loader import FinalReply
 from ..core import code_manager
 from ..db import get_db, db_connection, db_transaction
 from . import templates, conversation, model_resolver, api_standard, error_classifier
@@ -2302,6 +2303,11 @@ def _build_message_id_map(
     return result[:len(api_messages)]
 
 
+def _is_final_reply(result) -> bool:
+    """True if a tool result is a non-empty :class:`FinalReply`."""
+    return isinstance(result, FinalReply) and bool(result.strip())
+
+
 def _dispatch_chat_tool_call(
     tool_name: str,
     tool_input: dict,
@@ -2785,6 +2791,7 @@ def invoke_for_chat(
         tool_result_blocks = []
         tool_result_map = {}  # tool_use_id -> result text
         tool_timing_map = {}  # tool_use_id -> duration_ms
+        final_replies = []  # FinalReply texts, in tool_use order
         for block in content:
             if block.get("type") != "tool_use":
                 continue
@@ -2804,6 +2811,13 @@ def invoke_for_chat(
 
             t_end = time.monotonic()
             tool_timing_map[tool_id] = int((t_end - t_start) * 1000)
+
+            # A tool that returned FinalReply supplies this turn's reply.
+            # Capture it before truncation, which returns a plain str.
+            # Chat turns only: an arc step must keep running until the
+            # model finishes the step, so there it is a plain result.
+            if not _is_arc and _is_final_reply(result_str):
+                final_replies.append(str(result_str))
 
             # Truncate large tool outputs to protect the context window
             result_str = _truncate_tool_output(
@@ -2858,6 +2872,24 @@ def invoke_for_chat(
         db_message_ids.append(None)
 
         last_msg_id = assistant_msg_id
+
+        # Final-reply short-circuit: a tool returned FinalReply, so its text
+        # is the reply for this turn, verbatim. Every tool_use in the batch
+        # already has its tool_result persisted above, so the stored history
+        # stays well-formed; the reply follows as an ordinary assistant
+        # message. No further model call is made.
+        if final_replies:
+            reply_text = "\n\n".join(final_replies)
+            collected_text.append(reply_text)
+            last_msg_id = conversation.add_message(
+                conv_id, "assistant", reply_text,
+            )
+            logger.info(
+                "Ending turn with tool-supplied final reply from %s",
+                tool_names_used,
+            )
+            last_stop_reason = "end_turn"
+            break
 
         # Async tool short-circuit: if every tool in this turn is async
         # (results arrive later via arc.chat_notify) AND the model already
