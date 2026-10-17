@@ -270,10 +270,11 @@ def _select_chat_tools(context_budget: int | None = None) -> list[dict]:
 
 
 def _drop_operator_only_tools(tools: list[dict]) -> list[dict]:
-    """Remove operator-only tools from an arc agent's tool set.
+    """Remove operator-only tools from an agent's offered tool set.
 
-    Dispatch refuses them for arc agents anyway; not offering them keeps
-    the agent from trying.
+    Used for arc agents, and for the chat agent when no confirmation
+    handler is registered.  Dispatch refuses the calls in both cases
+    anyway; not offering them keeps the agent from trying.
     """
     from ..chat_tool_registry import OPERATOR_ONLY_TOOLS
     return [t for t in tools if t["name"] not in OPERATOR_ONLY_TOOLS]
@@ -2681,6 +2682,11 @@ def invoke_for_chat(
     # code-generation via submit_code.
     if _is_arc:
         tools = _maybe_add_reviewer_emit_tool(tools, _executor_arc_id)
+    # Operator-only tools are refused at dispatch for arc agents, and for
+    # everyone when no confirmation handler is registered; don't offer them
+    # in either case.
+    from ..chat_tool_loader import get_confirmation_handler as _get_confirm
+    if _is_arc or _get_confirm() is None:
         tools = _drop_operator_only_tools(tools)
 
     collected_text = []

@@ -153,6 +153,26 @@ def test_cli_set_threshold(capsys):
     assert "expires_at" in overrides["kill"]
 
 
+def test_cli_refuses_missing_database(tmp_path, monkeypatch, capsys):
+    """Wrong user or config: refuse, and never create an empty database."""
+    from carpenter.cli_budget import cmd_budget
+    missing = tmp_path / "nope" / "platform.db"
+    monkeypatch.setitem(config.CONFIG, "database_path", str(missing))
+    assert cmd_budget(["disable"]) == 1
+    assert "no Carpenter database" in capsys.readouterr().err
+    assert not missing.exists()
+
+
+def test_cli_refuses_uninitialised_database(tmp_path, monkeypatch, capsys):
+    import sqlite3
+    from carpenter.cli_budget import cmd_budget
+    empty = tmp_path / "empty.db"
+    sqlite3.connect(empty).close()
+    monkeypatch.setitem(config.CONFIG, "database_path", str(empty))
+    assert cmd_budget(["resume"]) == 1
+    assert "budget_state" in capsys.readouterr().err
+
+
 def test_cli_rejects_unknown_command(capsys):
     from carpenter.cli_budget import cmd_budget
     assert cmd_budget(["bogus"]) == 2

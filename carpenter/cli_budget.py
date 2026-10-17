@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 
 
@@ -39,10 +40,37 @@ def cmd_budget(argv: list[str]) -> int:
     except SystemExit as e:
         return int(e.code or 0)
 
-    from .db import init_db
+    from . import config
     from .core import budget
+    from .db import get_db
 
-    init_db()
+    # Never create a database here: run as the wrong user or with the wrong
+    # config, sqlite would make an empty one and every command would
+    # "succeed" against it while the server's breaker stays untouched.
+    db_path = config.CONFIG.get("database_path", "")
+    if not db_path or not os.path.isfile(db_path):
+        print(
+            f"ERROR: no Carpenter database at {db_path or '(database_path unset)'}. "
+            "Run this as the server's user with the server's config "
+            "(CARPENTER_CONFIG).",
+            file=sys.stderr,
+        )
+        return 1
+    conn = get_db()
+    try:
+        has_table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='budget_state'"
+        ).fetchone()
+    finally:
+        conn.close()
+    if not has_table:
+        print(
+            f"ERROR: {db_path} has no budget_state table; start the server "
+            "once to initialise it.",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"Database: {db_path}", file=sys.stderr)
     if args.command == "status":
         print(json.dumps(budget.status(), indent=2, default=str))
     elif args.command == "resume":
