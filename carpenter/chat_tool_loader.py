@@ -299,8 +299,10 @@ class LoadedTool:
 _loaded_tools: dict[str, LoadedTool] = {}
 # Tools registered through register_extension_tool (capability packages,
 # platform layers), kept apart from _loaded_tools.  They have no file in the
-# chat tools directory, so a hot reload re-adds them from here; a file tool
-# of the same name shadows one only while that file exists.
+# chat tools directory, so a hot reload re-adds them from here.  A name
+# already taken at registration is refused (the package registry reports it
+# as a collision), so only a file tool added later can shadow one, and only
+# while that file exists.
 _extension_tools: dict[str, LoadedTool] = {}
 _mtimes: dict[str, float] = {}
 _chat_tools_dir: str = ""
@@ -681,8 +683,14 @@ def _check_and_reload():
     # wins while it exists; once that file is gone the extension tool is
     # back.
     for name, tool in _extension_tools.items():
-        if name not in new_tools:
-            new_tools[name] = tool
+        if name in new_tools:
+            logger.warning(
+                "Chat tool file defines %r, shadowing the registered "
+                "extension tool of that name until the file tool is removed",
+                name,
+            )
+            continue
+        new_tools[name] = tool
 
     # Diff for logging
     old_names = set(_loaded_tools.keys())
