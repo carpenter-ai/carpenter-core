@@ -7,6 +7,8 @@ from pathlib import Path
 import pytest
 
 from carpenter.chat_tool_loader import (
+    SEED_RECORD_NAME,
+    _CHAT_TOOL_DEFAULTS_DIR,
     LoadedTool,
     chat_tool,
     install_chat_tool_defaults,
@@ -22,6 +24,8 @@ from carpenter.chat_tool_loader import (
     WRITE_CAPABILITIES,
 )
 from carpenter.chat_tool_registry import PLATFORM_TOOLS, validate_tool_defs
+
+SEED_DIR = Path(_CHAT_TOOL_DEFAULTS_DIR)
 
 
 class TestDecorator:
@@ -115,12 +119,102 @@ class TestInstallDefaults:
         assert result["copied"] > 0
         assert os.path.isdir(target)
 
-    def test_install_skips_existing(self, tmp_path):
-        """Doesn't overwrite existing directory."""
+    def test_second_run_is_a_no_op(self, tmp_path):
+        """A current install copies nothing and reports no drift."""
         target = str(tmp_path / "fresh_chat_tools")
-        os.makedirs(target)
+        install_chat_tool_defaults(target)
         result = install_chat_tool_defaults(target)
-        assert result["status"] == "exists"
+        assert result == {"status": "exists", "copied": 0, "drifted": []}
+
+    def test_adds_new_seed_files_to_existing_install(self, tmp_path):
+        """A seed module missing from an older install is added on start."""
+        target = tmp_path / "ct"
+        install_chat_tool_defaults(str(target))
+        # Simulate an install made before budget.py shipped: the file and
+        # its record entry are both absent.
+        (target / "budget.py").unlink()
+        record = target / SEED_RECORD_NAME
+        record.write_text(
+            "".join(
+                line + "\n" for line in record.read_text().splitlines()
+                if line != "budget.py"
+            )
+        )
+        result = install_chat_tool_defaults(str(target))
+        assert result["status"] == "installed"
+        assert result["copied"] == 1
+        assert (target / "budget.py").is_file()
+
+    def test_existing_install_without_record_gets_missing_files(self, tmp_path, caplog):
+        """An install from before the record existed gains every missing tool."""
+        target = tmp_path / "ct"
+        target.mkdir()
+        (target / "utilities.py").write_text(
+            (SEED_DIR / "utilities.py").read_text()
+        )
+        with caplog.at_level("WARNING", logger="carpenter.chat_tool_loader"):
+            result = install_chat_tool_defaults(str(target))
+        assert "existing install" in caplog.text and "budget.py" in caplog.text
+        seed_names = {p.name for p in SEED_DIR.glob("*.py")}
+        assert {p.name for p in target.glob("*.py")} == seed_names
+        assert result["copied"] == len(seed_names) - 1
+        assert result["drifted"] == []
+
+    def test_never_overwrites_edited_file(self, tmp_path, caplog):
+        """An edited module is kept, reported as drifted and logged."""
+        target = tmp_path / "ct"
+        install_chat_tool_defaults(str(target))
+        edited = "# local edit\n" + (SEED_DIR / "arcs.py").read_text()
+        (target / "arcs.py").write_text(edited)
+        with caplog.at_level("WARNING", logger="carpenter.chat_tool_loader"):
+            result = install_chat_tool_defaults(str(target))
+        assert (target / "arcs.py").read_text() == edited
+        assert result["drifted"] == ["arcs.py"]
+        assert result["copied"] == 0
+        assert "arcs.py" in caplog.text
+
+    def test_deleted_tool_is_not_reinstalled(self, tmp_path):
+        """Deleting an installed seed module disables it for good."""
+        target = tmp_path / "ct"
+        install_chat_tool_defaults(str(target))
+        (target / "budget.py").unlink()
+        result = install_chat_tool_defaults(str(target))
+        assert result["copied"] == 0
+        assert not (target / "budget.py").exists()
+
+    def test_deleted_drifted_tool_is_not_reinstalled(self, tmp_path):
+        """A module the operator edited and then deleted stays deleted."""
+        target = tmp_path / "ct"
+        install_chat_tool_defaults(str(target))
+        (target / "budget.py").write_text("# local edit\n")
+        assert install_chat_tool_defaults(str(target))["drifted"] == ["budget.py"]
+        (target / "budget.py").unlink()
+        result = install_chat_tool_defaults(str(target))
+        assert result == {"status": "exists", "copied": 0, "drifted": []}
+        assert not (target / "budget.py").exists()
+
+    def test_error_path(self, tmp_path, monkeypatch):
+        """A write failure returns status error and leaves no partial module."""
+        import carpenter.chat_tool_loader as ctl
+        target = tmp_path / "ct"
+
+        def fail(*args, **kwargs):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(ctl.os, "replace", fail)
+        result = install_chat_tool_defaults(str(target))
+        assert result["status"] == "error"
+        assert "disk full" in result["error"]
+        assert result["copied"] == 0
+        assert list(target.iterdir()) == []
+
+    def test_record_is_not_loaded_as_a_module(self, tmp_path):
+        """The record file sits beside the modules without being imported."""
+        target = tmp_path / "ct"
+        install_chat_tool_defaults(str(target))
+        assert (target / SEED_RECORD_NAME).is_file()
+        tools = load_chat_tools(str(target))
+        assert "read_file" in tools
 
 
 class TestLoadChatTools:

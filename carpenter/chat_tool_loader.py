@@ -6,6 +6,7 @@ Provides:
   - Module importer that collects decorated functions from ``config/chat_tools/``
   - Hot-reload via heartbeat hook (mtime polling)
   - ``install_chat_tool_defaults()`` to seed user config from ``config_seed/chat_tools/``
+    (new seed files are added on every start; edited files are never overwritten)
 
 Platform tools (submit_code, escalate, escalate_current_arc) are injected separately
 and cannot be overridden by user config modules.
@@ -17,6 +18,7 @@ import logging
 import os
 import shutil
 import sys
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -314,27 +316,129 @@ _confirmation_handler: Callable[[str, dict], bool] | None = None
 
 # ── Install defaults ───────────────────────────────────────────────
 
+# Name of the record, kept in the chat tools directory, of every seed file
+# ever installed there.  A seed file named in it is never copied again, so
+# deleting a tool module disables it for good.  Not a ``*.py`` file, so the
+# loader never imports it.
+SEED_RECORD_NAME = ".seed-installed"
+
+
+def _read_seed_record(chat_tools_dir: Path) -> set[str]:
+    try:
+        text = (chat_tools_dir / SEED_RECORD_NAME).read_text()
+    except OSError:
+        return set()
+    names = (line.strip() for line in text.splitlines())
+    return {n for n in names if n and not n.startswith("#")}
+
+
+def _atomic_write(dst: Path, data: bytes, stat_from: Path | None = None) -> None:
+    """Write ``data`` to ``dst`` through a temp file and ``os.replace``.
+
+    A crash mid-write leaves either the old file or no file, never a
+    truncated module that would fail to import at the next start.  The
+    temp name does not end in ``.py``, so the loader never picks it up.
+    """
+    fd, tmp = tempfile.mkstemp(dir=dst.parent, prefix=f".{dst.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        if stat_from is not None:
+            shutil.copystat(stat_from, tmp)
+        os.replace(tmp, dst)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _write_seed_record(chat_tools_dir: Path, names: set[str]) -> None:
+    _atomic_write(
+        chat_tools_dir / SEED_RECORD_NAME,
+        (
+            "# Seed chat tool files installed here once. A file listed here is\n"
+            "# not reinstalled if you delete it.\n"
+            + "".join(f"{n}\n" for n in sorted(names))
+        ).encode(),
+    )
+
+
 def install_chat_tool_defaults(chat_tools_dir: str) -> dict:
-    """Copy config_seed/chat_tools/ to user dir on first install.
+    """Install seed chat tools into the user's chat tools directory.
+
+    On first install the whole of ``config_seed/chat_tools/`` is copied.
+    On every later start, a seed module that has never been installed here
+    is added, so tools introduced by a newer release reach existing
+    deployments.  Nothing is ever overwritten: a module that is present but
+    differs from the seed is the user's to keep, and is reported in
+    ``drifted`` (and logged as a warning) so the operator can review the
+    newer seed.  A seed module that was installed once and later deleted is
+    not reinstalled; see ``SEED_RECORD_NAME``.
 
     Returns:
-        {"status": "installed"|"exists"|"no_defaults", "copied": int}
+        {"status": "installed"|"exists"|"no_defaults"|"error",
+         "copied": int, "drifted": [filenames]}
     """
-    if os.path.isdir(chat_tools_dir):
-        return {"status": "exists", "copied": 0}
+    target = Path(chat_tools_dir)
+    seed_dir = Path(_CHAT_TOOL_DEFAULTS_DIR)
+    if not seed_dir.is_dir():
+        logger.warning("Chat tool defaults directory not found: %s", seed_dir)
+        return {"status": "no_defaults", "copied": 0, "drifted": []}
 
-    if not os.path.isdir(_CHAT_TOOL_DEFAULTS_DIR):
-        logger.warning("Chat tool defaults directory not found: %s", _CHAT_TOOL_DEFAULTS_DIR)
-        return {"status": "no_defaults", "copied": 0}
-
+    seed_files = sorted(p for p in seed_dir.glob("*.py") if p.is_file())
+    existing_install = target.is_dir()
     try:
-        shutil.copytree(_CHAT_TOOL_DEFAULTS_DIR, chat_tools_dir)
-        count = sum(1 for _ in Path(chat_tools_dir).glob("*.py") if _.name != "__init__.py")
-        logger.info("Installed chat tool defaults: %d files to %s", count, chat_tools_dir)
-        return {"status": "installed", "copied": count}
+        target.mkdir(parents=True, exist_ok=True)
+        recorded = _read_seed_record(target)
+        record = set(recorded)
+        copied: list[str] = []
+        drifted: list[str] = []
+        for src in seed_files:
+            dst = target / src.name
+            if dst.exists():
+                if src.read_bytes() != dst.read_bytes():
+                    drifted.append(src.name)
+            elif src.name not in recorded:
+                _atomic_write(dst, src.read_bytes(), stat_from=src)
+                copied.append(src.name)
+            record.add(src.name)
+        if record != recorded:
+            _write_seed_record(target, record)
     except OSError as e:
         logger.error("Failed to install chat tool defaults: %s", e)
-        return {"status": "error", "error": str(e), "copied": 0}
+        return {"status": "error", "error": str(e), "copied": 0, "drifted": []}
+
+    if copied and existing_install:
+        # New tools in an existing install change what the agent can do, and
+        # an install from before the record existed also regains any seed
+        # module the operator had deleted; say so where it will be seen.
+        logger.warning(
+            "Added %d seed chat tool file(s) to existing install %s: %s. "
+            "Delete any you do not want; a deleted seed module is not "
+            "reinstalled (see %s).",
+            len(copied), target, ", ".join(copied), SEED_RECORD_NAME,
+        )
+    elif copied:
+        logger.info(
+            "Installed %d seed chat tool file(s) to %s: %s",
+            len(copied), target, ", ".join(copied),
+        )
+    if drifted:
+        logger.warning(
+            "%d chat tool file(s) in %s differ from this release's seed and "
+            "were left as they are: %s. A newer seed can carry security "
+            "fixes; compare each with %s and merge what you need.",
+            len(drifted), target, ", ".join(drifted), seed_dir,
+        )
+    return {
+        "status": "installed" if copied else "exists",
+        "copied": len(copied),
+        "drifted": drifted,
+    }
 
 
 # ── Module loading ─────────────────────────────────────────────────
