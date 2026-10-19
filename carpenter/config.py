@@ -506,7 +506,37 @@ DEFAULTS = {
     #         imap-inbound-poll:
     #           enabled: false
     # Read at trigger install/startup, so a change needs a restart.
-    "packages": {},
+    #
+    # Two keys in this mapping are RESERVED (they configure the package
+    # framework itself, not a package called "sources" or "search_order"):
+    #
+    # ``sources`` — the operator's package source registry: a list of
+    #   ``{name, url, subdir_template, credential_ref}`` entries.
+    #     * ``name`` is the alias ``search_order`` refers to.
+    #     * ``url`` is a ``git+https://host/org/repo.git`` repository or an
+    #       ``https://host/path/pkg.tar.gz`` archive (see
+    #       ``carpenter/packages/sources.py`` for the full grammar).  It may
+    #       NOT contain a ``{name}`` placeholder.
+    #     * ``subdir_template`` (optional) locates the package root inside
+    #       the fetched tree and may use ``{name}``, e.g. ``packages/{name}``
+    #       — that is how a monorepo of many packages is addressed.  Absent
+    #       means the repository/archive root IS the package.
+    #     * ``credential_ref`` (optional) is the NAME of a platform-provided
+    #       environment variable holding a read token for a private source.
+    #       A name, never a value; a package may not supply it.
+    # ``search_order`` — alias names, tried in order when a bare package
+    #   name is installed.  Empty (the default) keeps the pre-registry
+    #   behaviour: a bare name resolves to the local source tree.
+    #
+    # A malformed entry is refused with a clear error rather than skipped,
+    # so a typo cannot silently change which remote a package comes from.
+    # Note the YAML layer replaces this whole mapping (precedence is
+    # shallow), so a config.yaml that sets per-package overrides must keep
+    # ``sources`` / ``search_order`` in the same mapping to keep them.
+    "packages": {
+        "sources": [],        # [{name, url, subdir_template, credential_ref}]
+        "search_order": [],   # alias names, tried in order for a bare name
+    },
     "model_presets": {},  # User overrides for model selector presets (see model_selector.py)
     # Platform-integrity classifier config.  Read by
     # ``carpenter/security/platform_paths.py`` to drive path-tier and

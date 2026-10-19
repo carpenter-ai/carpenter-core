@@ -1037,7 +1037,14 @@ def _trigger_disabled_by_config(package_name: str, trigger_name: str) -> bool:
     packages_cfg = get_config("packages", {}) or {}
     if not isinstance(packages_cfg, dict):
         return False
-    triggers_cfg = (packages_cfg.get(package_name) or {}).get("triggers") or {}
+    # ``packages`` also holds the framework's own reserved keys (``sources``,
+    # ``search_order``), whose values are lists — not per-package mappings.
+    # A package whose name collides with one of those must not make this
+    # lookup explode.
+    pkg_cfg = packages_cfg.get(package_name)
+    if not isinstance(pkg_cfg, dict):
+        return False
+    triggers_cfg = pkg_cfg.get("triggers") or {}
     if not isinstance(triggers_cfg, dict):
         return False
     trigger_cfg = triggers_cfg.get(trigger_name) or {}
