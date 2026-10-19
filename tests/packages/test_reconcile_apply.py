@@ -367,3 +367,41 @@ class TestRoundTripWithReconcile:
         }
         assert result.hash == compute_package_hash(dest)
         assert get_install_record(db_conn, "p")["hash"] == result.hash
+
+
+class TestProvenanceCarriesForward:
+    def test_reconciled_install_keeps_the_recorded_source(
+        self, db_conn, tmp_path,
+    ):
+        """A reconcile re-records the same source, so it must not erase it.
+
+        ``_record_install`` is an INSERT OR REPLACE, so without an
+        explicit carry-over an apply would blank every ``source_*``
+        column of a package installed from a remote.
+        """
+        from carpenter.packages import sources
+
+        src = _make_source_pkg(tmp_path / "src", "p")
+        dest = tmp_path / "installed" / "p"
+        spec = sources.parse_source(
+            "git+https://forge.example/org/pkgs.git@v1.0#subdir=packages/p",
+        )
+        install_package(
+            src, dest, conn=db_conn, provenance=spec, resolved="c" * 40,
+        )
+        before = get_install_record(db_conn, "p")
+
+        apply_reconciled_install(
+            "p", "0.2.0",
+            _resolved("p", "0.2.0", {"extra.txt": "new\n"}),
+            conn=db_conn,
+        )
+
+        after = get_install_record(db_conn, "p")
+        assert after["version"] == "0.2.0"
+        for key in (
+            "source_kind", "source_url", "source_ref", "source_resolved",
+            "source_subdir", "source_id", "fetched_at",
+        ):
+            assert after[key] == before[key]
+        assert after["source_url"] == "https://forge.example/org/pkgs.git"

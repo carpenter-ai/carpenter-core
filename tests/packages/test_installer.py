@@ -420,3 +420,235 @@ class TestUninstall:
             "SELECT * FROM package_state_archive WHERE package_name = ?", ("p",),
         ).fetchall()
         assert rows == []
+
+
+# ── source provenance ───────────────────────────────────────────────
+
+
+_PROVENANCE_KEYS = (
+    "source_kind", "source_url", "source_ref", "source_resolved",
+    "source_subdir", "source_id", "fetched_at",
+)
+
+
+class TestProvenanceColumns:
+    """The ``source_*`` / ``fetched_at`` columns on ``installed_packages``.
+
+    These record WHERE the installed bytes came from.  ``source_path``
+    keeps its original meaning (the local directory they were copied
+    from) — the test below pins that, because changing it would silently
+    change what the reconcile path re-records.
+    """
+
+    def test_remote_provenance_is_recorded(self, tmp_path, db_conn):
+        from carpenter.packages import sources
+
+        src = make_source_pkg(tmp_path / "src", "p")
+        spec = sources.parse_source(
+            "git+https://forge.example/org/pkgs.git@v1.0#subdir=packages/p",
+        )
+        install_package(
+            src, tmp_path / "installed" / "p", conn=db_conn,
+            provenance=spec, resolved="c" * 40,
+        )
+        rec = installer.get_install_record(db_conn, "p")
+        assert rec["source_kind"] == "git"
+        assert rec["source_url"] == "https://forge.example/org/pkgs.git"
+        assert rec["source_ref"] == "v1.0"
+        assert rec["source_resolved"] == "c" * 40
+        assert rec["source_subdir"] == "packages/p"
+        assert rec["source_id"] == sources.source_id(spec)
+        assert rec["fetched_at"] == rec["installed_at"]
+
+    def test_local_provenance_records_an_empty_resolved(
+        self, tmp_path, db_conn,
+    ):
+        from carpenter.packages import sources
+
+        src = make_source_pkg(tmp_path / "src", "p")
+        install_package(
+            src, tmp_path / "installed" / "p", conn=db_conn,
+            provenance=sources.parse_source(str(src)),
+        )
+        rec = installer.get_install_record(db_conn, "p")
+        assert rec["source_kind"] == "local"
+        assert rec["source_url"] == ""
+        assert rec["source_ref"] == ""
+        assert rec["source_resolved"] == ""
+        assert rec["source_subdir"] == ""
+        assert rec["source_id"]
+        assert rec["fetched_at"]
+
+    def test_omitting_provenance_records_nothing(self, tmp_path, db_conn):
+        src = make_source_pkg(tmp_path / "src", "p")
+        install_package(src, tmp_path / "installed" / "p", conn=db_conn)
+        rec = installer.get_install_record(db_conn, "p")
+        assert [rec[k] for k in _PROVENANCE_KEYS] == [None] * 7
+
+    def test_credential_is_never_persisted(self, tmp_path, db_conn):
+        from carpenter.packages import sources
+
+        src = make_source_pkg(tmp_path / "src", "p")
+        spec = sources.parse_source(
+            "https://files.example/dl/p-1.0.tar.gz?token=secrettoken",
+        )
+        install_package(
+            src, tmp_path / "installed" / "p", conn=db_conn,
+            provenance=spec, resolved="a" * 64,
+        )
+        row = " ".join(
+            str(v) for v in db_conn.execute(
+                "SELECT * FROM installed_packages WHERE name = 'p'",
+            ).fetchone()
+        )
+        assert "secrettoken" not in row
+
+    def test_userinfo_credential_is_redacted_not_stored(
+        self, tmp_path, db_conn,
+    ):
+        from carpenter.packages import sources
+
+        src = make_source_pkg(tmp_path / "src", "p")
+        spec = sources.parse_source(
+            "git+https://bot:secrettoken@forge.example/org/p.git",
+        )
+        install_package(
+            src, tmp_path / "installed" / "p", conn=db_conn,
+            provenance=spec, resolved="c" * 40,
+        )
+        rec = installer.get_install_record(db_conn, "p")
+        assert rec["source_url"] == "https://forge.example/org/p.git"
+        assert "secrettoken" not in rec["source_url"]
+
+    def test_source_path_still_means_the_local_source_directory(
+        self, tmp_path, db_conn,
+    ):
+        """Pins the chosen answer to "what is source_path now?".
+
+        It stays what it always was: the local directory the bytes were
+        copied from — which for a remote source is the quarantine the
+        fetcher materialised, not the URL.  The URL lives in
+        ``source_url``.  ``reconcile_apply`` reads ``source_path`` only
+        to carry it forward on a re-record (the install destination
+        comes from ``install_path``), so keeping it a path keeps that
+        path's meaning intact.
+        """
+        from carpenter.packages import sources
+
+        src = make_source_pkg(tmp_path / "src", "p")
+        spec = sources.parse_source("git+https://forge.example/org/p.git")
+        install_package(
+            src, tmp_path / "installed" / "p", conn=db_conn,
+            provenance=spec, resolved="c" * 40,
+        )
+        rec = installer.get_install_record(db_conn, "p")
+        assert rec["source_path"] == str(src.resolve())
+        assert Path(rec["source_path"]).is_dir()
+        assert rec["source_url"] == "https://forge.example/org/p.git"
+
+    def test_reinstall_without_provenance_does_not_inherit_it(
+        self, tmp_path, db_conn,
+    ):
+        """A re-install can come from somewhere else, so no carry-over."""
+        from carpenter.packages import sources
+
+        src = make_source_pkg(tmp_path / "src", "p")
+        dest = tmp_path / "installed" / "p"
+        install_package(
+            src, dest, conn=db_conn,
+            provenance=sources.parse_source(
+                "git+https://forge.example/org/p.git",
+            ),
+            resolved="c" * 40,
+        )
+        install_package(src, dest, conn=db_conn)
+        rec = installer.get_install_record(db_conn, "p")
+        assert [rec[k] for k in _PROVENANCE_KEYS] == [None] * 7
+
+    def test_list_install_records_carries_provenance(self, tmp_path, db_conn):
+        from carpenter.packages import sources
+
+        src = make_source_pkg(tmp_path / "src", "p")
+        install_package(
+            src, tmp_path / "installed" / "p", conn=db_conn,
+            provenance=sources.parse_source(
+                "git+https://forge.example/org/p.git@main",
+            ),
+            resolved="c" * 40,
+        )
+        records = list_install_records(db_conn)
+        assert len(records) == 1
+        assert records[0]["source_ref"] == "main"
+        assert records[0]["source_id"]
+
+
+class TestProvenanceMigration:
+    """A DB created by the pre-provenance schema migrates in place."""
+
+    @staticmethod
+    def _old_schema_conn():
+        conn = sqlite3.connect(":memory:")
+        conn.execute("PRAGMA foreign_keys = ON")
+        # The installed_packages table as it was BEFORE the source_*
+        # columns existed (and before the three earlier additions, so
+        # the whole column-presence migration runs).
+        conn.executescript(
+            """
+            CREATE TABLE installed_packages (
+                name TEXT PRIMARY KEY,
+                version TEXT NOT NULL,
+                hash TEXT NOT NULL,
+                source_path TEXT NOT NULL,
+                install_path TEXT NOT NULL,
+                installed_at TEXT NOT NULL
+            );
+            """,
+        )
+        conn.execute(
+            "INSERT INTO installed_packages "
+            "(name, version, hash, source_path, install_path, installed_at) "
+            "VALUES ('legacy', '0.1.0', 'abc', '/src/legacy', "
+            "'/install/legacy', '2026-01-01T00:00:00+00:00')",
+        )
+        return conn
+
+    def test_columns_are_added(self):
+        conn = self._old_schema_conn()
+        ensure_installer_tables(conn)
+        cols = {
+            row[1] for row in
+            conn.execute("PRAGMA table_info(installed_packages)").fetchall()
+        }
+        assert set(_PROVENANCE_KEYS) <= cols
+        conn.close()
+
+    def test_pre_existing_row_reads_as_unknown_provenance(self):
+        conn = self._old_schema_conn()
+        ensure_installer_tables(conn)
+        rec = installer.get_install_record(conn, "legacy")
+        assert rec["source_path"] == "/src/legacy"
+        assert [rec[k] for k in _PROVENANCE_KEYS] == [None] * 7
+        conn.close()
+
+    def test_migration_is_idempotent_and_installs_still_record(
+        self, tmp_path,
+    ):
+        from carpenter.packages import sources
+
+        conn = self._old_schema_conn()
+        ensure_installer_tables(conn)
+        ensure_installer_tables(conn)
+        src = make_source_pkg(tmp_path / "src", "p")
+        install_package(
+            src, tmp_path / "installed" / "p", conn=conn,
+            provenance=sources.parse_source(
+                "git+https://forge.example/org/p.git@main",
+            ),
+            resolved="c" * 40,
+        )
+        rec = installer.get_install_record(conn, "p")
+        assert rec["source_kind"] == "git"
+        assert rec["source_ref"] == "main"
+        # The legacy row is untouched by the new install.
+        assert installer.get_install_record(conn, "legacy")["source_kind"] is None
+        conn.close()

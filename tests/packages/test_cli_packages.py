@@ -259,3 +259,72 @@ def test_install_requires_exactly_one_source(test_db, capsys):
     rc = cli_packages.cmd_packages(["install"])
     assert rc == 2
     assert "exactly one" in capsys.readouterr().err
+
+
+# ── source resolution ───────────────────────────────────────────────
+
+
+class TestSourceResolution:
+    def test_bare_name_uses_the_legacy_local_layout(
+        self, test_db, monkeypatch, tmp_path,
+    ):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        assert cli_packages._source_dir_for("demo") == (
+            tmp_path / "repos" / "carpenter-packages" / "packages" / "demo"
+        )
+
+    def test_install_by_bare_name_lands_under_base_dir(
+        self, test_db, monkeypatch, tmp_path, capsys,
+    ):
+        from carpenter import config
+
+        home = tmp_path / "home"
+        src_tree = home / "repos" / "carpenter-packages" / "packages"
+        src_tree.mkdir(parents=True)
+        _write_plain_pkg(src_tree)
+        monkeypatch.setenv("HOME", str(home))
+
+        rc = cli_packages.cmd_packages(["install", "plainpkg"])
+        assert rc == 0
+        installed = (
+            Path(config.CONFIG["base_dir"]) / "packages" / "plainpkg"
+        )
+        assert (installed / "manifest.yaml").is_file()
+
+    def test_remote_bare_name_is_refused_with_a_clear_error(
+        self, test_db, monkeypatch, capsys,
+    ):
+        from carpenter import config
+
+        monkeypatch.setitem(config.CONFIG, "packages", {
+            "sources": [{
+                "name": "house",
+                "url": "git+https://forge.example/org/pkgs.git",
+                "subdir_template": "packages/{name}",
+            }],
+            "search_order": ["house"],
+        })
+        rc = cli_packages.cmd_packages(["install", "plainpkg"])
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "remote source" in err
+        assert "forge.example" in err
+        assert "--path" in err
+
+    def test_malformed_source_spec_is_refused(self, test_db, capsys):
+        rc = cli_packages.cmd_packages(["install", "Not A Name"])
+        assert rc == 1
+        assert "accepted source forms" in capsys.readouterr().err
+
+    def test_install_records_local_provenance(
+        self, test_db, src_root, capsys,
+    ):
+        pkg = _write_plain_pkg(src_root)
+        assert cli_packages.cmd_packages(["install", "--path", str(pkg)]) == 0
+        with db_connection() as db:
+            rec = installer.get_install_record(db, "plainpkg")
+        assert rec["source_kind"] == "local"
+        assert rec["source_url"] == ""
+        assert rec["source_resolved"] == ""
+        assert rec["source_id"]
+        assert rec["source_path"] == str(pkg.resolve())
