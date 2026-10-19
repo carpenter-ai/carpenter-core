@@ -32,33 +32,46 @@ import sys
 from pathlib import Path
 
 
-# ── source / dest path conventions (mirror config_seed/chat_tools/packages.py)
+# ── source / dest path conventions ──────────────────────────────────
+#
+# Both of these delegate: the source grammar lives in
+# ``carpenter.packages.sources`` and the destination convention in
+# ``carpenter.packages.installer``, so this CLI and the install chat tool
+# resolve identically instead of each keeping its own copy (they once
+# disagreed about ``base_dir``).
 
 
 def _source_dir_for(source_name: str) -> Path:
-    """Conventional source path: ``~/repos/carpenter-packages/packages/<name>``."""
-    return Path(
-        os.path.expanduser(
-            f"~/repos/carpenter-packages/packages/{source_name}"
+    """Resolve a source spec to a local package directory.
+
+    Delegates to :func:`carpenter.packages.sources.parse_source`, so the
+    accepted forms are exactly the documented grammar (a bare name
+    resolves through the operator's configured sources and otherwise
+    falls back to the local source tree).
+
+    Raises:
+        SourceSpecError: the spec is not valid, or it resolves to a
+            remote source — fetching those is not wired up yet, so the
+            operator is told that plainly rather than left with a
+            confusing "directory not found".
+    """
+    from .packages.sources import SourceSpecError, describe, parse_source
+
+    spec = parse_source(source_name)
+    if spec.kind != "local" or spec.path is None:
+        raise SourceSpecError(
+            f"source {spec.raw!r} resolves to a remote source "
+            f"({describe(spec)}); installing from a remote source is not "
+            f"supported yet. Use a local directory with --path.",
         )
-    )
+    return spec.path
 
 
 def _install_destination_for(name: str) -> Path:
-    """Install destination for a package: ``~/carpenter/packages/<name>``.
+    """Install destination for a package: ``<base_dir>/packages/<name>``."""
+    from .packages.installer import default_install_dest
 
-    Honours the platform ``base_dir`` config when set so tests (and
-    relocated installs) land under the configured base rather than a
-    hardcoded ``~/carpenter``.
-    """
-    try:
-        from . import config
-        base_dir = config.CONFIG.get("base_dir")
-    except Exception:  # noqa: BLE001 — config may be unavailable in stripped builds
-        base_dir = None
-    if base_dir:
-        return Path(base_dir) / "packages" / name
-    return Path(os.path.expanduser(f"~/carpenter/packages/{name}"))
+    return default_install_dest(name)
 
 
 def _package_env_path(name: str) -> Path:
@@ -193,14 +206,17 @@ def _cmd_install(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
         prog="python3 -m carpenter packages install",
         description=(
-            "Install a capability package. By default resolves the source "
-            "from ~/repos/carpenter-packages/packages/<source_name>/ and "
-            "installs to <base_dir>/packages/<manifest_name>/."
+            "Install a capability package. A bare <source_name> resolves "
+            "through the configured package sources (config "
+            "packages.sources / packages.search_order) and otherwise falls "
+            "back to ~/repos/carpenter-packages/packages/<source_name>/; "
+            "the package installs to <base_dir>/packages/<manifest_name>/."
         ),
     )
     parser.add_argument(
         "source_name", nargs="?",
-        help="Package directory name under ~/repos/carpenter-packages/packages/",
+        help="Package name, resolved through the configured package sources "
+             "and otherwise under ~/repos/carpenter-packages/packages/.",
     )
     parser.add_argument(
         "--path",
@@ -231,11 +247,25 @@ def _cmd_install(argv: list[str]) -> int:
         )
         return 2
 
-    source_path = (
-        Path(args.path).expanduser().resolve()
-        if args.path
-        else _source_dir_for(args.source_name)
-    )
+    from .packages.sources import SourceSpecError, parse_source
+
+    try:
+        source_path = (
+            Path(args.path).expanduser().resolve()
+            if args.path
+            else _source_dir_for(args.source_name)
+        )
+    except SourceSpecError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    # Provenance for the install record.  Both routes are local
+    # directories here; parsing the resolved path gives the install a
+    # canonical spec (kind, resolved path, stable source id) to record.
+    try:
+        provenance = parse_source(str(source_path))
+    except SourceSpecError:  # pragma: no cover — a resolved path always parses
+        provenance = None
 
     if not source_path.is_dir():
         print(
@@ -363,6 +393,7 @@ def _cmd_install(argv: list[str]) -> int:
                 capability_input_fn=capability_input_fn,
                 capability_prompt_stream=sys.stderr,
                 allow_write_chat_tools=allow_write_chat_tools,
+                provenance=provenance,
             )
     except (installer.InstallError, ManifestError, PackageSecurityError) as exc:
         print(f"ERROR: install failed: {exc}", file=sys.stderr)

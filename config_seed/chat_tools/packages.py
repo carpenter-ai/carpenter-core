@@ -3,9 +3,10 @@
 D24 stage 3a (B-min) ships two write-side tools alongside the existing
 read-only ``list_packages``:
 
-* ``install_package(source_name)`` — copies a package from
-  ``~/repos/carpenter-packages/packages/<source_name>/`` to
-  ``~/carpenter/packages/<name>/``, hashes the contents, records the
+* ``install_package(source_name)`` — copies a package from the
+  resolved source directory (the operator's configured package sources,
+  else ``~/repos/carpenter-packages/packages/<source_name>/``) to
+  ``<base_dir>/packages/<name>/``, hashes the contents, records the
   install in the ``installed_packages`` SQL table, and (on next
   server restart) loads the package via the hash-pinned path.
 * ``uninstall_package(name)`` — removes the install dir + DB rows.
@@ -34,31 +35,50 @@ Trust-model notes:
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 from carpenter.chat_tool_loader import chat_tool
 
 
 def _source_dir_for(source_name: str) -> Path:
-    """Return the conventional source path for a package name.
+    """Resolve a source name to a local package directory.
 
-    Stage 3a only knows about the local
-    ``~/repos/carpenter-packages/packages/<name>/`` layout (SD1).
-    Remote / signed packages are out of scope for D24.
+    Delegates to ``carpenter.packages.sources.parse_source`` so this tool
+    and the operator CLI accept exactly the same source grammar: a bare
+    name resolves through the operator's configured package sources and
+    otherwise falls back to the local
+    ``~/repos/carpenter-packages/packages/<name>/`` layout.
+
+    Raises ``SourceSpecError`` when the name is not a valid source spec,
+    or when it resolves to a remote source (fetching those is not wired
+    up yet).
     """
-    return Path(
-        os.path.expanduser(
-            f"~/repos/carpenter-packages/packages/{source_name}"
-        )
+    from carpenter.packages.sources import (
+        SourceSpecError, describe, parse_source,
     )
+
+    spec = parse_source(source_name)
+    if spec.kind != "local" or spec.path is None:
+        raise SourceSpecError(
+            f"source {spec.raw!r} resolves to a remote source "
+            f"({describe(spec)}); installing from a remote source is not "
+            f"supported yet."
+        )
+    return spec.path
 
 
 def _install_destination_for(name: str) -> Path:
-    """Return the install destination for a package name (SD2)."""
-    return Path(
-        os.path.expanduser(f"~/carpenter/packages/{name}")
-    )
+    """Return the install destination for a package name (SD2).
+
+    Delegates to ``carpenter.packages.installer.default_install_dest``,
+    which honours the platform ``base_dir``.  This tool used to hardcode
+    ``~/carpenter/packages/<name>`` while the operator CLI honoured
+    ``base_dir``: on a deployment with a relocated ``base_dir`` that put
+    chat-installed packages where the registry never looks.
+    """
+    from carpenter.packages.installer import default_install_dest
+
+    return default_install_dest(name)
 
 
 def _summarize_manifest(manifest, pkg_hash: str) -> str:
@@ -87,8 +107,9 @@ def _summarize_manifest(manifest, pkg_hash: str) -> str:
 @chat_tool(
     description=(
         "Install a capability package from the local source repo "
-        "(~/repos/carpenter-packages/packages/<source_name>/) into the "
-        "platform's install directory (~/carpenter/packages/<name>/). "
+        "(~/repos/carpenter-packages/packages/<source_name>/, or the "
+        "operator's configured package sources) into the platform's "
+        "install directory (<base_dir>/packages/<name>/). "
         "Copies + hash-pins the contents per D24 SD3.  Requires user "
         "confirmation; the operator sees the manifest summary and "
         "package hash before the copy happens.  If the package is "
@@ -124,7 +145,12 @@ def install_package(tool_input, **kwargs):
     if not source_name or not isinstance(source_name, str):
         return "Error: source_name (string) is required."
 
-    source_path = _source_dir_for(source_name)
+    from carpenter.packages.sources import SourceSpecError, parse_source
+
+    try:
+        source_path = _source_dir_for(source_name)
+    except SourceSpecError as exc:
+        return f"Error: {exc}"
     if not source_path.is_dir():
         return (
             f"Error: source package directory not found at {source_path}. "
@@ -149,10 +175,17 @@ def install_package(tool_input, **kwargs):
 
     dest_path = _install_destination_for(manifest.name)
 
+    # Provenance for the install record: a canonical spec for the local
+    # directory the bytes are copied from.
+    try:
+        provenance = parse_source(str(source_path))
+    except SourceSpecError:
+        provenance = None
+
     try:
         with db_transaction() as db:
             result = installer.install_package(
-                source_path, dest_path, conn=db,
+                source_path, dest_path, conn=db, provenance=provenance,
             )
     except installer.InstallError as exc:
         return f"Install failed: {exc}"
@@ -172,7 +205,7 @@ def install_package(tool_input, **kwargs):
 @chat_tool(
     description=(
         "Uninstall a previously-installed capability package.  Removes "
-        "the install dir at ~/carpenter/packages/<name>/ and the DB "
+        "the install dir at <base_dir>/packages/<name>/ and the DB "
         "install record.  Refuses if any non-terminal arc still "
         "references a template the package shipped (D24 SD9); the "
         "operator must wait for those arcs to terminate or cancel "

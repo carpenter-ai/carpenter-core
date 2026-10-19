@@ -47,10 +47,16 @@ def _make_source(root: Path, name: str) -> Path:
 
 @pytest.fixture
 def fake_carpenter_dirs(tmp_path, monkeypatch):
-    """Redirect ~/repos/carpenter-packages and ~/carpenter to tmp_path.
+    """Redirect the legacy local source tree under ``$HOME`` to tmp_path.
 
-    The chat tools resolve sources / dests via ``os.path.expanduser``,
-    so we monkeypatch HOME for the duration of the test.
+    A bare source name resolves through
+    ``carpenter.packages.sources.parse_source``, which expands ``~`` for
+    the legacy ``~/repos/carpenter-packages/packages/<name>/`` fallback,
+    so HOME is monkeypatched for the duration of the test.
+
+    The install DESTINATION does not come from HOME: it follows the
+    platform ``base_dir`` (set to ``tmp_path`` by the autouse ``test_db``
+    fixture), which is what ``_install_destination_for`` resolves.
     """
     home = tmp_path / "home"
     home.mkdir()
@@ -127,11 +133,11 @@ class TestInstallChatTool:
         # Hash row was recorded.
         record = get_install_record(fake_db, "p")
         assert record is not None
-        # Install dir was materialized.
-        installed = (
-            fake_carpenter_dirs / "carpenter" / "packages" / "p"
-        )
+        # Install dir was materialized under the configured base_dir.
+        from carpenter import config
+        installed = Path(config.CONFIG["base_dir"]) / "packages" / "p"
         assert (installed / "manifest.yaml").is_file()
+        assert record["install_path"] == str(installed)
 
     def test_install_missing_source(self, fake_carpenter_dirs, fake_db):
         mod = _import_packages_chat_tools()

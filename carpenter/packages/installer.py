@@ -148,6 +148,31 @@ class VerifyResult:
     message: str
 
 
+# ── Install destination ─────────────────────────────────────────────
+
+
+def default_install_dest(name: str) -> Path:
+    """Return the install destination for a package: ``<base>/packages/<name>``.
+
+    ``base_dir`` from the platform config when it is set, falling back to
+    the conventional ``~/carpenter`` layout otherwise (D24 SD2).  This is
+    the ONE definition of the destination: every entry point (the
+    operator CLI, the install chat tool) resolves through it, because two
+    copies of this convention once disagreed — the chat tool hardcoded
+    ``~/carpenter/packages/<name>`` while the CLI honoured ``base_dir``,
+    so a deployment with a relocated ``base_dir`` had the chat tool
+    install where the registry does not look.
+    """
+    try:
+        from .. import config
+        base_dir = config.CONFIG.get("base_dir")
+    except Exception:  # noqa: BLE001 — config may be unavailable
+        base_dir = None
+    if base_dir:
+        return Path(base_dir) / "packages" / name
+    return Path(os.path.expanduser(f"~/carpenter/packages/{name}"))
+
+
 # ── Hashing ──────────────────────────────────────────────────────────
 
 
