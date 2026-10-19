@@ -10,9 +10,10 @@ behaving exactly as it did.
 Accepted forms (and nothing else):
 
 * **bare name** — ``^[a-z0-9][a-z0-9._-]*$``.  Resolved through the
-  operator's configured source registry (``packages.sources`` /
-  ``packages.search_order``, see :func:`configured_sources`).  When no
-  configured alias matches, it falls back to the legacy local layout
+  operator's configured source registry (the top-level
+  ``package_sources`` list, see :func:`configured_sources`), whose
+  declaration order IS the order the aliases are tried in.  When no
+  configured source is declared, it falls back to the legacy local layout
   ``~/repos/carpenter-packages/packages/<name>`` so existing installs
   keep working untouched.
 * **local directory** — an absolute path (``~`` is expanded) or a
@@ -66,7 +67,6 @@ __all__ = [
     "redact",
     "resolve_bare_name",
     "source_id",
-    "source_search_order",
 ]
 
 
@@ -108,7 +108,7 @@ _LEGACY_SOURCE_ROOT = "~/repos/carpenter-packages/packages"
 #: rather than only what did not.
 _ACCEPTED_FORMS = (
     "accepted source forms: a bare package name (resolved through the "
-    "configured packages.sources, else the local source tree); an "
+    "configured package_sources, else the local source tree); an "
     "absolute path or file:// URL to a package directory; "
     "git+https://host/org/repo.git[@ref][#subdir=rel/path]; "
     "https://host/path/pkg.tar.gz[#sha256=<64 lowercase hex>] (.tgz and "
@@ -486,11 +486,11 @@ def _parse_local(spec: str) -> SourceSpec:
 
 @dataclass(frozen=True)
 class ConfiguredSource:
-    """One entry of the operator's ``packages.sources`` list.
+    """One entry of the operator's ``package_sources`` list.
 
     Attributes:
-        name: Alias the operator refers to this source by (and what
-            ``packages.search_order`` lists).
+        name: Alias the operator refers to this source by, used in
+            previews, logs and provenance.
         url: A ``git+https://…`` or ``https://…`` source, per the module
             grammar.  Must not contain a ``{name}`` placeholder — a
             monorepo is addressed with ``subdir_template`` instead.
@@ -511,29 +511,37 @@ class ConfiguredSource:
 _SOURCE_KEYS = frozenset({"name", "url", "subdir_template", "credential_ref"})
 
 
-def _packages_config(config: dict | None) -> dict:
-    """Return the ``packages`` config mapping (never ``None``)."""
+def _source_entries(config: dict | None) -> list:
+    """Return the raw ``package_sources`` list (never ``None``).
+
+    The registry is a TOP-LEVEL config key, not a key under ``packages``:
+    every key under ``packages`` is a package name, and the YAML layer
+    replaces a top-level value wholesale, so nesting the registry there
+    would both reserve package names and lose the registry the moment an
+    operator set one per-package override.
+    """
     if config is None:
         from ..config import get_config
-        config = {"packages": get_config("packages", {}) or {}}
-    packages_cfg = config.get("packages", {}) or {}
-    if not isinstance(packages_cfg, dict):
+        config = {"package_sources": get_config("package_sources", []) or []}
+    raw = config.get("package_sources", []) or []
+    if not isinstance(raw, list):
         raise SourceSpecError(
-            "config 'packages' must be a mapping of package names plus the "
-            "'sources' / 'search_order' keys",
+            "config 'package_sources' must be a list of "
+            "{name, url, subdir_template, credential_ref} entries",
         )
-    return packages_cfg
+    return raw
 
 
 def configured_sources(config: dict | None = None) -> tuple[ConfiguredSource, ...]:
-    """Parse and validate ``packages.sources``.
+    """Parse and validate the top-level ``package_sources`` list.
 
     Args:
         config: Optional config mapping to read instead of the live
-            platform config (tests pass ``{"packages": {...}}``).
+            platform config (tests pass ``{"package_sources": [...]}``).
 
     Returns:
-        The declared sources in declaration order.
+        The declared sources in declaration order, which IS the order a
+        bare package name is resolved in (see :func:`resolve_bare_name`).
 
     Raises:
         SourceSpecError: the list, an entry, or a field is malformed.
@@ -541,16 +549,11 @@ def configured_sources(config: dict | None = None) -> tuple[ConfiguredSource, ..
             refused rather than skipped, so a typo cannot silently
             change which remote a package is installed from.
     """
-    raw = _packages_config(config).get("sources", []) or []
-    if not isinstance(raw, list):
-        raise SourceSpecError(
-            "config 'packages.sources' must be a list of "
-            "{name, url, subdir_template, credential_ref} entries",
-        )
+    raw = _source_entries(config)
     out: list[ConfiguredSource] = []
     seen: set[str] = set()
     for index, entry in enumerate(raw):
-        where = f"packages.sources[{index}]"
+        where = f"package_sources[{index}]"
         if not isinstance(entry, dict):
             raise SourceSpecError(
                 f"{where} must be a mapping, not {type(entry).__name__}",
@@ -633,40 +636,6 @@ def _validate_subdir_template(template: str, *, where: str) -> None:
         ) from exc
 
 
-def source_search_order(config: dict | None = None) -> tuple[str, ...]:
-    """Parse and validate ``packages.search_order``.
-
-    Returns the alias names to try, in order, when a bare package name
-    is installed.  Empty means "no configured source is consulted" and a
-    bare name keeps the legacy local behaviour.
-    """
-    packages_cfg = _packages_config(config)
-    raw = packages_cfg.get("search_order", []) or []
-    if not isinstance(raw, list):
-        raise SourceSpecError(
-            "config 'packages.search_order' must be a list of source "
-            "alias names",
-        )
-    known = {s.name for s in configured_sources(config)}
-    out: list[str] = []
-    for index, item in enumerate(raw):
-        where = f"packages.search_order[{index}]"
-        if not isinstance(item, str) or not item.strip():
-            raise SourceSpecError(
-                f"{where} must be a non-empty source alias name, got "
-                f"{item!r}",
-            )
-        alias = item.strip()
-        if alias not in known:
-            raise SourceSpecError(
-                f"{where} names source {alias!r}, which is not declared "
-                f"in packages.sources ("
-                f"{', '.join(sorted(known)) if known else 'no sources declared'})",
-            )
-        out.append(alias)
-    return tuple(out)
-
-
 def legacy_local_source(name: str) -> SourceSpec:
     """Return the pre-registry local source spec for a bare name.
 
@@ -691,22 +660,22 @@ def resolve_bare_name(
 ) -> tuple[SourceSpec, ...]:
     """Return the configured candidates for a bare package name, in order.
 
-    One spec per alias in ``packages.search_order``, in that order.
-    Parsing cannot tell whether a remote actually publishes the package
-    (that needs I/O), so the candidates are returned as a tuple and a
-    caller that can fetch may try each in turn; :func:`parse_source`
-    takes the first.  An empty tuple means no configured source applies
-    and the caller should use :func:`legacy_local_source`.
+    One spec per entry of ``package_sources``, in declaration order —
+    the list order is the search order, so there is no separate key that
+    could disagree with it.  Parsing cannot tell whether a remote
+    actually publishes the package (that needs I/O), so the candidates
+    are returned as a tuple and a caller that can fetch may try each in
+    turn; :func:`parse_source` takes the first.  An empty tuple means no
+    source is configured and the caller should use
+    :func:`legacy_local_source`.
     """
-    sources = {s.name: s for s in configured_sources(config)}
     out: list[SourceSpec] = []
-    for alias in source_search_order(config):
-        entry = sources[alias]
+    for entry in configured_sources(config):
         base = _parse_remote(entry.url)
         subdir = base.subdir
         if entry.subdir_template:
             subdir = _validate_subdir(entry.subdir_template.format(name=name))
-        out.append(replace(base, raw=name, subdir=subdir, alias=alias))
+        out.append(replace(base, raw=name, subdir=subdir, alias=entry.name))
     return tuple(out)
 
 

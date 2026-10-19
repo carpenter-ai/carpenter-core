@@ -296,14 +296,11 @@ class TestSourceResolution:
     ):
         from carpenter import config
 
-        monkeypatch.setitem(config.CONFIG, "packages", {
-            "sources": [{
-                "name": "house",
-                "url": "git+https://forge.example/org/pkgs.git",
-                "subdir_template": "packages/{name}",
-            }],
-            "search_order": ["house"],
-        })
+        monkeypatch.setitem(config.CONFIG, "package_sources", [{
+            "name": "house",
+            "url": "git+https://forge.example/org/pkgs.git",
+            "subdir_template": "packages/{name}",
+        }])
         rc = cli_packages.cmd_packages(["install", "plainpkg"])
         assert rc == 1
         err = capsys.readouterr().err

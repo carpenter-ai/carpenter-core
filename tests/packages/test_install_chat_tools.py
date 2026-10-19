@@ -270,14 +270,11 @@ class TestSharedResolution:
     ):
         from carpenter import config
 
-        monkeypatch.setitem(config.CONFIG, "packages", {
-            "sources": [{
-                "name": "house",
-                "url": "git+https://forge.example/org/pkgs.git",
-                "subdir_template": "packages/{name}",
-            }],
-            "search_order": ["house"],
-        })
+        monkeypatch.setitem(config.CONFIG, "package_sources", [{
+            "name": "house",
+            "url": "git+https://forge.example/org/pkgs.git",
+            "subdir_template": "packages/{name}",
+        }])
         mod = _import_packages_chat_tools()
         out = mod.install_package({"source_name": "p"})
         assert "Error" in out

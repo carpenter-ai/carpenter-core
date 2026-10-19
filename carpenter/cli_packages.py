@@ -208,7 +208,7 @@ def _cmd_install(argv: list[str]) -> int:
         description=(
             "Install a capability package. A bare <source_name> resolves "
             "through the configured package sources (config "
-            "packages.sources / packages.search_order) and otherwise falls "
+            "package_sources, in list order) and otherwise falls "
             "back to ~/repos/carpenter-packages/packages/<source_name>/; "
             "the package installs to <base_dir>/packages/<manifest_name>/."
         ),

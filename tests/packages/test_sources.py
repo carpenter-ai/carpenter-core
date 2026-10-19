@@ -25,19 +25,17 @@ from carpenter.packages.sources import (
     parse_source,
     redact,
     source_id,
-    source_search_order,
 )
 
 SHA256 = "a" * 64
 SHA40 = "b" * 40
 
 
-def _config(sources_list=None, search_order=None, **extra) -> dict:
-    """Build a config mapping holding only the packages registry keys."""
-    packages = dict(extra)
-    packages["sources"] = sources_list if sources_list is not None else []
-    packages["search_order"] = search_order if search_order is not None else []
-    return {"packages": packages}
+def _config(sources_list=None) -> dict:
+    """Build a config mapping holding only the top-level source registry."""
+    return {
+        "package_sources": sources_list if sources_list is not None else [],
+    }
 
 
 # ── accepted: local ─────────────────────────────────────────────────
@@ -383,7 +381,6 @@ class TestDescribe:
     def test_names_the_alias(self):
         config = _config(
             [{"name": "house", "url": "git+https://forge.example/o/pkgs.git"}],
-            ["house"],
         )
         text = describe(parse_source("demo", config=config))
         assert "via configured source 'house'" in text
@@ -395,7 +392,7 @@ class TestDescribe:
 class TestConfiguredSources:
     def test_defaults_are_empty(self):
         assert configured_sources(_config()) == ()
-        assert source_search_order(_config()) == ()
+        assert configured_sources({}) == ()
 
     def test_parsed_entry(self):
         entries = configured_sources(_config([{
@@ -471,9 +468,10 @@ class TestConfiguredSources:
         with pytest.raises(SourceSpecError, match=match):
             configured_sources(_config([entry]))
 
-    def test_non_list_refused(self):
+    @pytest.mark.parametrize("raw", [{"name": "house"}, "house"])
+    def test_non_list_refused(self, raw):
         with pytest.raises(SourceSpecError, match="must be a list"):
-            configured_sources({"packages": {"sources": {"name": "house"}}})
+            configured_sources({"package_sources": raw})
 
     def test_non_mapping_entry_refused(self):
         with pytest.raises(SourceSpecError, match="must be a mapping"):
@@ -484,38 +482,69 @@ class TestConfiguredSources:
         with pytest.raises(SourceSpecError, match="declared more than once"):
             configured_sources(_config([entry, dict(entry)]))
 
-    def test_packages_not_a_mapping_refused(self):
-        with pytest.raises(SourceSpecError, match="must be a mapping"):
-            configured_sources({"packages": ["house"]})
+    def test_the_old_nested_location_is_not_read(self):
+        """``packages.sources`` is not the registry and must be ignored."""
+        config = {
+            "packages": {"sources": [{"name": "house", "url": "nonsense"}]},
+        }
+        assert configured_sources(config) == ()
 
 
-class TestSearchOrder:
-    def test_validated_against_declared_sources(self):
-        config = _config(
-            [{"name": "house", "url": "git+https://f.example/o/r.git"}],
-            ["house"],
+class TestRegistryLivesAtTheTopLevel:
+    """The registry must not live under the ``packages`` config key.
+
+    ``packages`` is keyed by package name, and the YAML layer replaces a
+    top-level value wholesale (shallow precedence), so a registry nested
+    there both reserves package names and is silently lost the moment an
+    operator sets one per-package override.
+    """
+
+    def test_a_per_package_override_does_not_drop_the_registry(self, tmp_path):
+        from carpenter.config import load_config
+
+        yaml_file = tmp_path / "config.yaml"
+        yaml_file.write_text(
+            "packages:\n"
+            "  demo:\n"
+            "    triggers:\n"
+            "      poll:\n"
+            "        enabled: false\n"
+            "package_sources:\n"
+            "  - name: house\n"
+            "    url: git+https://forge.example/org/pkgs.git\n"
+            "    subdir_template: packages/{name}\n",
         )
-        assert source_search_order(config) == ("house",)
+        config = load_config(yaml_path=str(yaml_file))
 
-    def test_unknown_alias_refused(self):
-        config = _config(
-            [{"name": "house", "url": "git+https://f.example/o/r.git"}],
-            ["hous"],
+        # The per-package override is read ...
+        assert (
+            config["packages"]["demo"]["triggers"]["poll"]["enabled"] is False
         )
-        with pytest.raises(SourceSpecError, match="not declared in"):
-            source_search_order(config)
-
-    def test_non_list_refused(self):
-        with pytest.raises(SourceSpecError, match="must be a list"):
-            source_search_order({"packages": {"search_order": "house"}})
-
-    def test_non_string_entry_refused(self):
-        config = _config(
-            [{"name": "house", "url": "git+https://f.example/o/r.git"}],
-            [{"name": "house"}],
+        # ... and it did not take the registry with it.
+        assert [s.name for s in configured_sources(config)] == ["house"]
+        spec = parse_source("demo", config=config)
+        assert (spec.kind, spec.alias, spec.subdir) == (
+            "git", "house", "packages/demo",
         )
-        with pytest.raises(SourceSpecError, match="must be a non-empty source"):
-            source_search_order(config)
+
+    def test_no_package_name_is_reserved_by_the_registry(self, monkeypatch):
+        from carpenter import config as config_mod
+        from carpenter.packages import installer
+
+        monkeypatch.setitem(config_mod.CONFIG, "packages", {
+            "sources": {"triggers": {"poll": {"enabled": False}}},
+        })
+        monkeypatch.setitem(config_mod.CONFIG, "package_sources", [{
+            "name": "house",
+            "url": "git+https://forge.example/org/pkgs.git",
+            "subdir_template": "packages/{name}",
+        }])
+
+        # A package called "sources" carries a per-package override ...
+        assert installer._trigger_disabled_by_config("sources", "poll") is True
+        # ... and still resolves through the registry.
+        spec = parse_source("sources")
+        assert (spec.alias, spec.subdir) == ("house", "packages/sources")
 
 
 # ── bare names ──────────────────────────────────────────────────────
@@ -534,18 +563,15 @@ class TestBareNameResolution:
         assert spec.alias is None
         assert spec.raw == "demo"
 
-    def test_declared_but_unsearched_source_is_not_used(
-        self, monkeypatch, tmp_path,
-    ):
-        """A source with an empty search_order is configured, not enabled."""
-        monkeypatch.setenv("HOME", str(tmp_path))
+    def test_declaring_a_source_is_what_enables_it(self):
+        """No second key: a declared source is searched for a bare name."""
         config = _config(
             [{"name": "house", "url": "git+https://f.example/o/r.git"}],
-            [],
         )
-        assert parse_source("demo", config=config).kind == "local"
+        spec = parse_source("demo", config=config)
+        assert (spec.kind, spec.alias) == ("git", "house")
 
-    def test_resolves_through_the_first_searched_alias(self):
+    def test_resolves_through_the_first_declared_source(self):
         config = _config(
             [
                 {
@@ -558,7 +584,6 @@ class TestBareNameResolution:
                     "url": "https://files.example/d/all.tar.gz",
                 },
             ],
-            ["house", "other"],
         )
         spec = parse_source("demo", config=config)
         assert spec.kind == "git"
@@ -567,23 +592,21 @@ class TestBareNameResolution:
         assert spec.alias == "house"
         assert spec.raw == "demo"
 
-    def test_search_order_decides_which_alias_wins(self):
+    def test_list_order_decides_which_source_wins(self):
         config = _config(
             [
-                {"name": "house", "url": "git+https://forge-a.example/o/p.git"},
                 {"name": "other", "url": "git+https://forge-b.example/o/p.git"},
+                {"name": "house", "url": "git+https://forge-a.example/o/p.git"},
             ],
-            ["other", "house"],
         )
         assert parse_source("demo", config=config).alias == "other"
 
-    def test_all_candidates_are_returned_in_order(self):
+    def test_all_candidates_are_returned_in_list_order(self):
         config = _config(
             [
-                {"name": "house", "url": "git+https://forge-a.example/o/p.git"},
                 {"name": "other", "url": "git+https://forge-b.example/o/p.git"},
+                {"name": "house", "url": "git+https://forge-a.example/o/p.git"},
             ],
-            ["other", "house"],
         )
         candidates = sources.resolve_bare_name("demo", config=config)
         assert [c.alias for c in candidates] == ["other", "house"]
@@ -595,7 +618,6 @@ class TestBareNameResolution:
                 "url": "git+https://forge.example/org/pkgs.git",
                 "subdir_template": "packages/{name}",
             }],
-            ["house"],
         )
         spec = parse_source("demo", name="other-demo", config=config)
         assert spec.subdir == "packages/other-demo"
@@ -611,27 +633,23 @@ class TestBareNameResolution:
     def test_no_subdir_template_means_the_root_is_the_package(self):
         config = _config(
             [{"name": "house", "url": "git+https://forge.example/o/demo.git"}],
-            ["house"],
         )
         assert parse_source("demo", config=config).subdir is None
 
     def test_malformed_registry_surfaces_on_a_bare_name(self):
-        config = _config([{"name": "house", "url": "git+ssh://f.example/o/r"}], [])
+        config = _config([{"name": "house", "url": "git+ssh://f.example/o/r"}])
         with pytest.raises(SourceSpecError, match="url is invalid"):
             parse_source("demo", config=config)
 
     def test_live_config_is_consulted_when_none_is_passed(self, monkeypatch):
         monkeypatch.setitem(
             __import__("carpenter.config", fromlist=["CONFIG"]).CONFIG,
-            "packages",
-            {
-                "sources": [{
-                    "name": "house",
-                    "url": "git+https://forge.example/org/pkgs.git",
-                    "subdir_template": "packages/{name}",
-                }],
-                "search_order": ["house"],
-            },
+            "package_sources",
+            [{
+                "name": "house",
+                "url": "git+https://forge.example/org/pkgs.git",
+                "subdir_template": "packages/{name}",
+            }],
         )
         spec = parse_source("demo")
         assert spec.alias == "house"
@@ -640,7 +658,6 @@ class TestBareNameResolution:
     def test_explicit_spec_ignores_the_registry(self, tmp_path):
         config = _config(
             [{"name": "house", "url": "git+https://forge.example/o/p.git"}],
-            ["house"],
         )
         spec = parse_source(str(tmp_path), config=config)
         assert spec.kind == "local"
