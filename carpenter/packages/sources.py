@@ -675,10 +675,14 @@ def legacy_local_source(name: str) -> SourceSpec:
     that matches no configured source resolves here, which is what keeps
     this module behaviour-preserving.
     """
+    # Resolved the same way an explicit path is, so that ``demo`` and
+    # the absolute path it expands to are ONE source with one id.
     return SourceSpec(
         kind="local",
         raw=name,
-        path=Path(os.path.expanduser(f"{_LEGACY_SOURCE_ROOT}/{name}")),
+        path=Path(
+            os.path.expanduser(f"{_LEGACY_SOURCE_ROOT}/{name}"),
+        ).resolve(),
     )
 
 

@@ -528,7 +528,9 @@ class TestBareNameResolution:
         assert spec.kind == "local"
         assert spec.path == (
             tmp_path / "repos" / "carpenter-packages" / "packages" / "demo"
-        )
+        ).resolve()
+        # One source, one id: the bare name and the path it expands to.
+        assert source_id(spec) == source_id(parse_source(str(spec.path)))
         assert spec.alias is None
         assert spec.raw == "demo"
 
@@ -602,6 +604,9 @@ class TestBareNameResolution:
         monkeypatch.setenv("HOME", str(tmp_path))
         spec = parse_source("demo", name="other-demo", config=_config())
         assert spec.path.name == "other-demo"
+        assert spec.path.parent == (
+            tmp_path / "repos" / "carpenter-packages" / "packages"
+        ).resolve()
 
     def test_no_subdir_template_means_the_root_is_the_package(self):
         config = _config(
