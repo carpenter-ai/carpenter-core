@@ -262,7 +262,44 @@ CREATE TABLE IF NOT EXISTS installed_packages (
     -- state: the registry reads this flag per package and only registers
     -- the write-capable chat tools when it is 1.  Default 0 (gated off).
     -- This is SEPARATE from platform_capabilities_json (egress trust).
-    write_chat_tools_allowed INTEGER NOT NULL DEFAULT 0
+    write_chat_tools_allowed INTEGER NOT NULL DEFAULT 0,
+    -- Source provenance: WHERE these bytes came from, as opposed to
+    -- ``source_path`` (which stays what it always was — the local
+    -- directory the bytes were copied from, see its comment above).
+    -- All seven are NULL for a row written before provenance existed,
+    -- or by a caller that supplied none; they are never NULL together
+    -- with a value, so NULL means "provenance unknown" and an empty
+    -- string means "not applicable to this kind of source".
+    --
+    -- ``source_kind``: "local" | "git" | "archive".
+    source_kind TEXT,
+    -- ``source_url``: canonical source URL, stored REDACTED — a
+    -- credential is never persisted (see ``sources.redact``).  Empty
+    -- for a local source.
+    source_url TEXT,
+    -- ``source_ref``: the git branch / tag / commit the operator asked
+    -- for, verbatim.  Empty when none was given.
+    source_ref TEXT,
+    -- ``source_resolved``: what was ACTUALLY fetched — the git commit
+    -- sha40 or the archive's sha256.  This is the provenance anchor: it
+    -- pins the bytes in a way a mutable branch name cannot.  Empty
+    -- string for a local install (the operator's own tree is the
+    -- anchor; there is nothing to pin).
+    source_resolved TEXT,
+    -- ``source_subdir``: POSIX relative path of the package root inside
+    -- the fetched tree (a monorepo).  Empty when the tree root is the
+    -- package.
+    source_subdir TEXT,
+    -- ``source_id``: stable 16-hex id of the LOGICAL source (kind +
+    -- canonical location + subdir, excluding ref and digest).  Two
+    -- remotes publishing the same package name get different ids, so
+    -- this is what tells "the same package, updated" from "a different
+    -- package that happens to share a name" — something ``hash`` (pure
+    -- content) and ``name`` (not globally unique) cannot express.
+    source_id TEXT,
+    -- ``fetched_at``: UTC ISO-8601 time the recorded bytes were
+    -- obtained for this install.
+    fetched_at TEXT
 );
 """
 
@@ -278,6 +315,20 @@ CREATE TABLE IF NOT EXISTS installed_packages_templates (
 CREATE INDEX IF NOT EXISTS idx_installed_packages_templates_template
     ON installed_packages_templates(template_name);
 """
+
+
+#: Source-provenance columns, in the order they appear in the DDL.  Used
+#: by the column-presence migration and by the row readers so the three
+#: never drift apart.
+_PROVENANCE_COLUMNS = (
+    "source_kind",
+    "source_url",
+    "source_ref",
+    "source_resolved",
+    "source_subdir",
+    "source_id",
+    "fetched_at",
+)
 
 
 def ensure_installer_tables(conn: sqlite3.Connection) -> None:
@@ -312,6 +363,15 @@ def ensure_installer_tables(conn: sqlite3.Connection) -> None:
             "ALTER TABLE installed_packages "
             "ADD COLUMN write_chat_tools_allowed INTEGER NOT NULL DEFAULT 0",
         )
+    # Source-provenance migration: older DBs lack the source_* / fetched_at
+    # columns.  All nullable with no default, so an existing row keeps
+    # reading as "provenance unknown" rather than claiming a local source
+    # it was never recorded with.
+    for column in _PROVENANCE_COLUMNS:
+        if column not in cols:
+            conn.execute(
+                f"ALTER TABLE installed_packages ADD COLUMN {column} TEXT",
+            )
     conn.commit()
 
 
@@ -331,6 +391,44 @@ def _capability_to_dict(cap: PlatformCapabilityRef) -> dict:
     }
 
 
+def _provenance_values(
+    provenance,
+    *,
+    resolved: str,
+    fetched_at: str,
+    carry_over: dict | None,
+) -> tuple:
+    """Return the seven provenance column values for an install row.
+
+    Three cases, in precedence order:
+
+    1. ``provenance`` is a
+       :class:`carpenter.packages.sources.SourceSpec` — describe it.
+       The URL is stored REDACTED; a field that does not apply to the
+       kind is stored as an empty string.
+    2. ``provenance`` is ``None`` but ``carry_over`` is a prior install
+       record — keep what that row already had.  This is what stops a
+       re-record that happens to know nothing about the source (the
+       reconcile path) from silently erasing provenance.
+    3. Neither — all seven are NULL, i.e. "provenance unknown", which is
+       exactly how a row written before these columns existed reads.
+    """
+    if provenance is not None:
+        from .sources import redact, source_id as _source_id
+        return (
+            provenance.kind,
+            redact(provenance.url) if provenance.url else "",
+            provenance.ref or "",
+            resolved or "",
+            provenance.subdir or "",
+            _source_id(provenance),
+            fetched_at,
+        )
+    if carry_over is not None:
+        return tuple(carry_over.get(col) for col in _PROVENANCE_COLUMNS)
+    return (None,) * len(_PROVENANCE_COLUMNS)
+
+
 def _record_install(
     conn: sqlite3.Connection,
     *,
@@ -341,8 +439,20 @@ def _record_install(
     installed_at: str,
     granted_capabilities: tuple[PlatformCapabilityRef, ...] = (),
     write_chat_tools_allowed: bool = False,
+    provenance=None,
+    resolved: str = "",
+    provenance_carry_over: dict | None = None,
 ) -> None:
     """Write the install row + templates rows.
+
+    ``provenance`` is an optional
+    :class:`carpenter.packages.sources.SourceSpec` describing where the
+    bytes came from, and ``resolved`` the thing that pins them (git
+    commit sha40 / archive sha256; empty for a local source).  Omitting
+    both records NULL provenance — or, when
+    ``provenance_carry_over`` is a prior install record, that row's
+    provenance unchanged.  ``source_path`` keeps its original meaning
+    either way: the local directory the bytes were copied from.
 
     The caller owns the transaction.  When invoked inside
     :func:`carpenter.db.db_transaction`, that wrapper commits on
@@ -360,12 +470,19 @@ def _record_install(
     capabilities_payload = _json.dumps([
         _capability_to_dict(c) for c in granted_capabilities
     ])
+    provenance_values = _provenance_values(
+        provenance,
+        resolved=resolved,
+        fetched_at=installed_at,
+        carry_over=provenance_carry_over,
+    )
     conn.execute(
         "INSERT OR REPLACE INTO installed_packages "
         "(name, version, hash, source_path, install_path, installed_at, "
         "allowlist_proposals_json, platform_capabilities_json, "
-        "write_chat_tools_allowed) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "write_chat_tools_allowed, " + ", ".join(_PROVENANCE_COLUMNS) + ") "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?"
+        + ", ?" * len(_PROVENANCE_COLUMNS) + ")",
         (
             manifest.name,
             manifest.version,
@@ -376,6 +493,7 @@ def _record_install(
             proposals_payload,
             capabilities_payload,
             1 if write_chat_tools_allowed else 0,
+            *provenance_values,
         ),
     )
     # Refresh the templates join table for this package.
@@ -468,49 +586,47 @@ def _delete_install_record(conn: sqlite3.Connection, name: str) -> None:
     )
 
 
+#: The fixed column list both row readers select, in dict order.
+_RECORD_COLUMNS = (
+    "name", "version", "hash", "source_path", "install_path", "installed_at",
+    "allowlist_proposals_json", "platform_capabilities_json",
+    "write_chat_tools_allowed",
+) + _PROVENANCE_COLUMNS
+
+_RECORD_SELECT = (
+    "SELECT " + ", ".join(_RECORD_COLUMNS) + " FROM installed_packages"
+)
+
+
+def _row_to_record(row) -> dict:
+    """Map a ``_RECORD_SELECT`` row to the install-record dict.
+
+    Provenance columns pass through as-is: ``None`` means the row
+    predates provenance (or was written without any), which a caller can
+    tell apart from an empty string meaning "not applicable to this
+    source kind".
+    """
+    record = dict(zip(_RECORD_COLUMNS, row))
+    record["write_chat_tools_allowed"] = bool(
+        record["write_chat_tools_allowed"],
+    )
+    return record
+
+
 def get_install_record(
     conn: sqlite3.Connection, name: str,
 ) -> dict | None:
     row = conn.execute(
-        "SELECT name, version, hash, source_path, install_path, "
-        "installed_at, allowlist_proposals_json, platform_capabilities_json, "
-        "write_chat_tools_allowed "
-        "FROM installed_packages WHERE name = ?",
-        (name,),
+        _RECORD_SELECT + " WHERE name = ?", (name,),
     ).fetchone()
     if row is None:
         return None
-    return {
-        "name": row[0],
-        "version": row[1],
-        "hash": row[2],
-        "source_path": row[3],
-        "install_path": row[4],
-        "installed_at": row[5],
-        "allowlist_proposals_json": row[6],
-        "platform_capabilities_json": row[7],
-        "write_chat_tools_allowed": bool(row[8]),
-    }
+    return _row_to_record(row)
 
 
 def list_install_records(conn: sqlite3.Connection) -> list[dict]:
-    rows = conn.execute(
-        "SELECT name, version, hash, source_path, install_path, "
-        "installed_at, allowlist_proposals_json, platform_capabilities_json, "
-        "write_chat_tools_allowed "
-        "FROM installed_packages ORDER BY name"
-    ).fetchall()
-    return [
-        {
-            "name": r[0], "version": r[1], "hash": r[2],
-            "source_path": r[3], "install_path": r[4],
-            "installed_at": r[5],
-            "allowlist_proposals_json": r[6],
-            "platform_capabilities_json": r[7],
-            "write_chat_tools_allowed": bool(r[8]),
-        }
-        for r in rows
-    ]
+    rows = conn.execute(_RECORD_SELECT + " ORDER BY name").fetchall()
+    return [_row_to_record(r) for r in rows]
 
 
 def list_granted_capabilities(
@@ -1464,12 +1580,17 @@ def install_package(
     capability_input_fn=None,
     capability_prompt_stream=None,
     allow_write_chat_tools: bool = False,
+    provenance=None,
+    resolved: str = "",
 ) -> InstallResult:
     """Validate, hash, and install a capability package.
 
     Args:
         source_path: Path to the source package directory (the parent
-            of ``manifest.yaml``).
+            of ``manifest.yaml``).  Always a LOCAL directory: a remote
+            source is fetched into a quarantine directory first (see
+            :mod:`carpenter.packages.fetch`) and that directory is what
+            arrives here.
         dest_path: Where to materialize the installed copy
             (``~/carpenter/packages/<name>/`` in production).  The
             directory is created if missing; if it exists it is
@@ -1483,6 +1604,15 @@ def install_package(
             only on explicit operator consent (CLI ``--allow-write-chat-
             tools`` or interactive prompt).  This is SEPARATE from the
             platform-capability egress grant (``capability_input_fn``).
+        provenance: Optional
+            :class:`carpenter.packages.sources.SourceSpec` describing
+            where ``source_path``'s bytes came from.  Recorded in the
+            install row's ``source_*`` columns (URL redacted).  Omitted
+            — the default — records NULL provenance, which is how every
+            install behaved before these columns existed.
+        resolved: What pins the fetched bytes: a git commit sha40 or an
+            archive sha256.  Empty for a local source.  Only meaningful
+            alongside ``provenance``.
 
     Returns:
         :class:`InstallResult` with the recorded hash + paths.
@@ -1581,6 +1711,13 @@ def install_package(
         installed_at=installed_at,
         granted_capabilities=granted_installed_caps,
         write_chat_tools_allowed=allow_write_chat_tools,
+        # Deliberately NO carry-over from ``prior_record`` here: a
+        # re-install can legitimately come from a different source than
+        # the one recorded, so inheriting the old row's provenance would
+        # mis-record where these bytes came from.  A caller that knows
+        # the source says so; silence means "unknown".
+        provenance=provenance,
+        resolved=resolved,
     )
 
     # B-full: merge the proposed allowlist additions into the platform's

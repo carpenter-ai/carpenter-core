@@ -295,6 +295,10 @@ def apply_reconciled_install(
         pkg_hash=pkg_hash,
         installed_at=installed_at,
         write_chat_tools_allowed=prior_write_allowed,
+        # A reconcile re-records the SAME source's bytes, so the row's
+        # source provenance carries forward unchanged rather than being
+        # erased by the re-record.
+        provenance_carry_over=record,
     )
 
     # Refresh KB articles for the reconciled tree the same way install
