@@ -27,6 +27,18 @@ The shape of the contract is deliberate:
   directory (there is nothing to pin: the operator's own tree is the
   anchor).  It is what the install record stores so a later run can tell
   whether it would get the same bytes.
+* **The egress gate belongs to the dispatcher; redirects belong to the
+  fetcher.** :func:`fetch_source` runs every non-local spec's URL past
+  :func:`carpenter.security.egress.check_url` before it dispatches, so
+  the check cannot be forgotten by a fetcher and every future fetcher
+  inherits it.  That gate sees one URL.  **Any fetcher that follows HTTP
+  redirects must re-check every hop** with
+  :func:`carpenter.security.egress.check_redirect`, exactly as
+  ``carpenter/tool_backends/web.py`` does (it follows redirects by hand
+  for this reason: see ``_MAX_REDIRECTS`` there and the ``check_url`` /
+  ``check_redirect`` pair around its request).  Without that, a 302 from
+  an allowed host to a loopback, link-local or metadata address walks
+  straight through the gate.
 """
 
 from __future__ import annotations
@@ -37,7 +49,9 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import ClassVar, Protocol, runtime_checkable
+from urllib.parse import urlsplit
 
+from ..security import egress
 from .sources import SourceSpec
 
 logger = logging.getLogger(__name__)
@@ -246,6 +260,49 @@ class LocalDirectoryFetcher:
 register_fetcher(LocalDirectoryFetcher())
 
 
+# ── the egress gate ─────────────────────────────────────────────────
+
+
+def _check_egress(spec: SourceSpec) -> None:
+    """Refuse a remote source the platform's egress guard denies.
+
+    One gate for every remote kind, in the dispatcher rather than in
+    each fetcher: a package source is reached from the platform process,
+    which can reach loopback services, the local network and cloud
+    metadata endpoints that trust network location instead of
+    credentials.  The allowlist is the platform's existing
+    ``web_egress_allowlist`` — there is no second allowlist concept for
+    packages — so an operator naming a forge on a private network adds
+    its host there, once, and the message says so.
+
+    Raises:
+        FetchError: ``spec`` has no URL to check, or the guard refused
+            it.  The guard's own ``EgressDenied`` is chained as the
+            cause, and its message (which may name the resolved address)
+            is quoted once; nothing further about the destination is
+            added here.
+    """
+    url = spec.url or ""
+    if not url:
+        raise FetchError(
+            f"{spec.kind} source {spec.raw!r} has no URL, so its "
+            f"destination cannot be checked",
+        )
+    try:
+        host = urlsplit(url).hostname or ""
+    except ValueError:  # pragma: no cover — defensive
+        host = ""
+    try:
+        egress.check_url(url)
+    except egress.EgressDenied as exc:
+        where = f"host {host!r}" if host else f"source {spec.raw!r}"
+        raise FetchError(
+            f"refusing to fetch package source from {where}: the platform "
+            f"will not fetch from it ({exc}). An operator must add the host "
+            f"to the web_egress_allowlist config key to allow it.",
+        ) from exc
+
+
 # ── the dispatcher ──────────────────────────────────────────────────
 
 
@@ -257,7 +314,11 @@ def fetch_source(
 ) -> FetchResult:
     """Materialise ``spec`` into a local package tree.
 
-    Dispatches on ``spec.kind`` to the registered fetcher.  For a remote
+    Dispatches on ``spec.kind`` to the registered fetcher.  A non-local
+    spec's URL is first put past the platform's egress guard
+    (:func:`carpenter.security.egress.check_url`), so no fetcher owns
+    that check; a fetcher that then follows redirects must check each hop
+    itself (see the module docstring).  For a remote
     kind a fresh per-call quarantine directory is created under
     ``staging_root`` (default :func:`staging_root_dir`) and handed to the
     fetcher as its destination; it is removed again if the fetch fails.
@@ -278,9 +339,10 @@ def fetch_source(
         really is a package tree in the place it claimed.
 
     Raises:
-        FetchError: no fetcher is registered for the kind, the fetch
-            failed, or the fetcher returned a tree that is not a package
-            directory inside its quarantine.
+        FetchError: no fetcher is registered for the kind, the egress
+            guard refused the destination, the fetch failed, or the
+            fetcher returned a tree that is not a package directory
+            inside its quarantine.
     """
     fetcher = _FETCHERS.get(spec.kind)
     if fetcher is None:
@@ -292,10 +354,14 @@ def fetch_source(
     limits = limits or FetchLimits()
 
     if spec.kind == "local":
-        # Nothing to quarantine: the directory is the operator's own.
+        # Nothing to quarantine and nothing to reach: the directory is the
+        # operator's own, so the egress guard is not consulted at all.
         result = fetcher.fetch(spec, spec.path or Path(), limits=limits)
         _validate_result(spec, result, quarantine=None)
         return result
+
+    # Every remote kind passes the egress gate before any fetcher runs.
+    _check_egress(spec)
 
     root = staging_root if staging_root is not None else staging_root_dir()
     root.mkdir(parents=True, exist_ok=True)

@@ -29,6 +29,7 @@ from carpenter.packages.fetch import (
     staging_root_dir,
 )
 from carpenter.packages.sources import SourceSpec, parse_source
+from carpenter.security import egress
 
 from .conftest import write_package
 
@@ -254,6 +255,169 @@ class TestDispatch:
                 parse_source("git+https://forge.example/org/repo.git"),
                 staging_root=tmp_path / "staging",
             )
+
+
+# ── the egress gate ─────────────────────────────────────────────────
+
+
+def _resolver(mapping):
+    """A hermetic stand-in for ``egress._resolve_host`` (no DNS).
+
+    The guard exposes ``_resolve_host`` as a module-level indirection for
+    exactly this; the fetch gate must be testable without adding a
+    bypass of its own.
+    """
+    def _resolve(host, port):
+        try:
+            return mapping[host.lower()]
+        except KeyError:
+            raise OSError(f"unknown host {host}") from None
+    return _resolve
+
+
+class _StubKindFetcher:
+    """A stub registered for a kind no real fetcher handles.
+
+    The gate lives in the dispatcher, so it must apply to a kind that
+    did not exist when it was written — not just to git and archive.
+    """
+
+    kinds: ClassVar[frozenset[str]] = frozenset({"probe"})
+
+    def __init__(self):
+        self.calls: list[SourceSpec] = []
+
+    def fetch(self, spec, dest, *, limits):
+        self.calls.append(spec)
+        tree = write_package(dest, name="demo", manifest_yaml=MANIFEST)
+        return FetchResult(
+            tree=tree, staging=dest, resolved="",
+            bytes_fetched=len(MANIFEST), files_fetched=1,
+        )
+
+
+PROBE_HOST = "forge.probe.invalid"
+PROBE_URL = f"https://{PROBE_HOST}/org/pkgs.tar.gz"
+
+
+def _probe_spec() -> SourceSpec:
+    return SourceSpec(kind="probe", raw=PROBE_URL, url=PROBE_URL)
+
+
+class TestEgressGate:
+    """Every non-local fetch passes the platform's egress guard first."""
+
+    @pytest.fixture
+    def private_host(self, monkeypatch):
+        """``PROBE_HOST`` resolves to a non-public address, hermetically."""
+        monkeypatch.setattr(
+            egress, "_resolve_host", _resolver({PROBE_HOST: ["127.0.0.1"]}),
+        )
+
+    def test_non_public_destination_is_refused(
+        self, isolated_fetchers, private_host, tmp_path,
+    ):
+        stub = _StubKindFetcher()
+        register_fetcher(stub)
+        staging_root = tmp_path / "staging"
+
+        with pytest.raises(FetchError) as excinfo:
+            fetch_source(_probe_spec(), staging_root=staging_root)
+
+        message = str(excinfo.value)
+        assert PROBE_HOST in message
+        assert "web_egress_allowlist" in message
+        assert "An operator must add the host" in message
+        # The guard's refusal is the cause, and the fetcher never ran.
+        assert isinstance(excinfo.value.__cause__, egress.EgressDenied)
+        assert stub.calls == []
+        assert not staging_root.exists()
+
+    def test_allowlisted_host_reaches_the_fetcher(
+        self, isolated_fetchers, private_host, monkeypatch, tmp_path,
+    ):
+        stub = _StubKindFetcher()
+        register_fetcher(stub)
+        monkeypatch.setitem(
+            config.CONFIG, "web_egress_allowlist", [PROBE_HOST],
+        )
+
+        result = fetch_source(_probe_spec(), staging_root=tmp_path / "staging")
+
+        assert [s.url for s in stub.calls] == [PROBE_URL]
+        assert (result.tree / "manifest.yaml").is_file()
+
+    def test_a_local_spec_never_consults_the_guard(
+        self, local_pkg, monkeypatch,
+    ):
+        checked: list[str] = []
+
+        def _refuse_everything(url):
+            checked.append(url)
+            raise egress.EgressDenied("the guard was consulted")
+
+        monkeypatch.setattr(egress, "check_url", _refuse_everything)
+
+        result = fetch_source(parse_source(str(local_pkg)))
+
+        assert result.tree == local_pkg.resolve()
+        assert checked == []
+
+    @pytest.mark.parametrize("url", [
+        "http://127.0.0.1:8000/d/demo.tar.gz",
+        "http://localhost:8000/d/demo.tar.gz",
+        "http://[::1]:8000/d/demo.tar.gz",
+    ])
+    def test_loopback_forms_work_once_allowlisted(
+        self, isolated_fetchers, monkeypatch, tmp_path, url,
+    ):
+        """The grammar's loopback exception survives the gate.
+
+        It is not exempt from it: a test server on loopback is reachable
+        because the operator listed loopback, like any other non-public
+        destination.
+        """
+        class _LoopbackStub(_StubKindFetcher):
+            kinds: ClassVar[frozenset[str]] = frozenset({"archive"})
+
+        stub = _LoopbackStub()
+        register_fetcher(stub)
+        monkeypatch.setitem(
+            config.CONFIG, "web_egress_allowlist",
+            ["127.0.0.1", "localhost", "::1"],
+        )
+
+        result = fetch_source(
+            parse_source(url), staging_root=tmp_path / "staging",
+        )
+
+        assert len(stub.calls) == 1
+        assert (result.tree / "manifest.yaml").is_file()
+
+    @pytest.mark.parametrize("url", [
+        "http://127.0.0.1:8000/d/demo.tar.gz",
+        "http://[::1]:8000/d/demo.tar.gz",
+    ])
+    def test_loopback_is_refused_until_allowlisted(
+        self, isolated_fetchers, tmp_path, url,
+    ):
+        class _LoopbackStub(_StubKindFetcher):
+            kinds: ClassVar[frozenset[str]] = frozenset({"archive"})
+
+        stub = _LoopbackStub()
+        register_fetcher(stub)
+
+        with pytest.raises(FetchError, match="web_egress_allowlist"):
+            fetch_source(parse_source(url), staging_root=tmp_path / "staging")
+        assert stub.calls == []
+
+    def test_a_remote_spec_without_a_url_is_refused(
+        self, isolated_fetchers, tmp_path,
+    ):
+        register_fetcher(_StubKindFetcher())
+        spec = SourceSpec(kind="probe", raw="probe", url=None)
+        with pytest.raises(FetchError, match="has no URL"):
+            fetch_source(spec, staging_root=tmp_path / "staging")
 
 
 class TestRegisterFetcher:
