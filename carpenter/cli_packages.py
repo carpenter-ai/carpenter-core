@@ -93,18 +93,24 @@ def _print_manifest_preview(
     pkg_hash: str,
     *,
     stream,
-    read_only_tools=None,
-    write_tools=None,
+    static=None,
 ) -> None:
     """Print a human-readable summary of what installing this package does.
 
     Args:
-        read_only_tools / write_tools: optional classified chat-tool
-            lists from :func:`installer.classify_package_chat_tools`.
+        static: optional
+            :class:`carpenter.packages.static_preview.StaticPreview`.
             When provided, the preview enumerates the package's chat
             tools grouped by capability (read-only — will register; vs
             write/effectful — gated, listing each tool + its write
             capabilities) so the operator's write opt-in is informed.
+
+            That list is read from the source with an AST parse; the
+            package's own code is never executed to build this preview,
+            which is what makes it safe to show BEFORE the operator has
+            agreed to install.  The price is that a non-literal
+            declaration cannot be read, so the preview prints every such
+            value as explicitly undetermined rather than guessing.
     """
     p = lambda *a: print(*a, file=stream)  # noqa: E731
     p("")
@@ -128,11 +134,16 @@ def _print_manifest_preview(
     # informed.  Read-only tools register by default; write/effectful
     # tools are GATED and only register with an explicit --allow-write-
     # chat-tools opt-in.
-    if read_only_tools is not None or write_tools is not None:
-        ro = read_only_tools or []
-        wr = write_tools or []
+    if static is not None:
+        from .packages.static_preview import (
+            NOT_EXECUTED_NOTICE,
+            UNRESOLVED_NOTICE,
+        )
+
+        ro, wr = static.as_classified()
         p("")
         p("  Chat tools by capability:")
+        p(f"    {NOT_EXECUTED_NOTICE}")
         p(f"    read-only (register by default): {len(ro)}")
         for t in ro:
             caps = ", ".join(t["capabilities"]) or "pure"
@@ -152,6 +163,19 @@ def _print_manifest_preview(
                 p(f"      • {t['name']}  write caps: {wcaps}{confirm}")
         else:
             p("    write / effectful: 0")
+        refused = static.platform_boundary_tools
+        if refused:
+            p("")
+            p(
+                "    declares trust_boundary='platform' (REFUSED at load, "
+                f"whatever you opt into): {', '.join(refused)}"
+            )
+        if static.unresolved:
+            p("")
+            p(f"    NOT DETERMINED ({len(static.unresolved)}):")
+            p(f"    {UNRESOLVED_NOTICE}")
+            for note in static.unresolved:
+                p(f"      • {note}")
 
     # Credential requirements (env-var keys the package needs).
     creds = manifest.credential_requirements
@@ -199,7 +223,7 @@ def _print_manifest_preview(
 def _cmd_install(argv: list[str]) -> int:
     """Handle: python3 -m carpenter packages install <source_name|--path dir>."""
     from .db import db_transaction
-    from .packages import installer
+    from .packages import installer, static_preview
     from .packages.manifest import ManifestError, load_manifest
     from .packages.security import PackageSecurityError
 
@@ -290,18 +314,17 @@ def _cmd_install(argv: list[str]) -> int:
         return 1
 
     # Classify the package's chat tools so the preview can group them by
-    # capability and the operator's write opt-in is informed.  Best-effort:
-    # a module that fails to import simply yields no entries.
-    try:
-        read_only_tools, write_tools = installer.classify_package_chat_tools(
-            manifest,
-        )
-    except Exception:  # noqa: BLE001 — preview is best-effort
-        read_only_tools, write_tools = [], []
+    # capability and the operator's write opt-in is informed.  Read
+    # STATICALLY (AST only): this preview is shown before the operator
+    # has agreed to install anything, so importing the source tree to
+    # build it would execute a not-yet-trusted package's module-level
+    # code — the very decision the preview exists to inform.  Anything
+    # the parse cannot settle is reported, never guessed.
+    static = static_preview.inspect_package_chat_tools(source_path, manifest)
+    write_tools = [t["name"] for t in static.as_classified()[1]]
 
     _print_manifest_preview(
-        manifest, pkg_hash, stream=sys.stderr,
-        read_only_tools=read_only_tools, write_tools=write_tools,
+        manifest, pkg_hash, stream=sys.stderr, static=static,
     )
 
     dest_path = _install_destination_for(manifest.name)
@@ -313,16 +336,32 @@ def _cmd_install(argv: list[str]) -> int:
     # capabilities, NON-interactive without the flag does NOT fail — the
     # write chat tools are simply gated off (silently) and the package
     # still installs.
+    #
+    # The static read drives this gate, and it fails closed: when the
+    # package declares chat tools but the parse could not settle
+    # something about them, it is treated as write-capable.  A preview
+    # that cannot prove a package is read-only must not install it as if
+    # it were.
     allow_write_chat_tools = bool(args.allow_write_chat_tools)
-    if write_tools and not allow_write_chat_tools:
-        wnames = ", ".join(t["name"] for t in write_tools)
+    needs_write_consent = static_preview.write_consent_required(
+        static, manifest,
+    )
+    if needs_write_consent and not allow_write_chat_tools:
+        if write_tools:
+            headline = (
+                f"  Package {manifest.name!r} ships {len(write_tools)} "
+                f"WRITE-capable chat tool(s): {', '.join(write_tools)}"
+            )
+        else:
+            headline = (
+                f"  Package {manifest.name!r} declares chat tools whose "
+                f"capabilities could NOT be determined without running its "
+                f"code ({len(static.unresolved)} item(s) above), so they are "
+                f"treated as WRITE-capable"
+            )
         if hasattr(sys.stdin, "isatty") and sys.stdin.isatty():
             print("", file=sys.stderr)
-            print(
-                f"  Package {manifest.name!r} ships {len(write_tools)} "
-                f"WRITE-capable chat tool(s): {wnames}",
-                file=sys.stderr,
-            )
+            print(headline, file=sys.stderr)
             print(
                 "  The chat agent is read-only by default. Enable these "
                 "write chat tools for this package?",
@@ -348,10 +387,11 @@ def _cmd_install(argv: list[str]) -> int:
                 )
         else:
             # Non-interactive without the flag → simply gated off.
+            print(headline, file=sys.stderr)
             print(
-                f"  NOTE: {len(write_tools)} write chat tool(s) ({wnames}) "
-                "are GATED off (chat agent is read-only by default). "
-                "Re-run with --allow-write-chat-tools to enable them.",
+                "  NOTE: write chat tools are GATED off (chat agent is "
+                "read-only by default). Re-run with "
+                "--allow-write-chat-tools to enable them.",
                 file=sys.stderr,
             )
 

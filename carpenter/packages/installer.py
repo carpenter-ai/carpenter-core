@@ -715,6 +715,20 @@ def classify_package_chat_tools(
 ) -> tuple[list[dict], list[dict]]:
     """Inspect a manifest's chat-tool modules and split tools by capability.
 
+    .. warning::
+
+       This **imports the package's python**, which runs its
+       module-level code.  It is therefore only safe for a tree the
+       operator has already consented to installing.  Do NOT call it to
+       build a pre-consent preview: for a source the operator has not
+       yet agreed to trust (anything fetched from a remote, in
+       particular) importing the tree to describe it executes
+       attacker-supplied code before the prompt that was supposed to
+       authorise it.  Use
+       :func:`carpenter.packages.static_preview.inspect_package_chat_tools`
+       there — it reads the same declarations with an AST parse and
+       reports what it cannot read instead of guessing.
+
     Imports each declared chat-tool module (package-aware, the same path
     the registry uses) and collects ``@chat_tool``-decorated callables,
     partitioning them into read-only and write/effectful groups so the

@@ -148,6 +148,12 @@ from .fetch import (
     register_fetcher,
     staging_root_dir,
 )
+from .static_preview import (
+    StaticPreview,
+    StaticToolInfo,
+    inspect_package_chat_tools,
+    write_consent_required,
+)
 from .archive_cache import (
     ArchiveCacheError,
     ArchiveFetcher,
@@ -192,6 +198,10 @@ __all__ = [
     "list_blocking_arcs",
     "uninstall_package",
     "verify_install",
+    "StaticPreview",
+    "StaticToolInfo",
+    "inspect_package_chat_tools",
+    "write_consent_required",
     "CapabilityContext",
     "CapabilityError",
     "CapabilityRegistry",

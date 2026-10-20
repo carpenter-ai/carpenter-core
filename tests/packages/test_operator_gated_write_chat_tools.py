@@ -90,6 +90,56 @@ chat_tools:
 """
 
 
+# A package whose chat tool builds its capability list at runtime, so a
+# static read cannot settle what it declares.  Previewing it without
+# running it must fail closed rather than assume read-only.
+DYNCAPS_TOOLS_PY = """\
+from carpenter.chat_tool_loader import chat_tool
+
+CAPS = ["database_read"]
+
+
+@chat_tool(
+    description="Capabilities come from a module variable.",
+    input_schema={"type": "object", "properties": {}, "required": []},
+    capabilities=CAPS,
+)
+def pkg_dyncaps(tool_input, **kwargs):
+    return "ok"
+"""
+
+DYNCAPS_MANIFEST = """\
+name: dyncaps
+version: "0.1.0"
+description: Declares its chat-tool capabilities indirectly.
+chat_tools:
+  - tools.py
+"""
+
+# A read-only tool beside a module that cannot be parsed at all.
+READ_TOOL_PY = """\
+from carpenter.chat_tool_loader import chat_tool
+
+
+@chat_tool(
+    description="Read-only lister.",
+    input_schema={"type": "object", "properties": {}, "required": []},
+    capabilities=["database_read"],
+)
+def pkg_halfread_list(tool_input, **kwargs):
+    return "listed"
+"""
+
+HALFREAD_MANIFEST = """\
+name: halfread
+version: "0.1.0"
+description: One readable chat-tool module and one that is not.
+chat_tools:
+  - tools.py
+  - broken.py
+"""
+
+
 @pytest.fixture
 def db_conn():
     conn = sqlite3.connect(":memory:")
@@ -339,3 +389,149 @@ class TestCliInstallPreview:
         # Package installed, but write chat tools gated off.
         assert get_install_record(db_conn, "mixed") is not None
         assert write_chat_tools_allowed_for_package(db_conn, "mixed") is False
+
+    # ── the preview is built without running the package's code ─────
+    #
+    # The write opt-in is decided from a STATIC read of the source.
+    # Importing the tree to build this preview would run a package the
+    # operator has not yet agreed to install.
+
+    def test_preview_never_imports_the_package(
+        self, tmp_path, monkeypatch, capsys, db_conn,
+    ):
+        from carpenter import cli_packages
+        from carpenter.packages.static_preview import NOT_EXECUTED_NOTICE
+
+        marker = tmp_path / "executed.marker"
+        monkeypatch.setenv("CARPENTER_TEST_PREVIEW_MARKER", str(marker))
+        fixture = (
+            Path(__file__).parent / "fixtures" / "hostile_preview_pkg"
+        )
+        monkeypatch.setattr(
+            cli_packages, "_source_dir_for", lambda n: fixture,
+        )
+        monkeypatch.setattr(
+            cli_packages, "_install_destination_for",
+            lambda n: tmp_path / "installed" / n,
+        )
+        monkeypatch.setattr("sys.stdin", io.StringIO(""))
+
+        rc = cli_packages._cmd_install(["hostile_preview"])
+
+        assert rc == 0
+        assert not marker.exists(), (
+            "the install preview executed the package's module-level code"
+        )
+        err = capsys.readouterr().err
+        assert NOT_EXECUTED_NOTICE in err
+        # The tool is still described, and still gated.
+        assert "hostile_tool" in err
+        assert "filesystem_write" in err
+        assert write_chat_tools_allowed_for_package(
+            db_conn, "hostile_preview",
+        ) is False
+
+    def test_unreadable_capabilities_require_the_write_opt_in(
+        self, tmp_path, monkeypatch, capsys, db_conn,
+    ):
+        # Fail closed: the capability list is not a literal, so the
+        # static read cannot prove the package is read-only.
+        from carpenter import cli_packages
+
+        src_root = tmp_path / "dyn_root"
+        _make_source(src_root, "dyncaps", DYNCAPS_MANIFEST, DYNCAPS_TOOLS_PY)
+        monkeypatch.setattr(
+            cli_packages, "_source_dir_for", lambda n: src_root / n,
+        )
+        monkeypatch.setattr(
+            cli_packages, "_install_destination_for",
+            lambda n: tmp_path / "installed" / n,
+        )
+        monkeypatch.setattr("sys.stdin", io.StringIO(""))
+
+        rc = cli_packages._cmd_install(["dyncaps"])
+
+        assert rc == 0
+        err = capsys.readouterr().err
+        assert "NOT DETERMINED" in err
+        assert "could NOT be determined" in err
+        # An unreadable capability list makes the tool itself count as
+        # write-capable, so it is named in the gated group.
+        assert "pkg_dyncaps" in err
+        assert "WRITE-capable chat tool(s)" in err
+        assert write_chat_tools_allowed_for_package(db_conn, "dyncaps") is False
+
+    def test_an_unparseable_module_alone_forces_the_write_opt_in(
+        self, tmp_path, monkeypatch, capsys, db_conn,
+    ):
+        # Nothing readable is write-capable here: the only declared tool
+        # is read-only.  The second module cannot be parsed, so the
+        # package still cannot be proven read-only and the gate applies.
+        from carpenter import cli_packages
+
+        src_root = tmp_path / "broken_root"
+        pkg = _make_source(
+            src_root, "halfread", HALFREAD_MANIFEST, READ_TOOL_PY,
+        )
+        (pkg / "broken.py").write_text("def nope(:\n    pass\n")
+        monkeypatch.setattr(
+            cli_packages, "_source_dir_for", lambda n: src_root / n,
+        )
+        monkeypatch.setattr(
+            cli_packages, "_install_destination_for",
+            lambda n: tmp_path / "installed" / n,
+        )
+        monkeypatch.setattr("sys.stdin", io.StringIO(""))
+
+        rc = cli_packages._cmd_install(["halfread"])
+
+        assert rc == 0
+        err = capsys.readouterr().err
+        assert "could not be parsed" in err
+        assert "treated as WRITE-capable" in err
+        assert write_chat_tools_allowed_for_package(
+            db_conn, "halfread",
+        ) is False
+
+    def test_unreadable_capabilities_can_be_opted_in(
+        self, tmp_path, monkeypatch, db_conn,
+    ):
+        from carpenter import cli_packages
+
+        src_root = tmp_path / "dyn_root"
+        _make_source(src_root, "dyncaps", DYNCAPS_MANIFEST, DYNCAPS_TOOLS_PY)
+        monkeypatch.setattr(
+            cli_packages, "_source_dir_for", lambda n: src_root / n,
+        )
+        monkeypatch.setattr(
+            cli_packages, "_install_destination_for",
+            lambda n: tmp_path / "installed" / n,
+        )
+        rc = cli_packages._cmd_install(["dyncaps", "--allow-write-chat-tools"])
+        assert rc == 0
+        assert write_chat_tools_allowed_for_package(db_conn, "dyncaps") is True
+
+    def test_interactive_yes_opts_in_for_an_unreadable_package(
+        self, tmp_path, monkeypatch, db_conn,
+    ):
+        from carpenter import cli_packages
+
+        src_root = tmp_path / "dyn_root"
+        _make_source(src_root, "dyncaps", DYNCAPS_MANIFEST, DYNCAPS_TOOLS_PY)
+        monkeypatch.setattr(
+            cli_packages, "_source_dir_for", lambda n: src_root / n,
+        )
+        monkeypatch.setattr(
+            cli_packages, "_install_destination_for",
+            lambda n: tmp_path / "installed" / n,
+        )
+
+        class _Tty(io.StringIO):
+            def isatty(self):
+                return True
+
+        monkeypatch.setattr("sys.stdin", _Tty(""))
+        monkeypatch.setattr("builtins.input", lambda *_a: "yes")
+        rc = cli_packages._cmd_install(["dyncaps"])
+        assert rc == 0
+        assert write_chat_tools_allowed_for_package(db_conn, "dyncaps") is True

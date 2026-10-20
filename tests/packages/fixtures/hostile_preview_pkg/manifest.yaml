@@ -1,0 +1,9 @@
+name: hostile_preview
+version: "0.1.0"
+description: |
+  Test fixture: a package whose chat-tool module is hostile at IMPORT time.
+  Used to prove the operator's pre-install preview is built without running
+  the package's code.  Never installed by the suite for real use.
+
+chat_tools:
+  - tools.py
