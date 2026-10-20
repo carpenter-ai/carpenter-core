@@ -4,7 +4,14 @@
  * this script reads are the per-package grant checkboxes.  Destination,
  * package name, source spec and tree hash are never sent — the server
  * takes all of those from the recorded request.
+ *
+ * Deciding needs platform authentication as well as the link: UI_TOKEN
+ * is substituted in only when the viewer opened this page with a valid
+ * platform token, so an approval cannot be made by whoever holds the
+ * link alone.  Without it the POST is refused with 401, which the
+ * error path below reports.
  */
+var UI_TOKEN = "__UI_TOKEN__";
 function _collectGrants() {
     var grants = {};
     var boxes = document.querySelectorAll('input[data-pkg]');
@@ -33,12 +40,20 @@ function decide(decision) {
         payload.grants = _collectGrants();
     }
     _disableButtons();
+    var hdrs = {'Content-Type': 'application/json'};
+    if (UI_TOKEN) { hdrs['Authorization'] = 'Bearer ' + UI_TOKEN; }
     fetch('__DECIDE_URL__', {
         method: 'POST',
-        headers: {'Content-Type': 'application/json'},
+        headers: hdrs,
         body: JSON.stringify(payload)
     }).then(function(r) {
         return r.json().then(function(data) {
+            if (r.status === 401) {
+                throw new Error(
+                    'Not signed in to the platform. Open this page from the '
+                    + 'Carpenter web UI (or with your platform token) to '
+                    + 'approve or reject. Nothing was changed.');
+            }
             if (!r.ok) { throw new Error(data.detail || 'Request failed'); }
             return data;
         });

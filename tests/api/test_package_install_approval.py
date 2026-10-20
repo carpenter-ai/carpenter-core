@@ -22,6 +22,7 @@ from starlette.testclient import TestClient
 
 from carpenter import config
 from carpenter.api import package_install
+from carpenter.api.auth import TokenAuthMiddleware
 from carpenter.api.http import http_exception_handler
 from carpenter.db import db_connection, get_db
 from carpenter.packages import install_requests as ir
@@ -737,3 +738,148 @@ def test_the_approval_survives_a_restart(installer_tables, fake_fetch, client):
     resp = fresh.get(f"/api/package-install/{out.token}")
     assert resp.status_code == 200
     assert out.record.preview[0]["tree_hash"] in resp.text
+
+
+# ── the decide route needs platform authentication (F3) ─────────────
+
+UI_TOKEN = "ui-token-for-the-signed-in-operator"
+
+
+@pytest.fixture
+def gated_client(monkeypatch):
+    """A client behind the real token middleware, with a UI token set.
+
+    The plain ``client`` fixture mounts the routes bare, which is how
+    the rest of this file tests the page itself.  These tests are about
+    the gate, so they need the middleware the server actually installs.
+    """
+    monkeypatch.setitem(config.CONFIG, "ui_token", UI_TOKEN)
+    app = Starlette(routes=package_install.routes)
+    app.add_exception_handler(HTTPException, http_exception_handler)
+    app.add_middleware(TokenAuthMiddleware)
+    return TestClient(app)
+
+
+def test_the_approval_page_stays_open_without_a_ui_token(
+    installer_tables, fake_fetch, gated_client,
+):
+    """A human must still be able to read what was requested."""
+    _hello(fake_fetch)
+    out = _request([_git()])
+    resp = gated_client.get(f"/api/package-install/{out.token}")
+    assert resp.status_code == 200
+    assert out.record.preview[0]["tree_hash"] in resp.text
+
+
+def test_an_unauthenticated_post_cannot_approve(
+    installer_tables, fake_fetch, gated_client,
+):
+    """F3: holding the link must not be enough to approve the install."""
+    _hello(fake_fetch)
+    out = _request([_git()])
+
+    resp = gated_client.post(
+        f"/api/package-install/{out.token}/decide",
+        json={"decision": "approve"},
+    )
+    assert resp.status_code == 401
+    assert _status(out.token) == pi.STATUS_REQUESTED
+    assert _work_items() == []
+
+
+def test_the_request_token_alone_is_not_sufficient_to_approve(
+    installer_tables, fake_fetch, gated_client,
+):
+    """The approval token is not a platform credential.
+
+    Presenting it where the platform token goes — the ``token`` query
+    parameter and the bearer header — must not approve anything, which
+    is what makes a leaked link (it lives in the conversation that
+    asked) worth less than a signed-in session.
+    """
+    _hello(fake_fetch)
+    out = _request([_git()])
+
+    query = gated_client.post(
+        f"/api/package-install/{out.token}/decide?token={out.token}",
+        json={"decision": "approve"},
+    )
+    header = gated_client.post(
+        f"/api/package-install/{out.token}/decide",
+        json={"decision": "approve"},
+        headers={"Authorization": f"Bearer {out.token}"},
+    )
+    assert query.status_code == 401
+    assert header.status_code == 401
+    assert _status(out.token) == pi.STATUS_REQUESTED
+    assert _work_items() == []
+
+
+def test_an_authenticated_post_approves(
+    installer_tables, fake_fetch, gated_client,
+):
+    _hello(fake_fetch)
+    out = _request([_git()])
+
+    resp = gated_client.post(
+        f"/api/package-install/{out.token}/decide",
+        json={"decision": "approve"},
+        headers={"Authorization": f"Bearer {UI_TOKEN}"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == pi.STATUS_APPROVED
+    assert _status(out.token) == pi.STATUS_APPROVED
+    assert len(_work_items()) == 1
+
+
+def test_an_unauthenticated_post_cannot_reject_either(
+    installer_tables, fake_fetch, gated_client,
+):
+    """Rejection deletes the quarantine, so it is a decision too."""
+    _hello(fake_fetch)
+    out = _request([_git()])
+    resp = gated_client.post(
+        f"/api/package-install/{out.token}/decide",
+        json={"decision": "reject"},
+    )
+    assert resp.status_code == 401
+    assert _status(out.token) == pi.STATUS_REQUESTED
+
+
+def test_the_page_says_approving_needs_a_signed_in_session(
+    installer_tables, fake_fetch, client,
+):
+    _hello(fake_fetch)
+    out = _request([_git()])
+    page = client.get(f"/api/package-install/{out.token}").text
+    assert "signed in" in page
+    assert "Reading this page needs only the link" in page
+
+
+def test_the_page_forwards_the_ui_token_only_to_a_signed_in_viewer(
+    installer_tables, fake_fetch, monkeypatch, client,
+):
+    """The page must not hand the platform token to whoever has the link."""
+    monkeypatch.setitem(config.CONFIG, "ui_token", UI_TOKEN)
+    _hello(fake_fetch)
+    out = _request([_git()])
+
+    anonymous = client.get(f"/api/package-install/{out.token}").text
+    assert UI_TOKEN not in anonymous
+
+    signed_in = client.get(
+        f"/api/package-install/{out.token}?token={UI_TOKEN}",
+    ).text
+    assert UI_TOKEN in signed_in
+
+
+def test_a_wrong_token_in_the_page_url_is_not_echoed(
+    installer_tables, fake_fetch, monkeypatch, client,
+):
+    monkeypatch.setitem(config.CONFIG, "ui_token", UI_TOKEN)
+    _hello(fake_fetch)
+    out = _request([_git()])
+    page = client.get(
+        f"/api/package-install/{out.token}?token=</script><script>x",
+    ).text
+    assert "<script>x" not in page

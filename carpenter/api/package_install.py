@@ -6,11 +6,16 @@ already resolved, fetched into quarantine and statically previewed the
 sources, and written a ``pending_package_installs`` row; this module
 puts that row in front of a human and records what they decide.
 
-**The uuid4 token in the URL is the credential.**  Same contract as a
-review link (:mod:`carpenter.api.review`): the path is left out of the
-UI-token gate in :mod:`carpenter.api.auth` so the link works from a
-chat app or an email, which means the token must be unguessable, is
-single-use, expires, and is logged only as its first eight characters.
+**The uuid4 token in the URL names the request; it does not approve
+it.**  The GET is left out of the UI-token gate in
+:mod:`carpenter.api.auth` so the link opens from a chat app or an email,
+which means the token must be unguessable, is single-use, expires, and
+is logged only as its first eight characters.  The decide route is
+**not** exempt: approving installs unsandboxed platform-side code, and
+the approval URL is returned to the chat agent that asked and persisted
+in the conversation, so possession of the link is not evidence a human
+acted.  Deciding therefore needs a session authenticated to the
+platform as well, and the page says so (:data:`AUTH_NOTE_LINES`).
 
 Three rules this module exists to enforce:
 
@@ -34,6 +39,7 @@ browser refresh mid-request would open a double-install window.
 
 from __future__ import annotations
 
+import hmac
 import html
 import json
 import logging
@@ -45,11 +51,13 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse
 from starlette.routing import Route
 
+from .. import config
 from ..db import db_connection, db_transaction
 from ..packages import fetch as fetch_mod
 from ..packages import pending_install
 from ..packages.install_requests import REQUEST_URL_PREFIX
 from ..packages.pending_install import PendingInstallStateError
+from .auth import extract_token
 from .static import load_template, read_asset
 
 logger = logging.getLogger(__name__)
@@ -87,6 +95,20 @@ RATCHET_WARNING = (
     "One-way ratchet: uninstalling the package does NOT remove these "
     "security-policy entries (SD5). Approving widens what the platform "
     "will reach, permanently, until an operator removes them by hand."
+)
+
+#: Said on the page, because the one thing an operator must not have to
+#: discover by clicking is that the button will refuse them.  Approving
+#: deliberately needs more than the link: see :func:`carpenter.api.auth.
+#: is_protected`.
+AUTH_NOTE_LINES = (
+    "Reading this page needs only the link. APPROVING needs you to be "
+    "signed in to this platform as well.",
+    "If the buttons refuse with \u201cnot signed in\u201d, open this page "
+    "from the Carpenter web UI (or append your platform token) and decide "
+    "there. The link alone cannot install anything \u2014 whoever or "
+    "whatever passed it on, including the assistant that asked, cannot "
+    "approve it.",
 )
 
 #: What a credential requirement is, and is not.
@@ -503,10 +525,41 @@ def _render_package(entry: dict, index: int) -> str:
     )
 
 
+def _render_auth_note() -> str:
+    """The "approving needs a signed-in session" block."""
+    return (
+        '<div class="warn">'
+        + "".join(f"<p>{_esc(line)}</p>" for line in AUTH_NOTE_LINES)
+        + "</div>"
+    )
+
+
+def _viewer_ui_token(request: Request) -> str:
+    """The platform token to hand the page's script, or ``""``.
+
+    Echoed back only when the viewer already presented the configured
+    ``ui_token``, so the page never hands the platform credential to
+    someone who merely holds the approval link — and never reflects an
+    attacker-chosen string into the script either.
+    """
+    configured = config.CONFIG.get("ui_token", "") or ""
+    if not configured:
+        return ""
+    provided = extract_token(request)
+    if provided and hmac.compare_digest(provided, configured):
+        return configured
+    return ""
+
+
 # ── pages ───────────────────────────────────────────────────────────
 
-def _render_approval_page(record) -> HTMLResponse:
-    """The approval page for a ``requested`` row."""
+def _render_approval_page(record, ui_token: str = "") -> HTMLResponse:
+    """The approval page for a ``requested`` row.
+
+    ``ui_token`` is the platform token the viewer presented, if any; the
+    page's script sends it with the decision because the decide route
+    requires platform authentication on top of the link.
+    """
     names = [n for n in _package_names(record) if n]
     subtitle = (
         f"{len(record.preview)} package(s): "
@@ -519,7 +572,7 @@ def _render_approval_page(record) -> HTMLResponse:
     css = read_asset("package-install.css")
     js = read_asset("package-install.js").replace(
         "__DECIDE_URL__", f"{REQUEST_URL_PREFIX}{record.token}/decide",
-    )
+    ).replace("__UI_TOKEN__", ui_token)
     html_page = load_template(
         "package-install.html",
         token_short=record.token_prefix,
@@ -529,6 +582,7 @@ def _render_approval_page(record) -> HTMLResponse:
         attribution=_render_attribution(record),
         timing=_render_timing(record),
         packages=packages,
+        auth_note=_render_auth_note(),
         footnote=(
             "Nothing on this page can change what gets installed: the "
             "destination, the package name, the source spec and the tree "
@@ -646,7 +700,7 @@ async def view_request(request: Request):
         "Package install approval page served for request %s (%d package(s))",
         record.token_prefix, len(record.preview),
     )
-    return _render_approval_page(record)
+    return _render_approval_page(record, _viewer_ui_token(request))
 
 
 def _normalize_grants(record, raw) -> dict:

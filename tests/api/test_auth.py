@@ -54,11 +54,21 @@ class TestIsProtected:
             "/api/package-install/550e8400-e29b-41d4-a716-446655440000", "GET",
         ) is False
 
-    def test_package_install_decide_not_protected(self):
+    def test_package_install_decide_is_protected(self):
+        # Deliberately unlike the review precedent: the approval link is
+        # returned to the chat agent and persisted in the conversation,
+        # so the token alone must not approve unsandboxed platform code.
         assert is_protected(
             "/api/package-install/550e8400-e29b-41d4-a716-446655440000/decide",
             "POST",
-        ) is False
+        ) is True
+
+    def test_package_install_page_is_open_for_reading_only(self):
+        token_path = "/api/package-install/550e8400-e29b-41d4-a716-446655440000"
+        assert is_protected(token_path, "GET") is False
+        assert is_protected(token_path, "HEAD") is False
+        assert is_protected(token_path, "POST") is True
+        assert is_protected(token_path, "DELETE") is True
 
     def test_package_install_prefix_itself_is_protected(self):
         # Only a path carrying a token is open; the bare prefix is not,
