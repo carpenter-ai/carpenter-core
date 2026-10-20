@@ -49,6 +49,13 @@ from carpenter.packages.fetch import FetchResult
 from carpenter.packages.sources import ConfiguredSource, parse_source
 
 from .conftest import write_package
+# Imported for use as a fixture: the loopback dulwich server that
+# ``test_fetch_git`` serves its repositories from.  One copy of that
+# machinery is enough, and the end-to-end listing test below needs the
+# real GitFetcher to have a real repository to clone.
+from .test_fetch_git import _commit_all as git_commit_all
+from .test_fetch_git import _init as git_init
+from .test_fetch_git import git_server  # noqa: F401 — a pytest fixture
 
 HOST = "forge.discover.invalid"
 MONO_URL = f"git+https://{HOST}/org/packages.git"
@@ -172,6 +179,21 @@ def solo(tmp_path):
     (root / "manifest.yaml").write_text(_manifest("solo", version="2.0.0"))
     (root / "README.md").write_text("hello\n")
     return root
+
+
+def _head(repo: Path) -> str:
+    """The sha40 at ``repo``'s HEAD."""
+    from dulwich.repo import Repo
+
+    return Repo(str(repo)).head().decode()
+
+
+def _tree_contents(tree: Path) -> dict[str, bytes]:
+    """Every file under ``tree``, by relative path, for a byte comparison."""
+    return {
+        str(path.relative_to(tree)): path.read_bytes()
+        for path in sorted(tree.rglob("*")) if path.is_file()
+    }
 
 
 def _source(entry: dict) -> ConfiguredSource:
@@ -740,3 +762,131 @@ class TestChatTool:
         reply = tool({"source": "solo"})
         assert "Listing packages failed" in reply
         assert "Nothing was installed" in reply
+
+
+# ── a real monorepo, over loopback, through the real fetcher ─────────
+
+
+class TestAMonorepoEndToEnd:
+    """No stub: the real :class:`GitFetcher` against a real repository.
+
+    The loopback dulwich server is the one ``test_fetch_git`` uses, so
+    this exercises the whole path a listing really takes — egress gate,
+    clone, caps, hardening, quarantine — on a monorepo whose index root
+    is not a package.
+    """
+
+    LOOPBACK = "127.0.0.1"
+
+    @pytest.fixture
+    def repo(self, tmp_path) -> Path:
+        """Three good packages, one broken manifest, one non-package."""
+        root = tmp_path / "monorepo"
+        index = root / "packages"
+        for name in ("alpha", "beta", "gamma"):
+            write_package(
+                index, name=name, manifest_yaml=_manifest(name),
+                files={"tools.py": f"NAME = {name!r}\n"},
+            )
+        write_package(index, name="broken", manifest_yaml="name: [oops\n")
+        notes = index / "notes"
+        notes.mkdir(parents=True)
+        (notes / "readme.txt").write_text("how this monorepo is laid out\n")
+        (root / "README.md").write_text("a self-hosted forge monorepo\n")
+        git_init(root)
+        git_commit_all(root)
+        return root
+
+    @pytest.fixture
+    def loopback(self, tmp_path, monkeypatch, repo, git_server) -> dict:
+        """Serve ``repo`` and configure it as the ``house`` source."""
+        base = git_server({"monorepo": repo})
+        instance = tmp_path / "instance"
+        instance.mkdir()
+        entry = {
+            "name": "house",
+            "url": f"git+{base}/monorepo",
+            "subdir_template": "packages/{name}",
+        }
+        monkeypatch.setattr(
+            config, "CONFIG",
+            {
+                "base_dir": str(instance),
+                "web_egress_allowlist": [self.LOOPBACK],
+                "package_sources": [entry],
+            },
+        )
+        return {"base": base, "entry": entry, "head": _head(repo)}
+
+    def test_a_monorepo_lists_every_readable_package(self, loopback):
+        listing = list_remote_packages("house")
+
+        assert [p.name for p in listing.packages] == ["alpha", "beta", "gamma"]
+        assert [p.subdir for p in listing.packages] == [
+            "packages/alpha", "packages/beta", "packages/gamma",
+        ]
+        assert listing.resolved == loopback["head"]
+        assert [p.version for p in listing.packages] == ["0.1.0"] * 3
+        assert listing.packages[0].description == "The alpha package."
+
+    def test_one_broken_manifest_lands_in_errors_and_hides_nothing(
+        self, loopback,
+    ):
+        listing = list_remote_packages("house")
+
+        assert len(listing.errors) == 1
+        assert listing.errors[0].startswith("broken:")
+        assert len(listing.packages) == 3
+        # The non-package child is skipped silently: a monorepo is
+        # allowed to hold a notes directory.
+        assert "notes" not in str(listing.errors)
+        # And no quarantine path leaks into what a reader is shown.
+        assert "_fetch-" not in listing.errors[0]
+
+    def test_every_emitted_spec_parses_back_pinned_to_the_commit(
+        self, loopback,
+    ):
+        listing = list_remote_packages("house")
+        for package in listing.packages:
+            spec = parse_source(package.spec)
+            assert spec.kind == "git"
+            assert spec.subdir == package.subdir
+            assert spec.ref == loopback["head"]
+
+    def test_a_listed_spec_fetches_what_a_bare_name_would(self, loopback):
+        """The spec names the same subdir, and the same bytes come back."""
+        listing = list_remote_packages("house")
+        listed = next(p for p in listing.packages if p.name == "beta")
+
+        by_spec = parse_source(listed.spec)
+        by_name = parse_source("beta")
+        assert by_spec.subdir == by_name.subdir == "packages/beta"
+
+        from carpenter.packages.fetch import fetch_source
+
+        first = fetch_source(by_spec)
+        second = fetch_source(by_name)
+        try:
+            assert first.resolved == second.resolved == loopback["head"]
+            assert _tree_contents(first.tree) == _tree_contents(second.tree)
+            assert "manifest.yaml" in _tree_contents(first.tree)
+        finally:
+            fetch.cleanup(first)
+            fetch.cleanup(second)
+
+    def test_the_listing_leaves_nothing_behind(self, loopback):
+        list_remote_packages("house")
+        assert list(fetch.staging_root_dir().iterdir()) == []
+        assert not [m for m in sys.modules if m.startswith("_carpenter_pkg_")]
+
+    def test_a_template_pointing_at_the_wrong_directory_says_so(
+        self, loopback, monkeypatch,
+    ):
+        entry = {**loopback["entry"], "subdir_template": "libs/{name}"}
+        config.CONFIG["package_sources"] = [entry]
+        with pytest.raises(DiscoveryError) as exc:
+            list_remote_packages("house")
+        message = str(exc.value)
+        assert "reads the directory 'libs'" in message
+        assert "libs/{name}" in message
+        assert list(fetch.staging_root_dir().iterdir()) == []
