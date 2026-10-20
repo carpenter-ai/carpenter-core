@@ -42,10 +42,21 @@ The shape of the contract is deliberate:
   trust the ambient proxy environment (``HTTP_PROXY`` and friends): a
   proxy is a destination the gate never resolved, so what it checked
   would not be what gets connected to.
+* **Exactly one check is optional, and no install path turns it off.**
+  A fetch normally insists the tree it returns holds ``manifest.yaml``,
+  because the only thing it feeds is an installer.  Listing a monorepo
+  (:mod:`carpenter.packages.discover`) needs the directory *above* the
+  packages — an index, not a package — so :func:`fetch_source` takes
+  ``require_manifest=False`` for that one case and threads it to the
+  fetcher.  It defaults to ``True`` everywhere and nothing on the
+  install path passes it.  Everything else above stays on: the index
+  root arrives under the same caps, the same tree hardening and the
+  same quarantine, because a listing is an untrusted download too.
 """
 
 from __future__ import annotations
 
+import inspect
 import logging
 import shutil
 import tempfile
@@ -153,7 +164,12 @@ class Fetcher(Protocol):
     kinds: ClassVar[frozenset[str]]
 
     def fetch(
-        self, spec: SourceSpec, dest: Path, *, limits: FetchLimits,
+        self,
+        spec: SourceSpec,
+        dest: Path,
+        *,
+        limits: FetchLimits,
+        require_manifest: bool = True,
     ) -> FetchResult:
         """Materialise ``spec`` into ``dest`` and describe the result.
 
@@ -162,6 +178,15 @@ class Fetcher(Protocol):
         it is the operator's own source directory and must be treated as
         read-only.  Implementations enforce ``limits``, and on failure
         raise :class:`FetchError` rather than returning a partial tree.
+
+        ``require_manifest=False`` asks for the tree the spec addresses
+        even when it holds no ``manifest.yaml`` — a monorepo's index
+        root, which is what :mod:`carpenter.packages.discover` has to
+        enumerate and which is not itself a capability package.  It
+        relaxes **only** that one check: the caps, the hardening and the
+        quarantine containment are exactly as strict either way, because
+        a listing fetch is still an untrusted download.  A fetcher with
+        no manifest check of its own honours the flag by ignoring it.
         """
         ...
 
@@ -250,9 +275,20 @@ class LocalDirectoryFetcher:
     kinds: ClassVar[frozenset[str]] = frozenset({"local"})
 
     def fetch(
-        self, spec: SourceSpec, dest: Path, *, limits: FetchLimits,
+        self,
+        spec: SourceSpec,
+        dest: Path,
+        *,
+        limits: FetchLimits,
+        require_manifest: bool = True,
     ) -> FetchResult:
-        """Return ``spec``'s directory (plus any subdir) as the tree."""
+        """Return ``spec``'s directory (plus any subdir) as the tree.
+
+        ``require_manifest`` is accepted and deliberately unused: this
+        fetcher never checks for a manifest of its own (the dispatcher's
+        :func:`_validate_result` is the only check a local source gets),
+        so there is nothing here to relax.
+        """
         if spec.path is None:
             raise FetchError(
                 f"local source {spec.raw!r} has no resolved path",
@@ -322,6 +358,7 @@ def fetch_source(
     *,
     limits: FetchLimits | None = None,
     staging_root: Path | None = None,
+    require_manifest: bool = True,
 ) -> FetchResult:
     """Materialise ``spec`` into a local package tree.
 
@@ -344,16 +381,31 @@ def fetch_source(
         limits: Resource ceilings for the fetch.  Defaults to
             :class:`FetchLimits`'s own defaults.
         staging_root: Override for the quarantine root (tests).
+        require_manifest: Keep (the default) or drop the requirement
+            that the returned tree holds ``manifest.yaml``.  Dropping it
+            is for :mod:`carpenter.packages.discover`, which has to
+            enumerate a monorepo's index root — an index of packages,
+            not a package.  **It relaxes that one check and nothing
+            else**: the egress gate, every cap, the tree hardening and
+            the quarantine containment all still apply, because a
+            listing fetch is an untrusted download like any other.  No
+            install path passes it: a tree without a manifest must never
+            reach the installer.
 
     Returns:
         The :class:`FetchResult` the fetcher produced, after checking it
-        really is a package tree in the place it claimed.
+        really is a package tree — or, with ``require_manifest=False``,
+        a directory — in the place it claimed.
 
     Raises:
         FetchError: no fetcher is registered for the kind, the egress
-            guard refused the destination, the fetch failed, or the
-            fetcher returned a tree that is not a package directory
-            inside its quarantine.
+            guard refused the destination, the fetch failed, the fetcher
+            returned a tree that is not a directory inside its
+            quarantine, or (unless ``require_manifest`` is ``False``)
+            that directory is not a package.  Also when
+            ``require_manifest=False`` is asked of a fetcher whose
+            ``fetch`` predates the flag, since such a fetcher cannot be
+            asked for an index root.
     """
     fetcher = _FETCHERS.get(spec.kind)
     if fetcher is None:
@@ -367,8 +419,13 @@ def fetch_source(
     if spec.kind == "local":
         # Nothing to quarantine and nothing to reach: the directory is the
         # operator's own, so the egress guard is not consulted at all.
-        result = fetcher.fetch(spec, spec.path or Path(), limits=limits)
-        _validate_result(spec, result, quarantine=None)
+        result = _call_fetch(
+            fetcher, spec, spec.path or Path(),
+            limits=limits, require_manifest=require_manifest,
+        )
+        _validate_result(
+            spec, result, quarantine=None, require_manifest=require_manifest,
+        )
         return result
 
     # Every remote kind passes the egress gate before any fetcher runs.
@@ -378,18 +435,77 @@ def fetch_source(
     root.mkdir(parents=True, exist_ok=True)
     quarantine = Path(tempfile.mkdtemp(prefix=_QUARANTINE_PREFIX, dir=root))
     try:
-        result = fetcher.fetch(spec, quarantine, limits=limits)
-        _validate_result(spec, result, quarantine=quarantine)
+        result = _call_fetch(
+            fetcher, spec, quarantine,
+            limits=limits, require_manifest=require_manifest,
+        )
+        _validate_result(
+            spec, result,
+            quarantine=quarantine, require_manifest=require_manifest,
+        )
     except Exception:
         shutil.rmtree(quarantine, ignore_errors=True)
         raise
     return result
 
 
+def _accepts_require_manifest(fetcher: Fetcher) -> bool:
+    """Say whether ``fetcher.fetch`` takes ``require_manifest``.
+
+    ``register_fetcher`` is a public seam a platform package may use to
+    substitute its own fetcher, and :class:`Fetcher` is a Protocol, so
+    an implementation written before this flag existed is a real
+    possibility.  Such a fetcher is still called exactly as it was —
+    passing a keyword it does not accept would turn every install
+    through it into a ``TypeError`` — and is refused outright only when
+    a listing actually needs the flag honoured.
+    """
+    try:
+        signature = inspect.signature(fetcher.fetch)
+    except (TypeError, ValueError):  # pragma: no cover — exotic callables
+        return False
+    parameters = signature.parameters
+    if any(p.kind is p.VAR_KEYWORD for p in parameters.values()):
+        return True
+    return "require_manifest" in parameters
+
+
+def _call_fetch(
+    fetcher: Fetcher,
+    spec: SourceSpec,
+    dest: Path,
+    *,
+    limits: FetchLimits,
+    require_manifest: bool,
+) -> FetchResult:
+    """Invoke ``fetcher.fetch``, tolerating one that predates the flag."""
+    if _accepts_require_manifest(fetcher):
+        return fetcher.fetch(
+            spec, dest, limits=limits, require_manifest=require_manifest,
+        )
+    if not require_manifest:
+        raise FetchError(
+            f"the fetcher registered for source kind {spec.kind!r} "
+            f"({type(fetcher).__name__}) does not accept "
+            f"'require_manifest', so it cannot be asked for a tree that "
+            f"is not itself a capability package",
+        )
+    return fetcher.fetch(spec, dest, limits=limits)
+
+
 def _validate_result(
-    spec: SourceSpec, result: FetchResult, *, quarantine: Path | None,
+    spec: SourceSpec,
+    result: FetchResult,
+    *,
+    quarantine: Path | None,
+    require_manifest: bool = True,
 ) -> None:
-    """Check a fetcher honoured the contract before we trust its result."""
+    """Check a fetcher honoured the contract before we trust its result.
+
+    ``require_manifest=False`` drops the "and it is a package" assertion
+    only; a result still has to be a :class:`FetchResult` naming a real
+    directory inside the quarantine it was given.
+    """
     if not isinstance(result, FetchResult):
         raise FetchError(
             f"fetcher for {spec.kind!r} returned {type(result).__name__}, "
@@ -410,7 +526,7 @@ def _validate_result(
         raise FetchError(
             f"fetched tree {tree} for {spec.raw!r} is not a directory",
         )
-    if not (tree / "manifest.yaml").is_file():
+    if require_manifest and not (tree / "manifest.yaml").is_file():
         raise FetchError(
             f"fetched tree {tree} for {spec.raw!r} has no manifest.yaml",
         )

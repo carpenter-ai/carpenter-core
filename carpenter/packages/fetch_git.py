@@ -502,7 +502,12 @@ class GitFetcher:
     kinds: ClassVar[frozenset[str]] = frozenset({"git"})
 
     def fetch(
-        self, spec: SourceSpec, dest: Path, *, limits: FetchLimits,
+        self,
+        spec: SourceSpec,
+        dest: Path,
+        *,
+        limits: FetchLimits,
+        require_manifest: bool = True,
     ) -> FetchResult:
         """Clone ``spec`` at its ref and return the package tree.
 
@@ -514,10 +519,19 @@ class GitFetcher:
             dest: The quarantine directory to write inside.
             limits: Byte, file and wall-clock ceilings, all enforced
                 before the tree is handed back.
+            require_manifest: When ``False``, return the addressed
+                directory even though it holds no ``manifest.yaml`` —
+                a monorepo's index root, for
+                :mod:`carpenter.packages.discover`.  This is the only
+                check it relaxes: the clone is still shallow and
+                capped, submodules are still refused, and
+                :func:`_harden_tree` still runs over everything
+                materialised.
 
         Returns:
             A :class:`~.fetch.FetchResult` whose ``tree`` holds
-            ``manifest.yaml``, whose ``resolved`` is the 40-hex commit
+            ``manifest.yaml`` (unless ``require_manifest`` is
+            ``False``), whose ``resolved`` is the 40-hex commit
             actually fetched, and whose ``staging`` is ``dest``.
 
         Raises:
@@ -575,7 +589,10 @@ class GitFetcher:
             repo.close()
 
         _harden_tree(tree_root, spec)
-        if not (target / "manifest.yaml").is_file():
+        # The one check a listing fetch skips: an index root is a
+        # directory OF packages, so it has no manifest of its own.
+        # Everything above this line ran either way.
+        if require_manifest and not (target / "manifest.yaml").is_file():
             where = (
                 f"subdir {spec.subdir!r} of the git source"
                 if spec.subdir else "the git source"

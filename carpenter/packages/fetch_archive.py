@@ -512,7 +512,13 @@ def _measure_extracted(
 # ── layout: which directory inside the archive is the package ───────
 
 
-def _package_root(extract_root: Path, spec: SourceSpec, url: str) -> Path:
+def _package_root(
+    extract_root: Path,
+    spec: SourceSpec,
+    url: str,
+    *,
+    require_manifest: bool = True,
+) -> Path:
     """Resolve the package root inside an expanded archive.
 
     Two layouts are accepted, because both are published in the wild:
@@ -522,6 +528,12 @@ def _package_root(extract_root: Path, spec: SourceSpec, url: str) -> Path:
     looks like).  ``spec.subdir`` is then applied relative to whichever
     of those was found, so a monorepo published either way addresses its
     packages the same way.
+
+    With ``require_manifest=False`` the same walk happens — including
+    the containment check on ``spec.subdir`` and the "does that
+    directory exist" check — and only the final "and it holds a
+    manifest" verdict is dropped, so a listing can be handed a
+    monorepo's index root.
     """
     where = redact(url)
     base = extract_root
@@ -545,7 +557,7 @@ def _package_root(extract_root: Path, spec: SourceSpec, url: str) -> Path:
                 f"{spec.subdir!r}; it contains: {_listing(base)}",
             )
 
-    if (tree / _MANIFEST).is_file():
+    if (tree / _MANIFEST).is_file() or not require_manifest:
         return tree
 
     if spec.subdir:
@@ -584,7 +596,12 @@ class ArchiveUrlFetcher:
     kinds: ClassVar[frozenset[str]] = frozenset({"archive"})
 
     def fetch(
-        self, spec: SourceSpec, dest: Path, *, limits: FetchLimits,
+        self,
+        spec: SourceSpec,
+        dest: Path,
+        *,
+        limits: FetchLimits,
+        require_manifest: bool = True,
     ) -> FetchResult:
         """Download, verify and expand ``spec`` inside ``dest``.
 
@@ -599,6 +616,13 @@ class ArchiveUrlFetcher:
                 the tree in ``dest/_tree``.
             limits: Byte, file-count, per-file and wall-clock ceilings,
                 all enforced here.
+            require_manifest: When ``False``, the resolved directory is
+                returned even if it holds no ``manifest.yaml`` — a
+                monorepo's index root, for
+                :mod:`carpenter.packages.discover`.  Nothing else
+                changes: the redirect re-checks, the digest
+                verification, every cap and the member hardening all
+                run exactly as they do for an install.
 
         Returns:
             A :class:`~carpenter.packages.fetch.FetchResult` whose
@@ -652,7 +676,9 @@ class ArchiveUrlFetcher:
         files_fetched, expanded = _measure_extracted(
             extract_root, limits, url,
         )
-        tree = _package_root(extract_root, spec, url)
+        tree = _package_root(
+            extract_root, spec, url, require_manifest=require_manifest,
+        )
         logger.info(
             "Fetched package archive %s: %d bytes transferred, %d files "
             "expanded (%d bytes), sha256 %s",
