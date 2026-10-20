@@ -214,6 +214,11 @@ def request_package_install(tool_input, **kwargs):
         "The page shows where the bytes came from, the tree hash, what "
         "the package declares and the message this request was made for. "
         "If you did not ask for this, reject it.",
+        "",
+        "Approving requires being signed in to this platform: open the "
+        "link from the Carpenter web UI, or with your platform token. "
+        "The link alone shows you what was requested; it cannot approve "
+        "anything, and neither can I.",
     ]
     # A FinalReply ends the turn with no further model call, so this text
     # reaches the person verbatim: a model paraphrase of a security
