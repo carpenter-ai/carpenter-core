@@ -47,16 +47,17 @@ contains ``{name}`` (``packages/
 
 That directory above the placeholder is the *index root*, and it is the
 only thing a listing has to materialise.  **A monorepo index root is not
-itself a capability package**, and both the fetch dispatcher
-(``fetch._validate_result``) and the git/archive fetchers currently
-refuse to return a tree without a ``manifest.yaml`` in it.  So an index
-listing needs an additive seam on the fetch side — a listing mode that
-skips that one check — and until it exists
-:func:`list_remote_packages` refuses an index-shaped source with a
-message saying exactly that.  Everything above and below that one call
-is shape-agnostic: :func:`listing_from_tree` builds the listing from a
-materialised tree whichever shape it is, which is also how the index
-shape is tested.
+itself a capability package**, so the listing fetch is the one caller of
+:func:`carpenter.packages.fetch.fetch_source` that passes
+``require_manifest=False``: it asks for a directory rather than for a
+package.  That flag relaxes exactly one check and no other — the index
+root arrives through the same egress gate, the same byte, file and time
+caps, the same tree hardening and the same quarantine as an install
+would, because a listing is an untrusted download too.  Whether the
+tree is an index root or a single package, the rest of this module is
+shape-agnostic: :func:`listing_from_tree` builds the listing from a
+materialised tree either way, and it is the authority on "a
+single-package source must hold a manifest".
 """
 
 from __future__ import annotations
@@ -798,8 +799,7 @@ def list_remote_packages(
         DiscoveryError: unknown alias, malformed registry, a fetch the
             platform refused (the egress message is quoted, and it names
             ``web_egress_allowlist`` and the host), a missing index root,
-            or an index-shaped source, which the fetch layer cannot
-            materialise yet (see the module docstring).
+            or a single-package source whose tree holds no manifest.
     """
     source = source_for_alias(alias)
     shape = shape_for(source)
@@ -826,7 +826,12 @@ def list_remote_packages(
         source.name, redact(source.url),
     )
     try:
-        result = fetch_source(spec, limits=limits or FetchLimits())
+        # The one call that asks for a tree without a manifest: an index
+        # root is a directory OF packages.  Everything else the fetch
+        # layer enforces is on, and nothing fetched here is installed.
+        result = fetch_source(
+            spec, limits=limits or FetchLimits(), require_manifest=False,
+        )
     except FetchError as exc:
         raise DiscoveryError(_fetch_refusal(source, shape, exc)) from exc
     try:
@@ -845,25 +850,19 @@ def list_remote_packages(
 def _fetch_refusal(
     source: ConfiguredSource, shape: SourceShape, exc: FetchError,
 ) -> str:
-    """Explain a refused listing fetch, including the known gap.
+    """Explain a refused listing fetch, and say what it was reading.
 
-    An index root is not a capability package, and the fetch layer
-    refuses to hand back a tree without a ``manifest.yaml`` in it
-    (``fetch._validate_result``, and the same check inside the git and
-    archive fetchers).  Listing a monorepo therefore needs an additive
-    listing mode on the fetch side; say so rather than leaving a reader
-    to guess that their source is broken.
+    A listing fetch materialises the index root, not the whole source,
+    so the most likely configuration mistake is a ``subdir_template``
+    whose index root is not where the packages actually live.  The
+    refusal names that directory, because the fetcher's own message
+    (correctly) talks about a subdir the operator never typed.
     """
     message = f"could not list source {source.name!r}: {exc}"
-    if shape.is_index and _MANIFEST in str(exc):
-        root = shape.index_root or "the repository root"
+    if shape.is_index and shape.index_root:
         return (
-            f"{message}. {source.name!r} is configured with "
-            f"subdir_template {shape.template!r}, so listing it means "
-            f"reading the directory {root!r}, which is an index of "
-            f"packages and not a package itself. The platform's package "
-            f"fetch currently returns a tree only when it holds a "
-            f"{_MANIFEST}, so this source cannot be listed yet; install "
-            f"from it by name or by an explicit spec in the meantime."
+            f"{message}. Listing {source.name!r} reads the directory "
+            f"{shape.index_root!r}, which is where its subdir_template "
+            f"{shape.template!r} puts the packages."
         )
     return message

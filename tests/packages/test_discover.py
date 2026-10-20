@@ -15,7 +15,9 @@ What these tests are really guarding:
 * every spec string a listing emits must parse back, or the listing is
   giving out install instructions that do not work;
 * a listing must leave nothing behind — no quarantine, and no imported
-  package module.
+  package module;
+* ``require_manifest=False`` buys a listing the index root and nothing
+  else: a single-package source with no manifest is still refused.
 """
 
 from __future__ import annotations
@@ -119,9 +121,16 @@ class _StubFetcher:
         self.serve: Path | None = None
         self.resolved = COMMIT
         self.calls: list = []
+        self.manifest_required: list[bool] = []
 
-    def fetch(self, spec, dest, *, limits):
+    def fetch(self, spec, dest, *, limits, require_manifest=True):
         self.calls.append(spec)
+        # Recorded, not acted on: the real fetchers refuse a
+        # manifest-less tree themselves, and the dispatcher's
+        # ``_validate_result`` refuses one from any fetcher, so leaving
+        # the flag unenforced here keeps the dispatcher's own check
+        # under test rather than this double's.
+        self.manifest_required.append(require_manifest)
         assert self.serve is not None, "test did not set stub.serve"
         tree = Path(dest) / "tree"
         shutil.copytree(self.serve, tree)
@@ -445,26 +454,74 @@ class TestListRemotePackages:
         assert not marker.exists()
         assert not [m for m in sys.modules if m.startswith("_carpenter_pkg_")]
 
-    def test_an_index_source_cannot_be_fetched_yet(
+    def test_an_index_source_is_listed_end_to_end(
         self, base_dir, stub, monorepo,
     ):
-        """Today's gap, pinned: an index root is not a package.
+        """A monorepo index root is not a package, and lists anyway.
 
-        The stub materialises a perfectly good index root, and the fetch
-        dispatcher refuses it because the tree holds no ``manifest.yaml``
-        (``fetch._validate_result``); the real git and archive fetchers
-        refuse the same thing one step earlier.  Listing a monorepo needs
-        an additive listing mode on the fetch side; until then the
-        refusal has to say so rather than look like a broken source.
+        The listing fetch is the one caller that passes
+        ``require_manifest=False``, so the dispatcher hands back the
+        directory above the packages instead of refusing it.
         """
         _configure(MONO_SOURCE)
         stub.serve = monorepo
+        listing = list_remote_packages("house")
+        assert [p.name for p in listing.packages] == ["alpha", "beta", "gamma"]
+        assert [p.subdir for p in listing.packages] == [
+            "packages/alpha", "packages/beta", "packages/gamma",
+        ]
+        assert listing.errors == ()
+        # The index root is what was fetched, not the whole repository.
+        assert stub.calls[0].subdir == "packages"
+        assert list(fetch.staging_root_dir().iterdir()) == []
+
+    def test_a_listing_fetch_does_not_require_a_manifest(
+        self, base_dir, stub, monorepo, solo,
+    ):
+        """Whatever the shape, a listing asks for a directory.
+
+        ``listing_from_tree`` is then the authority on whether a
+        single-package source really holds a package, so the fetch
+        layer's manifest assertion is never what a listing relies on.
+        """
+        _configure(MONO_SOURCE, SOLO_SOURCE)
+        stub.serve = monorepo
+        list_remote_packages("house")
+        stub.serve = solo
+        list_remote_packages("solo")
+        assert stub.manifest_required == [False, False]
+
+    def test_a_single_package_source_without_a_manifest_still_refuses(
+        self, base_dir, stub, tmp_path,
+    ):
+        """``require_manifest=False`` must not make a listing credulous."""
+        empty = tmp_path / "not-a-package"
+        empty.mkdir()
+        (empty / "README.md").write_text("nothing to install here\n")
+        _configure(SOLO_SOURCE)
+        stub.serve = empty
+        with pytest.raises(DiscoveryError) as exc:
+            list_remote_packages("solo")
+        assert "single package" in str(exc.value)
+        assert "manifest.yaml" in str(exc.value)
+        assert list(fetch.staging_root_dir().iterdir()) == []
+
+    def test_a_missing_index_root_names_the_directory_it_read(
+        self, base_dir, stub, solo,
+    ):
+        """The operator typed a template, not a subdir; name the root."""
+        _configure(MONO_SOURCE)
+        stub.serve = solo  # no ``packages/`` anywhere in it
+
+        def refuse(spec, dest, *, limits, require_manifest=True):
+            raise fetch.FetchError("the git source has no directory 'packages'")
+
+        stub.fetch = refuse  # type: ignore[method-assign]
         with pytest.raises(DiscoveryError) as exc:
             list_remote_packages("house")
         message = str(exc.value)
-        assert "index of packages and not a package itself" in message
-        assert "'packages'" in message
-        assert list(fetch.staging_root_dir().iterdir()) == []
+        assert "reads the directory 'packages'" in message
+        assert "packages/{name}" in message
 
     def test_a_refused_fetch_is_reported_not_raised_raw(
         self, base_dir, stub, solo,
