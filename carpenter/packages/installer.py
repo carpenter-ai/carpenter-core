@@ -125,10 +125,19 @@ class InstallResult:
 
 @dataclass(frozen=True)
 class UninstallResult:
-    """Outcome of a successful uninstall."""
+    """Outcome of a successful uninstall.
+
+    ``reclaimed_archives`` lists the cached pristine archives the
+    uninstall deleted (see
+    :func:`carpenter.packages.archive_cache.reclaim_package_archives`).
+    Empty both when there were none and when reclaiming failed — the
+    failure is logged, never raised, so it cannot leave a package
+    installed.
+    """
 
     name: str
     removed_path: Path
+    reclaimed_archives: tuple[Path, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -2082,6 +2091,32 @@ def uninstall_package(
     if install_path.exists():
         shutil.rmtree(install_path)
 
+    # Reclaim the package's pristine-archive cache
+    # (``{base_dir}/cache/package-archives/<name>/``).  Install writes one
+    # archive per (source_id, version) as the reconcile anchor; without
+    # this the cache grew without bound, keeping a full copy of the tree
+    # of every version of every package that is no longer installed.
+    #
+    # Unconditional, including under ``archive_state=True``: an archive is
+    # a DERIVED artifact that a re-install re-materialises from the
+    # fetched tree, and with the install record gone there is no
+    # ``installed_packages.hash`` left to verify one against, so a kept
+    # archive is unreachable by ``load_pristine_tree`` anyway.
+    #
+    # BEST-EFFORT, exactly as install treats the cache: a stuck cache
+    # file is not a reason to leave a package installed, so a failure is
+    # logged and the uninstall carries on.
+    reclaimed: tuple[Path, ...] = ()
+    try:
+        from .archive_cache import reclaim_package_archives
+        reclaimed = reclaim_package_archives(name)
+    except Exception:  # noqa: BLE001 — cache reclaim is best-effort
+        logger.warning(
+            "Could not reclaim the cached pristine archive(s) for %r; "
+            "they will have to be removed by hand", name,
+            exc_info=True,
+        )
+
     # B-full: remove the package's KB folder + re-index.
     _uninstall_kb_articles(name, conn=conn)
 
@@ -2131,9 +2166,12 @@ def uninstall_package(
         pass
 
     logger.info(
-        "Uninstalled capability package %r (path %s)", name, install_path,
+        "Uninstalled capability package %r (path %s, %d cached archive(s) "
+        "reclaimed)", name, install_path, len(reclaimed),
     )
-    return UninstallResult(name=name, removed_path=install_path)
+    return UninstallResult(
+        name=name, removed_path=install_path, reclaimed_archives=reclaimed,
+    )
 
 
 def verify_install(

@@ -15,7 +15,10 @@ Design
   (and, for archives written before the ``source_id`` level existed,
   ``<name>/<version>.tar.gz``, which is still read).  This cache lives
   under ``base_dir``, **not** on the root filesystem, which may be slow
-  flash storage.
+  flash storage.  A package's whole ``<name>/`` subtree is reclaimed on
+  uninstall (:func:`reclaim_package_archives`), so the cache cannot grow
+  without bound across installs, re-installs and upgrades of packages
+  that are no longer installed.
 * The remote host that supplies an archive (a GitHub release asset,
   etc.) is **untrusted storage**.  The trust anchor is the local root
   hash already recorded in ``installed_packages.hash`` and computed by
@@ -59,6 +62,7 @@ __all__ = [
     "archive_candidates",
     "archive_tree",
     "cache_dir",
+    "reclaim_package_archives",
     "store_archive",
     "load_pristine_tree",
 ]
@@ -376,6 +380,136 @@ def store_archive(
         "Stored pristine archive for %s@%s at %s", name, version, dest,
     )
     return dest
+
+
+# ── cache reclamation ───────────────────────────────────────────────
+
+
+def _reclaim_target(name: str, root: Path) -> Path:
+    """Return the cache directory to delete for ``name``, or refuse.
+
+    Fail-closed allowlist in the style of :func:`_safe_extract` and
+    :func:`carpenter.packages.reconcile_apply._validate_rel_path` — the
+    caller is handing us a ``shutil.rmtree`` target, so nothing is
+    accepted that is not provably the package's own cache directory:
+
+    * an empty/whitespace name is refused,
+    * an absolute name, or one carrying a path separator, a drive
+      letter or a ``.``/``..`` component, is refused — a package name is
+      one path component, never a path,
+    * the resolved target must be a PROPER immediate subdirectory of the
+      resolved cache root: never the root itself, never above it, never
+      nested deeper,
+    * the target must not itself be a symlink, so a planted link cannot
+      redirect the delete out of the cache.  (``shutil.rmtree`` never
+      follows a symlinked *member*, so links inside the tree are removed
+      as links and their targets are left alone.)
+
+    Raises:
+        ArchiveCacheError: on any violation, BEFORE anything is deleted.
+    """
+    if not name or not name.strip():
+        raise ArchiveCacheError(
+            f"unsafe package name for cache reclaim (empty): {name!r}",
+        )
+    if name.startswith("/") or os.path.isabs(name):
+        raise ArchiveCacheError(
+            f"unsafe package name for cache reclaim (absolute): {name!r}",
+        )
+    # Reject backslash-absolute / drive-letter style too, since
+    # os.path.isabs is platform-dependent.
+    if name.startswith("\\") or (len(name) >= 2 and name[1] == ":"):
+        raise ArchiveCacheError(
+            f"unsafe package name for cache reclaim (absolute): {name!r}",
+        )
+    if "/" in name or "\\" in name or name in (".", ".."):
+        raise ArchiveCacheError(
+            f"unsafe package name for cache reclaim (not a single path "
+            f"component): {name!r}",
+        )
+
+    root_resolved = root.resolve()
+    candidate = root / name
+    if candidate.is_symlink():
+        raise ArchiveCacheError(
+            f"refusing to reclaim the cache for {name!r}: "
+            f"{candidate} is a symlink",
+        )
+    target = candidate.resolve()
+    if target == root_resolved or not _is_within(root_resolved, target):
+        raise ArchiveCacheError(
+            f"refusing to reclaim the cache for {name!r}: {target} is "
+            f"not a subdirectory of the cache root {root_resolved}",
+        )
+    if target.parent != root_resolved:
+        raise ArchiveCacheError(
+            f"refusing to reclaim the cache for {name!r}: {target} is "
+            f"not an immediate child of the cache root {root_resolved}",
+        )
+    return target
+
+
+def reclaim_package_archives(name: str) -> tuple[Path, ...]:
+    """Delete every cached pristine archive belonging to ``name``.
+
+    Removes ``<cache>/<name>/`` whole, so it reclaims every version and
+    every ``source_id`` the package ever had, the ``superseded-*`` copies
+    :func:`store_archive` moved aside, and the old source-blind
+    ``<cache>/<name>/<version>.tar.gz`` layout, leaving no empty
+    directories behind.  No other package's cache is touched: the delete
+    is scoped to one immediate child of the cache root, vetted by
+    :func:`_reclaim_target`.
+
+    Called from :func:`carpenter.packages.installer.uninstall_package`.
+    An archive is a *derived* artifact — a re-install re-materialises it
+    from the fetched tree — so there is nothing to keep once the install
+    record is gone, and keeping it is how the cache grew without bound
+    across installs, re-installs and upgrades of packages that are no
+    longer installed.
+
+    Idempotent: a missing cache directory (or a missing cache root) is a
+    no-op returning ``()``, not an error.
+
+    Args:
+        name: Package name.  Must be a single path component.
+
+    Returns:
+        The archive paths that were removed, sorted.  Informational: the
+        directory itself is gone either way.
+
+    Raises:
+        ArchiveCacheError: the name or the resolved path failed the
+            safety guard, or the delete failed.  Callers treat this as
+            best-effort — see :func:`uninstall_package`.
+    """
+    root = cache_dir()
+    target = _reclaim_target(name, root)
+    if not target.is_dir():
+        return ()
+
+    # Inventory the archives before the delete, for the caller's report.
+    # os.walk does not follow directory symlinks by default, matching
+    # what shutil.rmtree will actually traverse.
+    removed: list[Path] = []
+    for dirpath, _dirnames, filenames in os.walk(target):
+        for filename in filenames:
+            path = Path(dirpath) / filename
+            if filename.endswith(".tar.gz") and not path.is_symlink():
+                removed.append(path)
+
+    try:
+        shutil.rmtree(target)
+    except OSError as exc:
+        raise ArchiveCacheError(
+            f"could not reclaim the archive cache for {name!r} at "
+            f"{target}: {exc}",
+        ) from exc
+
+    logger.info(
+        "Reclaimed %d cached pristine archive(s) for %r from %s",
+        len(removed), name, target,
+    )
+    return tuple(sorted(removed))
 
 
 # ── safe extraction ─────────────────────────────────────────────────

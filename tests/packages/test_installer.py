@@ -422,6 +422,217 @@ class TestUninstall:
         assert rows == []
 
 
+# ── uninstall reclaims the archive cache ────────────────────────────
+
+
+class TestUninstallReclaimsArchiveCache:
+    """``uninstall_package`` used to leave the pristine archives behind.
+
+    Install writes ``cache/package-archives/<name>/<source_id>/
+    <version>.tar.gz`` as the reconcile anchor.  Uninstall never removed
+    it, so a full copy of the tree of every version of every package that
+    was no longer installed accumulated forever.
+    """
+
+    def _extra_archive(self, tmp_path, name, version, *, source_id=None,
+                       marker="x"):
+        """Add one more cached archive for name@version by hand."""
+        from carpenter.packages import archive_cache
+        src = tmp_path / f"extra-{name}-{version}-{source_id}-{marker}"
+        src.mkdir(parents=True)
+        (src / "manifest.yaml").write_text(
+            f"name: {name}\nversion: {version}\n",
+        )
+        (src / "body.py").write_text(f"# {marker}\n")
+        return archive_cache.store_archive(
+            name, version, src, source_id=source_id,
+        )
+
+    def _cache_root(self):
+        from carpenter.packages import archive_cache
+        return archive_cache.cache_dir()
+
+    def test_install_caches_then_uninstall_reclaims(
+        self, tmp_path, db_with_arcs,
+    ):
+        src = make_source_pkg(tmp_path / "src", "p")
+        install_package(src, tmp_path / "installed" / "p", conn=db_with_arcs)
+        cached = sorted(self._cache_root().rglob("*.tar.gz"))
+        assert len(cached) == 1, "install should have cached one archive"
+
+        result = uninstall_package("p", conn=db_with_arcs)
+
+        assert result.reclaimed_archives == tuple(cached)
+        assert not cached[0].exists()
+        assert not (self._cache_root() / "p").exists()
+        assert sorted(self._cache_root().rglob("*.tar.gz")) == []
+
+    def test_reclaims_every_version_source_and_superseded_copy(
+        self, tmp_path, db_with_arcs,
+    ):
+        src = make_source_pkg(tmp_path / "src", "p")
+        install_package(src, tmp_path / "installed" / "p", conn=db_with_arcs)
+        # Several versions, several source_ids, a superseded copy (same
+        # version string re-published with different bytes), and the
+        # legacy source-blind layout.
+        self._extra_archive(tmp_path, "p", "0.2.0", source_id="aaa")
+        self._extra_archive(tmp_path, "p", "0.2.0", source_id="bbb")
+        self._extra_archive(
+            tmp_path, "p", "0.2.0", source_id="aaa", marker="republished",
+        )
+        self._extra_archive(tmp_path, "p", "0.3.0")  # legacy flat layout
+        before = sorted((self._cache_root() / "p").rglob("*.tar.gz"))
+        # install's 0.1.0 + 0.2.0/aaa + its superseded copy + 0.2.0/bbb
+        # + the legacy flat 0.3.0.
+        assert len(before) == 5, before
+        assert any(".superseded-" in f.name for f in before)
+        assert (self._cache_root() / "p" / "0.3.0.tar.gz").is_file()
+
+        result = uninstall_package("p", conn=db_with_arcs)
+
+        assert set(result.reclaimed_archives) == set(before)
+        assert not (self._cache_root() / "p").exists()
+
+    def test_another_packages_cache_is_untouched(
+        self, tmp_path, db_with_arcs,
+    ):
+        for name in ("p", "q"):
+            src = make_source_pkg(tmp_path / f"src-{name}", name)
+            install_package(
+                src, tmp_path / "installed" / name, conn=db_with_arcs,
+            )
+        q_cached = sorted((self._cache_root() / "q").rglob("*.tar.gz"))
+        assert len(q_cached) == 1
+
+        uninstall_package("p", conn=db_with_arcs)
+
+        assert not (self._cache_root() / "p").exists()
+        assert q_cached[0].is_file()
+        assert installer.get_install_record(db_with_arcs, "q") is not None
+
+    def test_second_uninstall_of_a_reinstalled_package_is_clean(
+        self, tmp_path, db_with_arcs,
+    ):
+        """Idempotent: nothing cached to reclaim is not an error."""
+        src = make_source_pkg(tmp_path / "src", "p")
+        install_package(src, tmp_path / "installed" / "p", conn=db_with_arcs)
+        uninstall_package("p", conn=db_with_arcs)
+        # Re-install, then delete the cache under the platform's nose so
+        # the second uninstall finds nothing.
+        install_package(src, tmp_path / "installed" / "p", conn=db_with_arcs)
+        import shutil as _s
+        _s.rmtree(self._cache_root() / "p")
+
+        result = uninstall_package("p", conn=db_with_arcs)
+
+        assert result.reclaimed_archives == ()
+        assert installer.get_install_record(db_with_arcs, "p") is None
+
+    def test_preserve_state_still_reclaims_the_archives(
+        self, tmp_path, db_with_arcs,
+    ):
+        """``archive_state=True`` keeps mutable state, not derived archives.
+
+        The flag exists so a re-install can pick up the package's own
+        state; the pristine archive is a derived artifact a re-fetch
+        rebuilds, and with the install record gone there is no
+        ``installed_packages.hash`` left to verify a kept one against.
+        """
+        db_with_arcs.executescript("""
+            CREATE TABLE IF NOT EXISTS package_state (
+                package_name TEXT NOT NULL,
+                key          TEXT NOT NULL,
+                value_json   TEXT NOT NULL,
+                version      INTEGER NOT NULL DEFAULT 1,
+                created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (package_name, key),
+                FOREIGN KEY (package_name) REFERENCES installed_packages(name)
+                    ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS package_state_archive (
+                package_name TEXT NOT NULL,
+                key          TEXT NOT NULL,
+                value_json   TEXT NOT NULL,
+                version      INTEGER NOT NULL,
+                archived_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (package_name, key)
+            );
+        """)
+        src = make_source_pkg(tmp_path / "src", "p")
+        install_package(src, tmp_path / "installed" / "p", conn=db_with_arcs)
+        from carpenter.packages import state as pkg_state
+        pkg_state.set("p", "watermark", 999, conn=db_with_arcs)
+        cached = sorted((self._cache_root() / "p").rglob("*.tar.gz"))
+        assert len(cached) == 1
+
+        result = uninstall_package(
+            "p", conn=db_with_arcs, archive_state=True,
+        )
+
+        # State preserved...
+        rows = db_with_arcs.execute(
+            "SELECT key FROM package_state_archive WHERE package_name = ?",
+            ("p",),
+        ).fetchall()
+        assert [r[0] for r in rows] == ["watermark"]
+        # ...derived archives reclaimed anyway.
+        assert result.reclaimed_archives == tuple(cached)
+        assert not (self._cache_root() / "p").exists()
+
+    def test_reclaim_failure_is_logged_and_the_uninstall_succeeds(
+        self, tmp_path, db_with_arcs, monkeypatch, caplog,
+    ):
+        """A stuck cache file must not leave the package installed."""
+        from carpenter.packages import archive_cache
+        src = make_source_pkg(tmp_path / "src", "p")
+        dest = tmp_path / "installed" / "p"
+        install_package(src, dest, conn=db_with_arcs)
+        cached = sorted((self._cache_root() / "p").rglob("*.tar.gz"))
+        assert len(cached) == 1
+
+        # Fail only inside the cache: ``archive_cache.shutil`` is the one
+        # shared module object, so a blanket patch would also break the
+        # install-dir removal this test needs to succeed.
+        real_rmtree = archive_cache.shutil.rmtree
+        cache_root = str(self._cache_root())
+
+        def boom(path, *a, **k):
+            if str(path).startswith(cache_root):
+                raise OSError(13, "Permission denied")
+            return real_rmtree(path, *a, **k)
+
+        monkeypatch.setattr(archive_cache.shutil, "rmtree", boom)
+        with caplog.at_level("WARNING"):
+            result = uninstall_package("p", conn=db_with_arcs)
+
+        # The uninstall still happened in full.
+        assert result.name == "p"
+        assert result.reclaimed_archives == ()
+        assert not dest.exists()
+        assert installer.get_install_record(db_with_arcs, "p") is None
+        # ...and the failure was reported, not swallowed.
+        assert any(
+            "reclaim" in rec.message.lower() for rec in caplog.records
+        ), caplog.text
+        # The archive is genuinely still there (nothing pretended).
+        assert cached[0].is_file()
+
+    def test_crafted_package_name_cannot_delete_outside_the_cache(
+        self, tmp_path, db_with_arcs,
+    ):
+        """The guard refuses a name that is not one component of the root."""
+        from carpenter.packages import archive_cache
+        outside = self._cache_root().parent / "package-listings"
+        outside.mkdir(parents=True, exist_ok=True)
+        (outside / "src-aaa.json").write_text("{}\n")
+
+        with pytest.raises(archive_cache.ArchiveCacheError):
+            archive_cache.reclaim_package_archives("../package-listings")
+
+        assert (outside / "src-aaa.json").is_file()
+
+
 # ── source provenance ───────────────────────────────────────────────
 
 

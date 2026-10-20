@@ -193,6 +193,7 @@ from .archive_cache import (
     archive_tree,
     cache_dir,
     load_pristine_tree,
+    reclaim_package_archives,
     store_archive,
 )
 
@@ -283,5 +284,6 @@ __all__ = [
     "archive_tree",
     "cache_dir",
     "load_pristine_tree",
+    "reclaim_package_archives",
     "store_archive",
 ]

@@ -778,6 +778,10 @@ def _cmd_uninstall(argv: list[str]) -> int:
     print(f"Uninstalled {result.name}")
     print(f"  Removed install dir : {result.removed_path}")
     print("  Removed DB rows     : installed_packages + templates")
+    print(
+        "  Reclaimed archives  : "
+        f"{len(result.reclaimed_archives)} cached pristine archive(s)"
+    )
     if granted:
         print(
             "  Dropped capability grants: " + ", ".join(sorted(granted))
