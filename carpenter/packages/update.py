@@ -824,7 +824,13 @@ def apply_update(
     never a fresh fetch, so the bytes the operator approved are the
     bytes that land — after re-checking that the tree still hashes to
     what the plan recorded and that the install row has not moved under
-    us.  The quarantine is removed before returning, whatever happens.
+    us.
+
+    On success the quarantine is removed.  On a refusal it is KEPT, so
+    the same plan can be applied again with ``accept_conflicts`` without
+    a second fetch (a re-fetch would let the source swap the bytes the
+    operator approved); a caller that gives up calls
+    :func:`cleanup_plan`.
 
     Args:
         plan: An :class:`UpdatePlan` from :func:`plan_update`.
@@ -852,10 +858,13 @@ def apply_update(
             return apply_update(
                 plan, conn=db, accept_conflicts=accept_conflicts,
             )
-    try:
-        return _apply(plan, conn=conn, accept_conflicts=accept_conflicts)
-    finally:
-        cleanup_plan(plan)
+    result = _apply(plan, conn=conn, accept_conflicts=accept_conflicts)
+    # Only a success retires the quarantine.  A refusal — conflicts not
+    # accepted, a stale plan — has changed nothing, so the fetched bytes
+    # the operator was shown stay available for a retry with different
+    # arguments; the caller abandons them with ``cleanup_plan``.
+    cleanup_plan(plan)
+    return result
 
 
 def _apply(
@@ -999,7 +1008,7 @@ def _apply(
             # not the merged tree that is now on disk.
             shipped_hash=plan.fetched_hash,
         )
-    except InstallError as exc:
+    except (InstallError, OSError) as exc:
         raise UpdateError(
             f"installing the updated tree for {name!r} failed: {exc}. "
             f"The previous install and its database row are unchanged.",
