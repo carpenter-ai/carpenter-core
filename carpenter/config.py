@@ -580,6 +580,17 @@ DEFAULTS = {
     # Reaching a source's host also needs that host to be allowed by
     # ``web_egress_allowlist`` when it is not globally routable.
     "package_sources": [],  # [{name, url, subdir_template, credential_ref}]
+    # How long a remote source's package LISTING is served from
+    # ``{base_dir}/cache/package-listings/`` before it is fetched again.
+    # Discovery (``carpenter/packages/discover.py``, the read-only
+    # ``list_available_packages`` chat tool) reads manifests only and
+    # installs nothing, but it does make the platform talk to a remote,
+    # so the cache is also the rate limit: an agent asking the same
+    # question all afternoon causes at most one fetch per source per TTL.
+    # Short enough that a package published this morning shows up this
+    # afternoon.  ``0`` means always refetch; an unusable value falls
+    # back to 6 rather than to "never refresh".
+    "package_sources_listing_ttl_hours": 6,
     "model_presets": {},  # User overrides for model selector presets (see model_selector.py)
     # Platform-integrity classifier config.  Read by
     # ``carpenter/security/platform_paths.py`` to drive path-tier and

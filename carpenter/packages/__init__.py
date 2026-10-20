@@ -140,6 +140,13 @@ from .sources import (
     redact,
     source_id,
 )
+from .discover import (
+    DiscoveryError,
+    RemotePackage,
+    SourceListing,
+    list_remote_packages,
+    list_source_aliases,
+)
 from .fetch import (
     FetchError,
     FetchLimits,
@@ -251,6 +258,11 @@ __all__ = [
     "parse_source",
     "redact",
     "source_id",
+    "DiscoveryError",
+    "RemotePackage",
+    "SourceListing",
+    "list_remote_packages",
+    "list_source_aliases",
     "FetchError",
     "FetchLimits",
     "FetchResult",
