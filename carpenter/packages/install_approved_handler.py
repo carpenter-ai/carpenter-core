@@ -72,10 +72,18 @@ def idempotency_key_for(token: str) -> str:
 def enqueue_approved_install(record) -> int | None:
     """Queue the install of an already-approved request.
 
-    Call this from inside the same transaction that flipped the row to
-    ``approved``: ``work_queue.enqueue`` opens its own transaction, so
-    in practice that means calling it immediately after that
-    transaction commits, as ``api/review.py``'s decide route does.
+    Call this **after** the transaction that flipped the row to
+    ``approved`` has committed, not inside it: ``work_queue.enqueue``
+    opens a ``db_transaction()`` of its own, and that guard is
+    per-thread, so calling it inside another one raises
+    ``RuntimeError`` rather than enqueuing anything.  Follow it with
+    ``main_loop.wake_signal.set()`` so the loop picks the item up
+    without waiting for the next heartbeat.
+
+    The row is already ``approved`` and durable at that point, so a
+    crash between the commit and the enqueue loses only the dispatch:
+    the operator sees an approved request that never started, and the
+    honest recovery is to look, not to guess.
 
     The payload carries the row **id**, not the token: the work_queue
     table is not a place to put a credential, and the handler can read
