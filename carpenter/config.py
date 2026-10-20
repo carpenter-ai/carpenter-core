@@ -394,16 +394,25 @@ DEFAULTS = {
     #     max_open_requests: 3      # undecided requests allowed at once
     #     max_requests_per_hour: 5  # requests the agent may create per hour
     #     max_sources_per_request: 5
+    #     notify_agent: false       # re-invoke the chat agent on the outcome
     #
     # The limits exist because the only defence that cannot be hardened
     # is the human reading the page: a request the agent can repeat
     # without limit is a retry loop against their patience.  Requests
     # are never auto-approved, whatever these are set to.
+    #
+    # ``notify_agent`` is OFF because the outcome notification needs no
+    # model: the platform writes a visible system message into the
+    # conversation that asked, which the UI renders from its existing
+    # poll.  Turning it on re-invokes the chat agent once per approved
+    # install, so the agent can act on the result — at the price of a
+    # model call for every approval.
     "package_install": {
         "request_ttl_hours": 24,
         "max_open_requests": 3,
         "max_requests_per_hour": 5,
         "max_sources_per_request": 5,
+        "notify_agent": False,
     },
     # Tool classification lists — used by the callback API for access control.
     # Each list can be extended (add items) or reduced (remove items) via config.yaml.
