@@ -59,14 +59,17 @@ EVENT_TYPE = "package.install.approved"
 PRIORITY = 50
 
 
-def idempotency_key_for(token: str) -> str:
+def idempotency_key_for(request_id: int) -> str:
     """The work-queue idempotency key for one request.
 
-    Keyed on the token so a second POST to the decide route cannot
-    enqueue a second install, and so the key means nothing to anything
-    that is not already holding the token.
+    Keyed on the row id, not the token.  It still makes a second POST to
+    the decide route unable to enqueue a second install, because there is
+    one row per request — but the token is the credential that approves
+    an install, and ``work_queue`` rows are durable, readable by anything
+    with database access, and outlive the request.  Writing the token
+    into one would hand out that credential to every later reader.
     """
-    return f"pkg_install:{token}"
+    return f"pkg_install:{request_id}"
 
 
 def enqueue_approved_install(record) -> int | None:
@@ -98,7 +101,7 @@ def enqueue_approved_install(record) -> int | None:
     work_id = work_queue.enqueue(
         EVENT_TYPE,
         {"request_id": record.id},
-        idempotency_key=idempotency_key_for(record.token),
+        idempotency_key=idempotency_key_for(record.id),
         max_retries=work_queue.SINGLE_ATTEMPT,
         priority=PRIORITY,
     )

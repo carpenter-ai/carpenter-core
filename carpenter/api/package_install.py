@@ -724,7 +724,7 @@ def _enqueue_install(record) -> int | None:
             "token_prefix": record.token_prefix,
             "packages": [n for n in _package_names(record) if n],
         },
-        idempotency_key=f"{IDEMPOTENCY_PREFIX}{record.token}",
+        idempotency_key=f"{IDEMPOTENCY_PREFIX}{record.id}",
         max_retries=work_queue.SINGLE_ATTEMPT,
         priority=50,
     )

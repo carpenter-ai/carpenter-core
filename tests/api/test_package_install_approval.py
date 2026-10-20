@@ -496,7 +496,8 @@ def test_approve_flips_the_row_writes_grants_and_enqueues_once(
     items = _work_items()
     assert len(items) == 1
     item = items[0]
-    assert item["idempotency_key"] == f"pkg_install:{out.token}"
+    assert item["idempotency_key"] == f"pkg_install:{out.record.id}"
+    assert out.record.token not in item["idempotency_key"]
     assert item["max_retries"] == 1
     assert item["priority"] == 50
     payload = json.loads(item["payload_json"])

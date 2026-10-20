@@ -751,7 +751,8 @@ def test_enqueueing_an_approved_install_is_idempotent(
     assert second is None, "a second POST must not queue a second install"
     items = _work_items(handler.EVENT_TYPE)
     assert len(items) == 1
-    assert items[0]["idempotency_key"] == f"pkg_install:{out.record.token}"
+    assert items[0]["idempotency_key"] == f"pkg_install:{out.record.id}"
+    assert out.record.token not in items[0]["idempotency_key"]
     assert items[0]["max_retries"] == 1
     assert items[0]["priority"] == handler.PRIORITY
 
