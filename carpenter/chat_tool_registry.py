@@ -53,6 +53,31 @@ OPERATOR_ONLY_TOOLS = frozenset({
     "uninstall_package",
 })
 
+# Chat-only tools.  The mirror image of OPERATOR_ONLY_TOOLS: these are
+# refused to ARC agents and allowed to the chat agent, whatever the
+# (user-owned) tool module declares.  Core is the enforcement point for
+# the same reason it is there — a chat tool module can lag behind the
+# seed or lose a flag, and a security property that lives only in a
+# user-editable file is not a security property.
+#
+# A chat-only tool is one whose whole safety argument is "a human is
+# reading this, in the conversation it was asked for".  An arc agent runs
+# unattended and may be acting on content a third party wrote (an email it
+# read, a web page, a KB entry), so letting one reach such a tool is how
+# a prompt injection gets a hand on the platform.
+#
+# These are NOT in OPERATOR_ONLY_TOOLS and must not be: that set is
+# dropped for EVERY agent when no confirmation handler is registered
+# (``invocation._select_chat_tools``), and none is registered on this
+# platform — so putting a chat tool there would make it unreachable.
+CHAT_ONLY_TOOLS = frozenset({
+    # Asks the operator to approve a package install on a one-time link
+    # and installs nothing by itself.  The link is sent back into the
+    # conversation that asked, which is only meaningful when a human is
+    # in it.
+    "request_package_install",
+})
+
 # Where the operator does the same thing without the chat agent.
 OPERATOR_ONLY_ALTERNATIVES = {
     "budget_control": "python3 -m carpenter budget",

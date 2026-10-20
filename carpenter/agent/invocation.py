@@ -275,6 +275,11 @@ def _select_chat_tools(context_budget: int | None = None) -> list[dict]:
     return sorted(core_tools + selected_non_core, key=lambda t: t["name"])
 
 
+def _drop_tools(tools: list[dict], names) -> list[dict]:
+    """Return ``tools`` without any whose name is in ``names``."""
+    return [t for t in tools if t["name"] not in names]
+
+
 def _drop_operator_only_tools(tools: list[dict]) -> list[dict]:
     """Remove operator-only tools from an agent's offered tool set.
 
@@ -283,7 +288,21 @@ def _drop_operator_only_tools(tools: list[dict]) -> list[dict]:
     anyway; not offering them keeps the agent from trying.
     """
     from ..chat_tool_registry import OPERATOR_ONLY_TOOLS
-    return [t for t in tools if t["name"] not in OPERATOR_ONLY_TOOLS]
+    return _drop_tools(tools, OPERATOR_ONLY_TOOLS)
+
+
+def _drop_chat_only_tools(tools: list[dict]) -> list[dict]:
+    """Remove chat-only tools from an ARC agent's offered tool set.
+
+    The mirror of :func:`_drop_operator_only_tools`, and deliberately a
+    separate function: operator-only tools are also dropped for the chat
+    agent when no confirmation handler is registered, while chat-only
+    tools are dropped *only* for arcs — dropping them for everyone would
+    make them unreachable, which is the whole point of not putting them
+    in ``OPERATOR_ONLY_TOOLS``.
+    """
+    from ..chat_tool_registry import CHAT_ONLY_TOOLS
+    return _drop_tools(tools, CHAT_ONLY_TOOLS)
 
 
 def _maybe_add_reviewer_emit_tool(
@@ -2358,7 +2377,9 @@ def _dispatch_chat_tool_call(
 
     # Check if tool requires user confirmation.
     from ..chat_tool_loader import get_loaded_tools, get_confirmation_handler
-    from ..chat_tool_registry import OPERATOR_ONLY_TOOLS, OPERATOR_ONLY_ALTERNATIVES
+    from ..chat_tool_registry import (
+        CHAT_ONLY_TOOLS, OPERATOR_ONLY_TOOLS, OPERATOR_ONLY_ALTERNATIVES,
+    )
     loaded_tools = get_loaded_tools()
     tool_def = loaded_tools.get(tool_name)
 
@@ -2373,6 +2394,22 @@ def _dispatch_chat_tool_call(
         return (
             f"Error: '{tool_name}' is operator-only and cannot be called by "
             "an arc agent. Ask the user to do this."
+        )
+
+    # Chat-only tools: the mirror case.  These are safe BECAUSE a human is
+    # reading the conversation they were called from; an arc agent runs
+    # unattended and may be acting on content a third party wrote, so it
+    # never gets one.  Enforced here as well as by not offering it
+    # (``_drop_chat_only_tools``), because the offer list is advisory —
+    # a model can name a tool it was not given.
+    if tool_name in CHAT_ONLY_TOOLS and executor_arc_id is not None:
+        logger.warning(
+            "Refused chat-only tool %s for arc %s", tool_name, executor_arc_id,
+        )
+        return (
+            f"Error: '{tool_name}' can only be called from a chat "
+            "conversation with a person in it, not by an arc agent. Ask the "
+            "user to request this in chat themselves."
         )
 
     if not operator_only and not (tool_def and tool_def.requires_user_confirm):
@@ -2690,9 +2727,12 @@ def invoke_for_chat(
         tools = _maybe_add_reviewer_emit_tool(tools, _executor_arc_id)
     # Operator-only tools are refused at dispatch for arc agents; don't
     # offer them.  (_select_chat_tools already drops them for everyone
-    # when no confirmation handler is registered.)
+    # when no confirmation handler is registered.)  Chat-only tools are
+    # refused to arcs at dispatch too, and are dropped HERE only — they
+    # must stay offered to the chat agent.
     if _is_arc:
         tools = _drop_operator_only_tools(tools)
+        tools = _drop_chat_only_tools(tools)
 
     collected_text = []
     total_tokens = 0
