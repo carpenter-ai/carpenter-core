@@ -14,6 +14,7 @@ from carpenter.chat_tool_loader import set_confirmation_handler
 from carpenter.chat_tool_registry import (
     CHAT_ONLY_TOOLS,
     OPERATOR_ONLY_TOOLS,
+    PLATFORM_TOOLS,
 )
 
 TOOL = sorted(CHAT_ONLY_TOOLS)[0]
@@ -65,6 +66,16 @@ def test_chat_only_and_operator_only_are_disjoint():
 
 def test_the_set_is_not_empty():
     assert CHAT_ONLY_TOOLS
+
+
+def test_every_chat_only_tool_is_a_platform_tool():
+    """These write platform state, so they cannot sit at the chat boundary.
+
+    A platform-boundary tool whose name is missing from
+    ``PLATFORM_TOOLS`` makes tool loading raise at startup, so the two
+    have to agree.
+    """
+    assert CHAT_ONLY_TOOLS <= PLATFORM_TOOLS
 
 
 # ── dispatch ────────────────────────────────────────────────────────

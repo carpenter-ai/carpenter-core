@@ -40,6 +40,15 @@ PLATFORM_TOOLS = frozenset({
     # API budget circuit breaker control: clearing a tripped breaker or
     # raising a limit mutates safety-critical platform state.
     "budget_control",
+    # Asks the operator to approve a package install on a one-time link.
+    # Installs nothing itself, but writes platform state (a quarantine
+    # directory and a request row), so it cannot sit at the chat
+    # boundary.  Chat-only: refused to arc agents (CHAT_ONLY_TOOLS).
+    # A platform-boundary tool whose name is missing from this set makes
+    # tool loading raise at startup, so this entry and the seed module
+    # config_seed/chat_tools/packages_install_request.py must stay
+    # together.
+    "request_package_install",
 })
 
 # Operator-only tools.  Core requires a human to confirm every call to one
