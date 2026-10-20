@@ -743,8 +743,10 @@ async def submit_decision(request: Request):
     token = request.path_params["token"]
     try:
         body = await request.json()
-    except (ValueError, json.JSONDecodeError):
-        raise HTTPException(status_code=400, detail="Expected a JSON body")
+    except ValueError as exc:  # json.JSONDecodeError subclasses it
+        raise HTTPException(
+            status_code=400, detail="Expected a JSON body",
+        ) from exc
     if not isinstance(body, dict):
         raise HTTPException(status_code=400, detail="Expected a JSON object")
 
@@ -796,7 +798,7 @@ async def submit_decision(request: Request):
             raise HTTPException(
                 status_code=409,
                 detail="This request was decided by someone else first",
-            )
+            ) from exc
         logger.warning(
             "Operator APPROVED package install request %s; grants=%s",
             updated.token_prefix, grants,
@@ -824,7 +826,7 @@ async def submit_decision(request: Request):
         raise HTTPException(
             status_code=409,
             detail="This request was decided by someone else first",
-        )
+        ) from exc
     logger.warning(
         "Operator REJECTED package install request %s; nothing installed",
         updated.token_prefix,
