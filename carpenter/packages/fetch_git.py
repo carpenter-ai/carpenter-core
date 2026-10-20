@@ -18,6 +18,15 @@ configuration: the host user's ``~/.gitconfig`` must not be able to
 rewrite the URL (``url.<base>.insteadOf``) after the dispatcher has
 already put it past the egress gate, nor point the transport at a proxy.
 
+**Redirects are driven by hand, through the egress guard.**  urllib3
+follows a redirect chain inside one ``request()`` call, so the gate the
+dispatcher ran over the clone URL would otherwise see hop 0 only.  The
+pool manager built by :func:`_gated_pool_manager_class` re-checks every
+hop with :func:`carpenter.security.egress.check_url`, caps the chain at
+:data:`MAX_REDIRECTS`, and refuses any hop that leaves the scheme, host
+and port the request named — so the provenance recorded for the fetch is
+the origin the bytes really came from.
+
 What the fetch does, in order:
 
 1. Resolve the credential, if the source was configured with one, from
@@ -51,7 +60,9 @@ import threading
 import time
 from pathlib import Path
 from typing import ClassVar
+from urllib.parse import urljoin, urlsplit
 
+from ..security import egress
 from .fetch import FetchError, FetchLimits, FetchResult, register_fetcher
 from .sources import SourceSpec, SourceSpecError, configured_sources, redact
 
@@ -89,6 +100,140 @@ _MODE_GITLINK = 0o160000
 #: the installed tree a repository (and, with a crafted config, one that
 #: runs code); the rest cannot be written as a relative path at all.
 _FORBIDDEN_COMPONENTS = frozenset({"", ".", "..", ".git"})
+
+
+#: Redirect hop limit for the clone transport.  Same answer as
+#: :data:`carpenter.packages.fetch_archive.MAX_REDIRECTS` and
+#: ``tool_backends/web.py``, so the platform has one.
+MAX_REDIRECTS = 10
+
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def _origin(url: str) -> tuple[str, str, int | None]:
+    """Return ``(scheme, host, port)`` with the default port filled in.
+
+    The identity a fetch is allowed to stay on.  Comparing the whole
+    origin rather than only the host is deliberate: a redirect that
+    keeps the host but changes the scheme or the port is a different
+    service, and an ``https`` -> ``http`` hop would put the clone (and
+    the credential, if the transport ever stopped stripping it) on the
+    wire in clear.
+    """
+    parts = urlsplit(url)
+    scheme = (parts.scheme or "").lower()
+    host = (parts.hostname or "").lower().rstrip(".")
+    try:
+        port = parts.port
+    except ValueError:  # pragma: no cover — defensive
+        port = None
+    if port is None:
+        port = _DEFAULT_PORTS.get(scheme)
+    return (scheme, host, port)
+
+
+def _gated_pool_manager_class(base_url: str):
+    """Build a ``PoolManager`` subclass that follows no unchecked hop.
+
+    The dispatcher (:func:`carpenter.packages.fetch.fetch_source`) puts
+    the clone URL past :func:`carpenter.security.egress.check_url` once.
+    urllib3 follows redirects *inside* one ``request()`` call, so without
+    this a ``307`` from an allowed host walks the platform onto loopback,
+    a link-local address or a cloud metadata endpoint, and dulwich only
+    notices afterwards.  :mod:`carpenter.packages.fetch`'s docstring
+    calls re-checking every hop mandatory and
+    :mod:`carpenter.packages.fetch_archive` already does it; this is the
+    git transport's half.
+
+    Two rules, both enforced here because this is the only place that
+    sees a hop before it is requested:
+
+    * **Every hop goes past the egress guard**, exactly as the archive
+      fetcher's hand-rolled redirect loop does.
+    * **A hop may not leave the origin the operator consented to.**  A
+      package source that moves host mid-fetch is not a case this
+      platform serves, and refusing it keeps the recorded provenance
+      honest: the host on the approval page, in the ``source_url``
+      column and in the audit log is then necessarily the host the bytes
+      came from.  Following a cross-host hop and *relabelling* the
+      provenance would be the alternative, but attribution is the
+      design's primary mitigation (WP5-plan 8.2) and a source whose host
+      is not the one the operator read is not worth the complexity.
+
+    Only ``GET``/``HEAD`` hops are followed at all: dulwich POSTs the
+    pack negotiation with a generator body that cannot be replayed, and
+    a redirect that silently dropped it would be worse than a refusal.
+    """
+    import urllib3
+
+    allowed = _origin(base_url)
+
+    class _GatedPoolManager(urllib3.PoolManager):
+        """A pool manager that drives redirects by hand, through the gate."""
+
+        def urlopen(self, method, url, redirect=True, **kw):  # noqa: D102
+            hops = 0
+            current = url
+            while True:
+                response = super().urlopen(
+                    method, current, redirect=False, **kw,
+                )
+                location = (
+                    response.get_redirect_location() if redirect else None
+                )
+                if not location:
+                    if hops:
+                        # dulwich reads ``geturl()`` to notice that the
+                        # repository moved and to rebase the next
+                        # request; it must see where we ended up.
+                        try:
+                            response.url = current
+                        except NotImplementedError:  # pragma: no cover
+                            pass
+                    return response
+                target = urljoin(current, location)
+                response.drain_conn()
+                if hops >= MAX_REDIRECTS:
+                    raise FetchError(
+                        f"the git source {redact(url)} redirected more than "
+                        f"{MAX_REDIRECTS} times; refusing to follow the "
+                        f"chain any further. Nothing was fetched.",
+                    )
+                if str(method).upper() not in ("GET", "HEAD"):
+                    raise FetchError(
+                        f"the git source {redact(url)} answered a "
+                        f"{str(method).upper()} with a redirect; a package "
+                        f"fetch does not replay a request body onto another "
+                        f"URL. Nothing was fetched.",
+                    )
+                if _origin(target) != allowed:
+                    logger.warning(
+                        "Refused a cross-origin redirect while fetching a "
+                        "package source: %s -> %s",
+                        redact(current), redact(target),
+                    )
+                    raise FetchError(
+                        f"the git source {redact(url)} redirected to a "
+                        f"different scheme, host or port "
+                        f"({redact(target)}); a package fetch follows a "
+                        f"redirect only within the origin the request named, "
+                        f"so that the host shown for approval and recorded "
+                        f"as provenance is the host the bytes came from. "
+                        f"Name the final URL as the source instead.",
+                    )
+                try:
+                    egress.check_url(target)
+                except egress.EgressDenied as exc:
+                    raise FetchError(
+                        f"refusing to follow a redirect while fetching the "
+                        f"git source {redact(url)}: {exc} A redirect may "
+                        f"not take the platform to a destination the egress "
+                        f"guard would not have accepted in the first place.",
+                    ) from exc
+                current = target
+                hops += 1
+
+    return _GatedPoolManager
 
 
 def _scrub(text: str, secret: tuple[str, str] | None) -> str:
@@ -455,6 +600,7 @@ class GitFetcher:
             # has stopped waiting for it.
             pool = default_urllib3_manager(
                 None, base_url=url, timeout=max(float(limits.timeout_s), 1.0),
+                pool_manager_cls=_gated_pool_manager_class(url),
             )
             repo = porcelain.clone(
                 url, str(clone_dir),

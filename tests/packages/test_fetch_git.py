@@ -41,6 +41,7 @@ from carpenter.packages import fetch
 from carpenter.packages.fetch import FetchError, FetchLimits, Fetcher, fetch_source
 from carpenter.packages.fetch_git import GitFetcher, _harden_tree
 from carpenter.packages.sources import SourceSpec, parse_source
+from carpenter.security import egress
 
 from .conftest import write_package
 
@@ -773,3 +774,142 @@ class TestErrors:
             fetch_source(parse_source(f"git+{base}/demo"),
                          staging_root=staging)
         assert "web_egress_allowlist" in str(exc.value)
+
+
+# ── redirects: every hop re-checked, and no hop off the origin ───────
+
+
+def _redirect_to(target_base: str, path_prefix: str = ""):
+    """WSGI middleware that 307s the first request to another base URL.
+
+    Mirrors what a forge (or an attacker who controls one allowlisted
+    name) can do: the clone's very first request —
+    ``/info/refs?service=git-upload-pack`` — is answered with a
+    ``Location`` pointing somewhere else entirely.
+    """
+    seen: list[str] = []
+
+    def middleware(app):
+        def wrapped(environ, start_response):
+            path = environ.get("PATH_INFO", "")
+            query = environ.get("QUERY_STRING", "")
+            seen.append(path + (f"?{query}" if query else ""))
+            if len(seen) == 1:
+                location = f"{target_base}{path_prefix}{path}"
+                if query:
+                    location += f"?{query}"
+                start_response("307 Temporary Redirect", [
+                    ("Content-Type", "text/plain"),
+                    ("Location", location),
+                ])
+                return [b"moved"]
+            return app(environ, start_response)
+        return wrapped
+
+    middleware.seen = seen  # type: ignore[attr-defined]
+    return middleware
+
+
+class TestRedirects:
+    """F1: the clone transport must not walk through the egress gate."""
+
+    def test_a_redirect_to_another_host_is_refused(
+        self, package_repo, git_server, tmp_path, monkeypatch, staging,
+    ):
+        # Only the name "localhost" is allowlisted.  The attacker's
+        # redirect target, 127.0.0.1, is NOT allowlisted and
+        # ``check_url`` refuses it when asked directly -- so if the tree
+        # arrives anyway, the gate has been walked through.
+        monkeypatch.setattr(config, "CONFIG", {
+            "base_dir": str(tmp_path / "instance"),
+            "web_egress_allowlist": ["localhost"],
+            "package_sources": [],
+        })
+        internal = git_server({"demo": package_repo})
+        front = _redirect_to(internal)
+        front_base = git_server({"demo": package_repo}, middleware=front)
+        port = front_base.rsplit(":", 1)[1]
+
+        with pytest.raises(FetchError) as exc:
+            fetch_source(
+                parse_source(f"git+http://localhost:{port}/demo"),
+                staging_root=staging,
+            )
+        message = str(exc.value)
+        assert "redirect" in message.lower()
+        assert list(staging.iterdir()) == []
+
+    def test_a_redirect_that_changes_the_port_is_refused(
+        self, package_repo, git_server, configured, do_fetch, staging,
+    ):
+        internal = git_server({"demo": package_repo})
+        front = _redirect_to(internal)
+        front_base = git_server({"demo": package_repo}, middleware=front)
+
+        with pytest.raises(FetchError) as exc:
+            do_fetch(parse_source(f"git+{front_base}/demo"))
+        assert "redirect" in str(exc.value).lower()
+        assert list(staging.iterdir()) == []
+
+    def test_a_same_origin_redirect_is_followed_and_every_hop_checked(
+        self, package_repo, git_server, configured, do_fetch, monkeypatch,
+    ):
+        checked: list[str] = []
+        real_check = egress.check_url
+
+        def recording(url):
+            checked.append(url)
+            return real_check(url)
+
+        monkeypatch.setattr(egress, "check_url", recording)
+
+        # The front server redirects /moved/demo/... to /demo/... on
+        # itself: same scheme, host and port, so it is served.
+        base_holder: list[str] = []
+
+        def middleware(app):
+            def wrapped(environ, start_response):
+                path = environ.get("PATH_INFO", "")
+                query = environ.get("QUERY_STRING", "")
+                if path.startswith("/moved/"):
+                    location = base_holder[0] + path[len("/moved"):]
+                    if query:
+                        location += f"?{query}"
+                    start_response("307 Temporary Redirect", [
+                        ("Content-Type", "text/plain"),
+                        ("Location", location),
+                    ])
+                    return [b"moved"]
+                return app(environ, start_response)
+            return wrapped
+
+        base = git_server({"demo": package_repo}, middleware=middleware)
+        base_holder.append(base)
+
+        result = do_fetch(parse_source(f"git+{base}/moved/demo"))
+        assert (result.tree / "manifest.yaml").is_file()
+        # Hop 0 from the dispatcher, plus at least one hop checked by
+        # the transport itself.
+        assert len(checked) >= 2
+        assert any("/demo/info/refs" in url for url in checked)
+
+    def test_the_hop_limit_is_enforced(
+        self, package_repo, git_server, configured, do_fetch, staging,
+    ):
+        def endless(app):
+            def wrapped(environ, start_response):
+                path = environ.get("PATH_INFO", "")
+                query = environ.get("QUERY_STRING", "")
+                location = path + f"?{query}" if query else path
+                start_response("307 Temporary Redirect", [
+                    ("Content-Type", "text/plain"),
+                    ("Location", location),
+                ])
+                return [b"moved"]
+            return wrapped
+
+        base = git_server({"demo": package_repo}, middleware=endless)
+        with pytest.raises(FetchError) as exc:
+            do_fetch(parse_source(f"git+{base}/demo"))
+        assert "redirect" in str(exc.value).lower()
+        assert list(staging.iterdir()) == []
