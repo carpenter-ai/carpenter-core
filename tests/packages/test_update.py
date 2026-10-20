@@ -989,3 +989,48 @@ class TestCliUpdate:
             Path(config.CONFIG["base_dir"]) / "cache" / "package-staging"
         )
         assert not staging.exists() or list(staging.iterdir()) == []
+
+
+# ── trigger subscriptions survive the swap ──────────────────────────
+
+
+def test_subscription_record_is_restored_after_an_update(
+    base_dir, db_conn, stub, tmp_path,
+):
+    """``_subscriptions.json`` lives inside the tree the swap replaces.
+
+    It is excluded from the package hash, so no tree carries it and the
+    atomic swap drops it — a fresh process would then re-register
+    nothing and the package's triggers would stop firing.
+    """
+    manifest = dedent("""\
+        name: subdemo
+        version: "{version}"
+        description: Subscription fixture.
+        trigger_subscriptions:
+          - event: demo.event
+            handler: handlers:on_event
+    """)
+
+    def _write(root: Path, version: str, body: str) -> Path:
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "manifest.yaml").write_text(manifest.format(version=version))
+        (root / "handlers.py").write_text(body)
+        return root
+
+    src = _write(tmp_path / "sub-v1", "0.1.0", "def on_event(e, c):\n    return 1\n")
+    installed = install_package(
+        src, default_install_dest("subdemo"), conn=db_conn,
+        provenance=_spec(), resolved="a" * 40,
+    )
+    record_file = installed.dest_path / "_subscriptions.json"
+    assert record_file.is_file()
+
+    stub.serve = _write(
+        tmp_path / "sub-v2", "0.2.0", "def on_event(e, c):\n    return 2\n",
+    )
+    result = apply_update(plan_update("subdemo", conn=db_conn), conn=db_conn)
+
+    assert result.subscriptions_registered == 1
+    assert record_file.is_file()
+    assert "demo.event" in record_file.read_text()

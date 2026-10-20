@@ -197,6 +197,9 @@ class UpdateResult:
         archive_cached: Whether the new version's pristine tree made it
             into the archive cache.  False means the NEXT update has no
             anchor and will have to clobber.
+        subscriptions_registered: Trigger subscriptions re-recorded from
+            the new manifest (the atomic swap removes the record, which
+            lives inside the install directory).
         needs_restart: Whether the new code can be live in this process.
         restart_reason: Why, in words for the operator.
         notes: Carried over from the plan, plus anything the apply
@@ -218,6 +221,7 @@ class UpdateResult:
     conflicts_overridden: tuple[str, ...] = ()
     overwritten: tuple[str, ...] = ()
     archive_cached: bool = False
+    subscriptions_registered: int = 0
     needs_restart: bool = False
     restart_reason: str = ""
     notes: tuple[str, ...] = field(default_factory=tuple)
@@ -748,7 +752,17 @@ def _resolve_tree(
         elif status in (FileStatus.UNCHANGED, FileStatus.CONVERGED):
             # Identical either side; prefer the shipped bytes so the
             # installed tree stays byte-faithful to the new version.
-            resolved[path] = shipped_new.get(path, live.get(path, b""))
+            # Both statuses require the path in ``new``, so the fallback
+            # is defensive only — and it raises rather than inventing
+            # content for a file we cannot account for.
+            if path in shipped_new:
+                resolved[path] = shipped_new[path]
+            elif path in live:  # pragma: no cover — defensive
+                resolved[path] = live[path]
+            else:  # pragma: no cover — defensive
+                raise UpdateError(
+                    f"{status.value} path {path!r} is in neither tree",
+                )
         elif status in (FileStatus.USER_ONLY, FileStatus.ADDED_USER):
             preserved.append(path)
             if path in live:
@@ -1038,6 +1052,32 @@ def _apply(
             f"and will only be able to offer the clobbering fallback.",
         )
 
+    # Restore the trigger-subscription record.  It lives INSIDE the
+    # install directory while being excluded from the package hash, so
+    # the atomic swap drops it — and a fresh process reads that file to
+    # re-register the package's subscriptions.  Without this, an update
+    # would silently stop a package's triggers from firing after the
+    # next restart.  This is the same call install makes and it imports
+    # no package python; in-process Trigger CLASSES are deliberately
+    # NOT re-instantiated here, because that does import the package's
+    # code, which is precisely what a restart is for.
+    subscriptions_registered = 0
+    try:
+        from .installer import _install_trigger_subscriptions
+        subscriptions_registered = _install_trigger_subscriptions(
+            load_manifest(install_path / "manifest.yaml"), install_path,
+        )
+    except Exception as exc:  # noqa: BLE001 — best effort, but reported
+        logger.warning(
+            "Updated %r but could not restore its trigger subscriptions",
+            name, exc_info=True,
+        )
+        notes.append(
+            f"the package's trigger subscriptions could not be "
+            f"re-recorded ({exc}); its triggers may not fire after the "
+            f"next restart until it is installed again.",
+        )
+
     needs_restart, restart_reason = _restart_posture(name)
     logger.info(
         "Updated %r %s -> %s (%s, hash %s, %d file(s))",
@@ -1060,6 +1100,7 @@ def _apply(
         conflicts_overridden=overridden,
         overwritten=overwritten,
         archive_cached=archive_cached,
+        subscriptions_registered=subscriptions_registered,
         needs_restart=needs_restart,
         restart_reason=restart_reason,
         notes=tuple(notes),
