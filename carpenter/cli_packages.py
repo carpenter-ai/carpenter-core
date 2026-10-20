@@ -1,12 +1,17 @@
 """Operator CLI for capability-package management.
 
-Provides ``python3 -m carpenter packages <subcommand>`` with three
+Provides ``python3 -m carpenter packages <subcommand>`` with four
 subcommands:
 
 * ``install <source_name>`` (or ``--path <dir>``) — install a capability
   package, previewing the manifest and (for packages declaring
   ``platform_capabilities``) gating the install on PLATFORM-LEVEL TRUST
   consent.
+* ``update <name>`` — re-fetch the source the install recorded, at its
+  ref, and apply it: a three-way merge that keeps the operator's edits
+  to the installed tree where it can, reports the conflicts it cannot
+  merge, and says plainly when there is no pristine version to merge
+  against.
 * ``uninstall <name>`` — remove an installed package (dir + DB rows +
   capability grants).
 * ``list`` — show installed packages and their granted capability verbs.
@@ -506,6 +511,225 @@ def _cmd_install(argv: list[str]) -> int:
     return 0
 
 
+# ── update ──────────────────────────────────────────────────────────
+
+
+def _print_update_plan(plan, *, stream) -> None:
+    """Print what an update would do, before the operator decides."""
+    from .packages.sources import describe
+    from .packages.update import (
+        STRATEGY_CLOBBER,
+        STRATEGY_NOOP,
+        STRATEGY_RECONCILE,
+    )
+
+    strategies = {
+        STRATEGY_RECONCILE: (
+            "three-way merge against the pristine tree of the installed "
+            "version"
+        ),
+        STRATEGY_CLOBBER: (
+            "REPLACE the installed tree — no pristine tree to merge "
+            "against, so local edits are LOST"
+        ),
+        STRATEGY_NOOP: "nothing to do",
+    }
+    p = lambda *a: print(*a, file=stream)  # noqa: E731
+    p("")
+    p(f"  Package  : {plan.name}")
+    p(f"  Version  : {plan.installed_version} -> {plan.fetched_version}")
+    p(
+        f"  Tree hash: {plan.installed_hash[:12]}... -> "
+        f"{plan.fetched_hash[:12]}..."
+    )
+    p(f"  Source   : {describe(plan.source)}")
+    if plan.resolved:
+        p(f"  Resolved : {plan.resolved}")
+    p(
+        f"  Strategy : {plan.strategy} — "
+        f"{strategies.get(plan.strategy, 'unknown')}"
+    )
+    if plan.local_edits:
+        p(f"  Your changes ({len(plan.local_edits)}):")
+        for path in plan.local_edits:
+            p(f"    • {path}")
+    if plan.conflicts:
+        p("  " + "=" * 68)
+        p(f"  CONFLICTS ({len(plan.conflicts)}) — changed by you AND "
+          f"by the new version:")
+        for path in plan.conflicts:
+            p(f"    • {path}")
+        p("  " + "=" * 68)
+    if plan.notes:
+        p("  Notes:")
+        for note in plan.notes:
+            p(f"    - {note}")
+    p("")
+
+
+def _cmd_update(argv: list[str]) -> int:
+    """Handle: python3 -m carpenter packages update <name>."""
+    from .db import db_connection, db_transaction
+    from .packages import static_preview
+    from .packages.manifest import ManifestError, load_manifest
+    from .packages.update import (
+        STRATEGY_NOOP,
+        UpdateError,
+        apply_update,
+        cleanup_plan,
+        plan_update,
+    )
+
+    parser = argparse.ArgumentParser(
+        prog="python3 -m carpenter packages update",
+        description=(
+            "Update an installed capability package from the source its "
+            "install recorded, following that source's ref. The plan is "
+            "printed and confirmed before anything is written. Edits you "
+            "made to the installed tree are merged where possible, "
+            "reported where they conflict, and never discarded without "
+            "saying so."
+        ),
+    )
+    parser.add_argument(
+        "name", help="Installed package name (manifest 'name' field).",
+    )
+    parser.add_argument(
+        "--yes", action="store_true",
+        help="Apply the plan without asking. Required to update "
+             "non-interactively, and it also accepts a plan that "
+             "REPLACES the installed tree when there is no pristine "
+             "version to merge against.",
+    )
+    parser.add_argument(
+        "--accept-conflicts", action="store_true",
+        help="Apply even when a file was changed both by you and by the "
+             "new version. The NEW version's content wins every "
+             "conflicting file and your edit there is discarded.",
+    )
+    args = parser.parse_args(argv)
+
+    # Planning fetches, so it is deliberately NOT inside the write
+    # transaction: the operator's confirmation happens between the two,
+    # and holding SQLite's writer lock across a prompt would block every
+    # other writer for as long as the operator takes to read.
+    try:
+        with db_connection() as db:
+            plan = plan_update(args.name, conn=db)
+    except UpdateError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        # Show the fetched version the same way install shows a source
+        # tree: from the manifest plus a STATIC read of its chat tools.
+        # The package's own code is never executed to build this.
+        try:
+            manifest = load_manifest(plan.fetched_tree / "manifest.yaml")
+            static = static_preview.inspect_package_chat_tools(
+                plan.fetched_tree, manifest,
+            )
+            _print_manifest_preview(
+                manifest, plan.fetched_hash, stream=sys.stderr,
+                static=static,
+            )
+        except ManifestError as exc:  # pragma: no cover — planned already
+            print(
+                f"ERROR: the fetched package is unreadable: {exc}",
+                file=sys.stderr,
+            )
+            return 1
+
+        _print_update_plan(plan, stream=sys.stderr)
+
+        if plan.strategy == STRATEGY_NOOP:
+            print(
+                f"{plan.name} is already up to date at "
+                f"{plan.installed_version} "
+                f"(hash {plan.installed_hash[:12]}); nothing was changed."
+            )
+            return 0
+
+        if plan.conflicts and not args.accept_conflicts:
+            print(
+                f"ERROR: {len(plan.conflicts)} file(s) were changed both "
+                f"by you and by the new version, so they cannot be "
+                f"merged automatically: {', '.join(plan.conflicts)}. "
+                f"Nothing was changed. Re-run with --accept-conflicts to "
+                f"take the new version's content for those files "
+                f"(discarding your edits there), or copy your changes "
+                f"out of {plan.install_path} first.",
+                file=sys.stderr,
+            )
+            return 1
+
+        if not args.yes:
+            if not (hasattr(sys.stdin, "isatty") and sys.stdin.isatty()):
+                print(
+                    "ERROR: refusing to apply an update "
+                    "non-interactively without --yes.",
+                    file=sys.stderr,
+                )
+                return 1
+            try:
+                resp = input("  Type 'yes' to apply this update: ")
+            except EOFError:
+                resp = ""
+            if not (isinstance(resp, str) and resp.strip().lower() == "yes"):
+                print("Update declined; nothing was changed.")
+                return 0
+
+        try:
+            with db_transaction() as db:
+                result = apply_update(
+                    plan, conn=db, accept_conflicts=args.accept_conflicts,
+                )
+        except UpdateError as exc:
+            print(f"ERROR: update failed: {exc}", file=sys.stderr)
+            return 1
+    finally:
+        # Every exit from here owes the fetched tree a cleanup, and the
+        # ones that reach apply_update have had it done for them —
+        # cleanup_plan is idempotent, so saying it once covers both.
+        cleanup_plan(plan)
+
+    print(
+        f"Updated {result.name} {result.from_version} -> "
+        f"{result.to_version} (hash {result.to_hash[:12]}) at "
+        f"{result.dest_path}"
+    )
+    if result.local_edits_preserved:
+        print("")
+        print("  Your edits were KEPT in:")
+        for path in result.local_edits_preserved:
+            print(f"    • {path}")
+    if result.conflicts_overridden:
+        print("")
+        print("  Your edits were DISCARDED in favour of the new version:")
+        for path in result.conflicts_overridden:
+            print(f"    • {path}")
+    if result.overwritten:
+        print("")
+        print(
+            f"  {len(result.overwritten)} file(s) were overwritten "
+            f"wholesale (no pristine version to merge against):"
+        )
+        for path in result.overwritten:
+            print(f"    • {path}")
+    if not result.archive_cached:
+        print("")
+        print(
+            "  NOTE: the new version's pristine tree could not be "
+            "cached, so the next update will have nothing to merge "
+            "against."
+        )
+    print("")
+    print(f"  Restart needed: {'yes' if result.needs_restart else 'no'}")
+    print(f"  {result.restart_reason}.")
+    print("")
+    return 0
+
+
 # ── uninstall ───────────────────────────────────────────────────────
 
 
@@ -623,6 +847,7 @@ def _cmd_list(argv: list[str]) -> int:
 
 _SUBCOMMANDS = {
     "install": _cmd_install,
+    "update": _cmd_update,
     "uninstall": _cmd_uninstall,
     "list": _cmd_list,
 }
@@ -641,6 +866,7 @@ def cmd_packages(argv: list[str]) -> int:
             "commands:\n"
             "  install <source_name> [--path DIR] [--accept-capabilities] "
             "[--allow-write-chat-tools]\n"
+            "  update <name> [--yes] [--accept-conflicts]\n"
             "  uninstall <name> [--force] [--preserve-state]\n"
             "  list\n",
             file=sys.stderr if (argv and argv[0] not in ("-h", "--help"))
