@@ -384,6 +384,27 @@ DEFAULTS = {
     # JUDGE value allowlists under ``security`` (domain_allowlist etc.).
     # See carpenter/security/egress.py.
     "web_egress_allowlist": [],
+    # Chat-requested package installs (the two-phase request -> operator
+    # approval -> install flow).  A chat agent can only ASK for a package;
+    # the operator approves on a one-time link, and these keys bound how
+    # long that link lives and how often the agent may ask.
+    #
+    #   package_install:
+    #     request_ttl_hours: 24     # link lifetime; expired links 410
+    #     max_open_requests: 3      # undecided requests allowed at once
+    #     max_requests_per_hour: 5  # requests the agent may create per hour
+    #     max_sources_per_request: 5
+    #
+    # The limits exist because the only defence that cannot be hardened
+    # is the human reading the page: a request the agent can repeat
+    # without limit is a retry loop against their patience.  Requests
+    # are never auto-approved, whatever these are set to.
+    "package_install": {
+        "request_ttl_hours": 24,
+        "max_open_requests": 3,
+        "max_requests_per_hour": 5,
+        "max_sources_per_request": 5,
+    },
     # Tool classification lists — used by the callback API for access control.
     # Each list can be extended (add items) or reduced (remove items) via config.yaml.
     # Format in config.yaml:

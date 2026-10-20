@@ -160,6 +160,12 @@ from .static_preview import (
     inspect_package_chat_tools,
     write_consent_required,
 )
+from .pending_install import (
+    PendingInstall,
+    PendingInstallError,
+    PendingInstallStateError,
+    ensure_pending_install_table,
+)
 from .reload import (
     PackageLoadOutcome,
     reload_packages,
@@ -196,6 +202,10 @@ __all__ = [
     "configured_search_paths",
     "PackageLoadOutcome",
     "reload_packages",
+    "PendingInstall",
+    "PendingInstallError",
+    "PendingInstallStateError",
+    "ensure_pending_install_table",
     "PackageSecurityError",
     "validate_manifest_security",
     "InstallError",

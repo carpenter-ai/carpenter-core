@@ -397,6 +397,13 @@ def ensure_installer_tables(conn: sqlite3.Connection) -> None:
             conn.execute(
                 f"ALTER TABLE installed_packages ADD COLUMN {column} TEXT",
             )
+    # Chat-requested installs: the pending-request record the two-phase
+    # request -> operator approval -> install flow is built on.  It lives
+    # here rather than in ``schema.sql`` for the same reason
+    # ``installed_packages`` does: this function is the one path both the
+    # migration and every test that needs the installer tables take.
+    from .pending_install import ensure_pending_install_table
+    ensure_pending_install_table(conn)
     conn.commit()
 
 
