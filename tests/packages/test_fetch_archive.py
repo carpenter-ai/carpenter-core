@@ -1171,3 +1171,36 @@ class TestOrigin:
         assert (
             fetch_archive._origin(left) == fetch_archive._origin(right)
         ) is same
+
+
+# ── the ambient proxy environment (F8) ──────────────────────────────
+
+
+def _dead_port() -> int:
+    """A port nothing is listening on."""
+    sock = socket.socket()
+    sock.bind((LOOPBACK, 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    return port
+
+
+class TestProxyEnvironmentIsIgnored:
+    """What the egress guard checked has to be what gets connected to."""
+
+    def test_a_set_proxy_does_not_change_where_the_fetch_goes(
+        self, site, quarantine, flat_archive, monkeypatch,
+    ):
+        dead = f"http://{LOOPBACK}:{_dead_port()}"
+        for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+                     "http_proxy", "https_proxy", "all_proxy"):
+            monkeypatch.setenv(name, dead)
+        for name in ("NO_PROXY", "no_proxy"):
+            monkeypatch.delenv(name, raising=False)
+
+        url = site.serve("/demo.tar.gz", flat_archive)
+        result = _fetch(_spec(url), quarantine)
+
+        assert (result.tree / "manifest.yaml").is_file()
+        # The bytes came from the host the guard checked, not the proxy.
+        assert site.headers_for("/demo.tar.gz")

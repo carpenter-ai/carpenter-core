@@ -38,7 +38,10 @@ The shape of the contract is deliberate:
   for this reason: see ``_MAX_REDIRECTS`` there and the ``check_url`` /
   ``check_redirect`` pair around its request).  Without that, a 302 from
   an allowed host to a loopback, link-local or metadata address walks
-  straight through the gate.
+  straight through the gate.  For the same reason a fetcher must not
+  trust the ambient proxy environment (``HTTP_PROXY`` and friends): a
+  proxy is a destination the gate never resolved, so what it checked
+  would not be what gets connected to.
 """
 
 from __future__ import annotations

@@ -913,3 +913,27 @@ class TestRedirects:
             do_fetch(parse_source(f"git+{base}/demo"))
         assert "redirect" in str(exc.value).lower()
         assert list(staging.iterdir()) == []
+
+
+# ── the ambient proxy environment (F8) ──────────────────────────────
+
+
+class TestProxyEnvironmentIsIgnored:
+    """What the egress guard checked has to be what gets connected to."""
+
+    def test_a_set_proxy_does_not_change_where_the_clone_goes(
+        self, package_repo, git_server, configured, do_fetch, monkeypatch,
+    ):
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        dead = f"http://127.0.0.1:{sock.getsockname()[1]}"
+        sock.close()
+        for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+                     "http_proxy", "https_proxy", "all_proxy"):
+            monkeypatch.setenv(name, dead)
+        for name in ("NO_PROXY", "no_proxy"):
+            monkeypatch.delenv(name, raising=False)
+
+        base = git_server({"demo": package_repo})
+        result = do_fetch(parse_source(f"git+{base}/demo"))
+        assert (result.tree / "manifest.yaml").is_file()

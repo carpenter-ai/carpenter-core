@@ -17,6 +17,11 @@ remote's code.  For the same reason the clone is given an **empty** git
 configuration: the host user's ``~/.gitconfig`` must not be able to
 rewrite the URL (``url.<base>.insteadOf``) after the dispatcher has
 already put it past the egress gate, nor point the transport at a proxy.
+The transport is built here rather than by dulwich's
+``default_urllib3_manager`` for the same reason: that helper reads
+``http_proxy``/``https_proxy``/``all_proxy`` out of the platform's
+environment, and a proxy is a destination the gate never checked (see
+:func:`_pool_manager`).
 
 **Redirects are driven by hand, through the egress guard.**  urllib3
 follows a redirect chain inside one ``request()`` call, so the gate the
@@ -234,6 +239,33 @@ def _gated_pool_manager_class(base_url: str):
                 hops += 1
 
     return _GatedPoolManager
+
+
+def _pool_manager(url: str, timeout: float):
+    """Build the clone's HTTP transport, ignoring the ambient environment.
+
+    Deliberately NOT ``dulwich.client.default_urllib3_manager``: that
+    reads ``https_proxy`` / ``http_proxy`` / ``all_proxy`` from the
+    platform process's environment even when it is handed an empty git
+    configuration, and a proxy is a destination the egress guard never
+    resolved and never checked.  The guard's whole claim is that the host
+    it inspected is the host that gets connected to, so the fetcher
+    builds its own pool manager and sends the request where the URL says.
+    An operator who needs a proxy for package fetches has to say so in
+    code; there is no silent environment route around the gate.
+
+    Everything else matches what ``default_urllib3_manager`` would have
+    produced for ``config=None``: dulwich's user agent, certificate
+    verification required, and one socket timeout for the whole budget.
+    """
+    from dulwich.client import default_user_agent_string
+
+    manager_cls = _gated_pool_manager_class(url)
+    return manager_cls(
+        headers={"User-agent": default_user_agent_string()},
+        timeout=timeout,
+        cert_reqs="CERT_REQUIRED",
+    )
 
 
 def _scrub(text: str, secret: tuple[str, str] | None) -> str:
@@ -586,7 +618,6 @@ class GitFetcher:
         from the object store instead, under the caps.
         """
         from dulwich import porcelain
-        from dulwich.client import default_urllib3_manager
         from dulwich.config import ConfigDict
 
         pinned_sha = bool(spec.ref and _SHA1_RE.match(spec.ref))
@@ -598,9 +629,8 @@ class GitFetcher:
             # A socket timeout equal to the whole budget, so an
             # unresponsive peer ends this thread even once the caller
             # has stopped waiting for it.
-            pool = default_urllib3_manager(
-                None, base_url=url, timeout=max(float(limits.timeout_s), 1.0),
-                pool_manager_cls=_gated_pool_manager_class(url),
+            pool = _pool_manager(
+                url, timeout=max(float(limits.timeout_s), 1.0),
             )
             repo = porcelain.clone(
                 url, str(clone_dir),

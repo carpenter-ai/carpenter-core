@@ -33,6 +33,11 @@ What this module is careful about, and why:
   decompression bomb is refused without a byte of it reaching the disk.
   What actually landed is then re-measured, because the index is
   attacker-supplied too.
+* **The ambient environment cannot redirect the transport.** The
+  client runs with ``trust_env=False``, so a proxy variable in the
+  platform process's environment cannot send the request somewhere the
+  egress guard never resolved.  What the gate checked is what gets
+  connected to.
 * **Credentials go to one origin and are never recorded.** A source that
   resolved through a configured entry with a ``credential_ref`` names an
   environment *variable*; its value is sent as a bearer token to that
@@ -679,6 +684,12 @@ class ArchiveUrlFetcher:
                 with httpx.stream(
                     "GET", url,
                     headers=headers, follow_redirects=False, timeout=timeout,
+                    # Not the ambient environment's business where a
+                    # package comes from: ``trust_env`` would let
+                    # ``HTTP_PROXY``/``HTTPS_PROXY``/``ALL_PROXY`` send
+                    # this request to a host the egress guard never
+                    # resolved and never checked.
+                    trust_env=False,
                 ) as response:
                     try:
                         target = egress.check_redirect(
