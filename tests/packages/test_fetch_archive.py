@@ -320,9 +320,12 @@ def quarantine(tmp_path) -> Path:
     return dest
 
 
-def _fetch(spec: SourceSpec, dest: Path, **limit_kwargs):
+def _fetch(spec: SourceSpec, dest: Path, *, require_manifest: bool = True,
+           **limit_kwargs):
     limits = FetchLimits(**limit_kwargs) if limit_kwargs else FetchLimits()
-    return ArchiveUrlFetcher().fetch(spec, dest, limits=limits)
+    return ArchiveUrlFetcher().fetch(
+        spec, dest, limits=limits, require_manifest=require_manifest,
+    )
 
 
 # ── registration and shape ──────────────────────────────────────────
@@ -1280,3 +1283,185 @@ class TestMemberCountIsEnforcedLazily:
         assert result.files_fetched == 21
         assert (result.tree / "f19.txt").read_text() == "x"
         assert len(visited) == 21
+
+
+# ── the index root a listing fetches (require_manifest=False) ───────
+
+
+@pytest.fixture
+def index_archive(tmp_path) -> bytes:
+    """A monorepo tarball: ``packages/`` holding three packages."""
+    root = _fresh(tmp_path / "mono-index")
+    for name in ("alpha", "beta", "gamma"):
+        write_package(
+            root / "packages", name=name,
+            manifest_yaml=MANIFEST.replace("demo", name),
+            files={"tools.py": f"NAME = {name!r}\n"},
+        )
+    (root / "packages" / "notes").mkdir()
+    (root / "packages" / "notes" / "readme.txt").write_text("not a package\n")
+    (root / "README.md").write_text("a self-hosted forge monorepo\n")
+    return _archive_bytes(root, tmp_path / "mono-index.tar.gz")
+
+
+@pytest.fixture
+def wrapped_index_archive(tmp_path) -> bytes:
+    """The same monorepo inside one top-level directory, as a forge serves it."""
+    root = _fresh(tmp_path / "wrapped")
+    inner = root / "packages-1.0"
+    for name in ("alpha", "beta"):
+        write_package(
+            inner / "packages", name=name,
+            manifest_yaml=MANIFEST.replace("demo", name),
+        )
+    (inner / "README.md").write_text("wrapped\n")
+    return _archive_bytes(root, tmp_path / "wrapped.tar.gz")
+
+
+class TestIndexRoot:
+    """``require_manifest=False`` buys the index root and nothing else."""
+
+    def test_the_index_root_is_refused_by_default(
+        self, site, quarantine, index_archive,
+    ):
+        url = site.serve("/mono.tar.gz", index_archive)
+        with pytest.raises(FetchError, match="holds no manifest.yaml"):
+            _fetch(_spec(url, subdir="packages"), quarantine)
+
+    def test_the_index_root_is_returned_when_it_is_not_required(
+        self, site, quarantine, index_archive,
+    ):
+        url = site.serve("/mono.tar.gz", index_archive)
+        result = _fetch(
+            _spec(url, subdir="packages"), quarantine, require_manifest=False,
+        )
+
+        assert result.tree.name == "packages"
+        assert not (result.tree / "manifest.yaml").exists()
+        assert sorted(p.name for p in result.tree.iterdir()) == [
+            "alpha", "beta", "gamma", "notes",
+        ]
+        assert (result.tree / "beta" / "manifest.yaml").is_file()
+        assert result.resolved == hashlib.sha256(index_archive).hexdigest()
+        assert result.tree.resolve().is_relative_to(quarantine.resolve())
+
+    def test_a_wrapper_directory_is_still_unwrapped_first(
+        self, site, quarantine, wrapped_index_archive,
+    ):
+        """The subdir applies under the single top-level directory."""
+        url = site.serve("/wrapped.tar.gz", wrapped_index_archive)
+        result = _fetch(
+            _spec(url, subdir="packages"), quarantine, require_manifest=False,
+        )
+        assert result.tree.parent.name == "packages-1.0"
+        assert sorted(p.name for p in result.tree.iterdir()) == [
+            "alpha", "beta",
+        ]
+
+    def test_a_missing_index_root_is_still_refused(
+        self, site, quarantine, index_archive,
+    ):
+        url = site.serve("/mono.tar.gz", index_archive)
+        with pytest.raises(FetchError, match="has no directory 'absent'"):
+            _fetch(_spec(url, subdir="absent"), quarantine,
+                   require_manifest=False)
+
+    def test_a_subdir_escaping_the_archive_is_still_refused(
+        self, site, quarantine, index_archive,
+    ):
+        url = site.serve("/mono.tar.gz", index_archive)
+        with pytest.raises(FetchError, match="points outside"):
+            _fetch(_spec(url, subdir="../../etc"), quarantine,
+                   require_manifest=False)
+
+    # ── the caps still bite ──────────────────────────────────────────
+
+    def test_the_file_count_cap_still_bites(
+        self, site, quarantine, index_archive,
+    ):
+        url = site.serve("/mono.tar.gz", index_archive)
+        with pytest.raises(FetchError) as excinfo:
+            _fetch(_spec(url, subdir="packages"), quarantine,
+                   require_manifest=False, max_files=3)
+        assert "max_files limit of 3" in str(excinfo.value)
+
+    def test_the_declared_length_cap_still_bites(
+        self, site, quarantine, index_archive,
+    ):
+        url = site.serve("/mono.tar.gz", index_archive)
+        with pytest.raises(FetchError) as excinfo:
+            _fetch(_spec(url, subdir="packages"), quarantine,
+                   require_manifest=False, max_bytes=16)
+        assert "max_bytes" in str(excinfo.value)
+
+    def test_the_per_file_cap_still_bites(self, site, quarantine, tmp_path):
+        root = _fresh(tmp_path / "fat-index")
+        write_package(
+            root / "packages", name="alpha",
+            manifest_yaml=MANIFEST.replace("demo", "alpha"),
+            files={"fat.txt": "b" * 5_000},
+        )
+        body = _archive_bytes(root, tmp_path / "fat-index.tar.gz")
+        url = site.serve("/fat.tar.gz", body)
+        with pytest.raises(FetchError) as excinfo:
+            _fetch(_spec(url, subdir="packages"), quarantine,
+                   require_manifest=False, max_file_bytes=1_000)
+        assert "max_file_bytes" in str(excinfo.value)
+
+    def test_the_wall_clock_budget_still_bites(self, quarantine):
+        with pytest.raises(FetchError) as excinfo:
+            _fetch(_spec("https://nowhere.invalid/mono.tar.gz",
+                         subdir="packages"),
+                   quarantine, require_manifest=False, timeout_s=0.0)
+        assert "timeout_s" in str(excinfo.value)
+
+    # ── integrity and member hardening still bite ────────────────────
+
+    def test_a_digest_mismatch_is_still_refused(
+        self, site, quarantine, index_archive,
+    ):
+        url = site.serve("/mono.tar.gz", index_archive)
+        spec = _spec(url, subdir="packages", digest="0" * 64)
+        with pytest.raises(FetchError, match="sha256"):
+            _fetch(spec, quarantine, require_manifest=False)
+        assert list(quarantine.rglob("manifest.yaml")) == []
+
+    def test_an_unsafe_member_is_still_refused(self, site, quarantine):
+        link = tarfile.TarInfo("packages/alpha/escape")
+        link.type = tarfile.SYMTYPE
+        link.linkname = "../../../../etc/passwd"
+        link.mtime = 0
+        body = _tar_gz([
+            _manifest_member("packages/alpha/"),
+            (link, None),
+        ])
+        url = site.serve("/evil.tar.gz", body)
+        with pytest.raises(FetchError) as excinfo:
+            _fetch(_spec(url, subdir="packages"), quarantine,
+                   require_manifest=False)
+        message = str(excinfo.value)
+        assert "refused by the archive safety check" in message
+        assert "unsafe archive member" in message
+
+    def test_a_redirect_to_a_refused_address_is_still_refused(
+        self, site, quarantine,
+    ):
+        start = site.redirect("/mono.tar.gz", "http://169.254.169.254/x.tar.gz")
+        with pytest.raises(FetchError) as excinfo:
+            _fetch(_spec(start, subdir="packages"), quarantine,
+                   require_manifest=False)
+        assert "refusing to continue the redirect chain" in str(excinfo.value)
+        assert [path for path, _ in site.seen] == ["/mono.tar.gz"]
+
+    def test_the_ambient_proxy_is_still_ignored(
+        self, site, quarantine, index_archive, monkeypatch,
+    ):
+        dead = f"http://{LOOPBACK}:{_dead_port()}"
+        for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+                     "http_proxy", "https_proxy", "all_proxy"):
+            monkeypatch.setenv(name, dead)
+        url = site.serve("/mono.tar.gz", index_archive)
+        result = _fetch(_spec(url, subdir="packages"), quarantine,
+                        require_manifest=False)
+        assert (result.tree / "alpha" / "manifest.yaml").is_file()
+        assert site.headers_for("/mono.tar.gz")

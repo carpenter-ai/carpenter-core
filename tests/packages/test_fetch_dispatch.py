@@ -528,3 +528,200 @@ class TestStagingRoot:
         assert not [
             m for m, _ in found if staging.resolve() in m.resolve().parents
         ]
+
+
+# ── the listing seam: require_manifest ──────────────────────────────
+
+
+class _StubIndexFetcher:
+    """Writes an *index root* — a directory OF packages — and returns it.
+
+    This is the shape a monorepo listing needs and that an installer
+    must never be handed: ``packages/`` holding two package directories
+    and no ``manifest.yaml`` of its own.
+    """
+
+    kinds: ClassVar[frozenset[str]] = frozenset({"git"})
+
+    def __init__(self, *, escape_to: Path | None = None):
+        self.escape_to = escape_to
+        self.manifest_required: list[bool] = []
+
+    def fetch(self, spec, dest, *, limits, require_manifest=True):
+        self.manifest_required.append(require_manifest)
+        root = self.escape_to if self.escape_to is not None else dest / "tree"
+        index = root / "packages"
+        index.mkdir(parents=True)
+        for name in ("alpha", "beta"):
+            write_package(index, name=name, manifest_yaml=MANIFEST)
+        return FetchResult(
+            tree=index, staging=dest, resolved="d" * 40,
+            bytes_fetched=2 * len(MANIFEST), files_fetched=2,
+        )
+
+
+class _LegacyFetcher:
+    """A fetcher written before ``require_manifest`` existed.
+
+    ``register_fetcher`` is a public seam a platform package may use, so
+    an implementation whose ``fetch`` does not take the keyword has to
+    keep working — the dispatcher must not turn every install through it
+    into a ``TypeError``.
+    """
+
+    kinds: ClassVar[frozenset[str]] = frozenset({"git"})
+
+    def __init__(self):
+        self.calls = 0
+
+    def fetch(self, spec, dest, *, limits):
+        self.calls += 1
+        return FetchResult(
+            tree=write_package(dest, name="demo", manifest_yaml=MANIFEST),
+            staging=dest, resolved="e" * 40,
+            bytes_fetched=len(MANIFEST), files_fetched=1,
+        )
+
+
+GIT_URL = "git+https://forge.example/org/repo.git"
+
+
+class TestRequireManifest:
+    """The one check a listing fetch may turn off, and nothing else."""
+
+    def test_the_default_refuses_an_index_root(
+        self, isolated_fetchers, tmp_path,
+    ):
+        register_fetcher(_StubIndexFetcher())
+        with pytest.raises(FetchError, match="no manifest.yaml"):
+            fetch_source(
+                parse_source(GIT_URL), staging_root=tmp_path / "staging",
+            )
+
+    def test_an_index_root_is_returned_when_it_is_not_required(
+        self, isolated_fetchers, tmp_path,
+    ):
+        register_fetcher(_StubIndexFetcher())
+        result = fetch_source(
+            parse_source(GIT_URL), staging_root=tmp_path / "staging",
+            require_manifest=False,
+        )
+        assert not (result.tree / "manifest.yaml").exists()
+        assert sorted(p.name for p in result.tree.iterdir()) == [
+            "alpha", "beta",
+        ]
+        assert result.resolved == "d" * 40
+
+    def test_the_flag_reaches_the_fetcher(self, isolated_fetchers, tmp_path):
+        stub = _StubIndexFetcher()
+        register_fetcher(stub)
+        staging_root = tmp_path / "staging"
+        fetch_source(parse_source(GIT_URL), staging_root=staging_root,
+                     require_manifest=False)
+        with pytest.raises(FetchError):
+            fetch_source(parse_source(GIT_URL), staging_root=staging_root)
+        assert stub.manifest_required == [False, True]
+
+    def test_the_quarantine_still_contains_the_tree(
+        self, isolated_fetchers, tmp_path,
+    ):
+        """Relaxing the manifest check must not relax containment."""
+        escape = tmp_path / "elsewhere"
+        escape.mkdir()
+        register_fetcher(_StubIndexFetcher(escape_to=escape))
+        staging_root = tmp_path / "staging"
+        with pytest.raises(FetchError, match="outside its staging directory"):
+            fetch_source(parse_source(GIT_URL), staging_root=staging_root,
+                         require_manifest=False)
+        assert list(staging_root.iterdir()) == []
+
+    def test_a_non_result_is_still_refused(self, isolated_fetchers, tmp_path):
+        class _Wrong:
+            kinds: ClassVar[frozenset[str]] = frozenset({"git"})
+
+            def fetch(self, spec, dest, *, limits, require_manifest=True):
+                return dest
+
+        register_fetcher(_Wrong())
+        with pytest.raises(FetchError, match="not a FetchResult"):
+            fetch_source(parse_source(GIT_URL),
+                         staging_root=tmp_path / "staging",
+                         require_manifest=False)
+
+    def test_a_tree_that_is_not_a_directory_is_still_refused(
+        self, isolated_fetchers, tmp_path,
+    ):
+        class _File:
+            kinds: ClassVar[frozenset[str]] = frozenset({"git"})
+
+            def fetch(self, spec, dest, *, limits, require_manifest=True):
+                target = dest / "not-a-dir"
+                target.write_text("bytes\n")
+                return FetchResult(tree=target, staging=dest, resolved="",
+                                   bytes_fetched=6, files_fetched=1)
+
+        register_fetcher(_File())
+        with pytest.raises(FetchError, match="is not a directory"):
+            fetch_source(parse_source(GIT_URL),
+                         staging_root=tmp_path / "staging",
+                         require_manifest=False)
+
+    def test_a_failed_fetch_still_leaves_no_quarantine(
+        self, isolated_fetchers, tmp_path,
+    ):
+        register_fetcher(_StubIndexFetcher())
+        staging_root = tmp_path / "staging"
+        with pytest.raises(FetchError):
+            fetch_source(parse_source(GIT_URL), staging_root=staging_root)
+        assert list(staging_root.iterdir()) == []
+
+    def test_the_egress_gate_still_runs_first(
+        self, isolated_fetchers, monkeypatch, tmp_path,
+    ):
+        """A listing fetch is an outbound request like any other."""
+        stub = _StubIndexFetcher()
+        register_fetcher(stub)
+        monkeypatch.setattr(
+            egress, "_resolve_host", _resolver({"forge.example": "127.0.0.1"}),
+        )
+        monkeypatch.setitem(config.CONFIG, "web_egress_allowlist", [])
+        with pytest.raises(FetchError, match="web_egress_allowlist"):
+            fetch_source(parse_source(GIT_URL),
+                         staging_root=tmp_path / "staging",
+                         require_manifest=False)
+        assert stub.manifest_required == []
+
+    def test_a_local_index_root_is_returned_too(self, tmp_path):
+        """The local fetcher honours the flag by having no check of its own."""
+        root = tmp_path / "monorepo"
+        write_package(root / "packages", name="demo", manifest_yaml=MANIFEST)
+        spec = SourceSpec(kind="local", raw=str(root), path=root,
+                          subdir="packages")
+
+        with pytest.raises(FetchError, match="no manifest.yaml"):
+            fetch_source(spec)
+        result = fetch_source(spec, require_manifest=False)
+        assert result.tree == root / "packages"
+        assert result.staging is None
+
+    def test_a_fetcher_predating_the_flag_still_installs(
+        self, isolated_fetchers, tmp_path,
+    ):
+        legacy = _LegacyFetcher()
+        register_fetcher(legacy)
+        result = fetch_source(
+            parse_source(GIT_URL), staging_root=tmp_path / "staging",
+        )
+        assert (result.tree / "manifest.yaml").is_file()
+        assert legacy.calls == 1
+
+    def test_a_fetcher_predating_the_flag_cannot_serve_a_listing(
+        self, isolated_fetchers, tmp_path,
+    ):
+        legacy = _LegacyFetcher()
+        register_fetcher(legacy)
+        with pytest.raises(FetchError, match="does not accept"):
+            fetch_source(parse_source(GIT_URL),
+                         staging_root=tmp_path / "staging",
+                         require_manifest=False)
+        assert legacy.calls == 0

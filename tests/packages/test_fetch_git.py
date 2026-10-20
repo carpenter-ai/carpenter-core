@@ -182,9 +182,13 @@ def staging(tmp_path: Path) -> Path:
 @pytest.fixture
 def do_fetch(staging: Path):
     """Fetch a spec through the real dispatcher (egress gate included)."""
-    def _fetch(spec: SourceSpec, **limit_kwargs):
+    def _fetch(spec: SourceSpec, *, require_manifest: bool = True,
+               **limit_kwargs):
         limits = FetchLimits(**limit_kwargs) if limit_kwargs else FetchLimits()
-        return fetch_source(spec, limits=limits, staging_root=staging)
+        return fetch_source(
+            spec, limits=limits, staging_root=staging,
+            require_manifest=require_manifest,
+        )
     return _fetch
 
 
@@ -572,6 +576,235 @@ class TestHardening:
             _harden_tree(tree, SourceSpec(kind="git", raw="git+https://x/y",
                                           url="https://x/y"))
         assert "regular file" in str(exc.value)
+
+
+# ── the index root a listing fetches (require_manifest=False) ───────
+
+
+class TestIndexRoot:
+    """Fetching the directory ABOVE the packages, for a listing.
+
+    An index root is not a capability package, so the fetcher's own
+    final check refuses it by default.  ``require_manifest=False`` drops
+    that one check — and these tests pin that it drops nothing else: a
+    listing fetch is still an untrusted download, under the same caps,
+    the same hardening and the same quarantine.
+    """
+
+    @pytest.fixture
+    def index_repo(self, tmp_path: Path) -> Path:
+        """A monorepo: three packages, a non-package child, a README."""
+        root = tmp_path / "index"
+        packages = root / "packages"
+        for name in ("alpha", "beta", "gamma"):
+            write_package(
+                packages, name=name,
+                manifest_yaml=MANIFEST.replace("demo", name),
+                files={"tools.py": f"NAME = {name!r}\n"},
+            )
+        notes = packages / "notes"
+        notes.mkdir(parents=True)
+        (notes / "readme.txt").write_text("not a package\n")
+        (root / "README.md").write_text("a self-hosted forge monorepo\n")
+        (root / "tools" / "ci").mkdir(parents=True)
+        (root / "tools" / "ci" / "build.sh").write_text("#!/bin/sh\nexit 0\n")
+        _init(root)
+        _commit_all(root)
+        return root
+
+    def test_the_index_root_is_refused_by_default(
+        self, index_repo, git_server, configured, do_fetch,
+    ):
+        base = git_server({"index": index_repo})
+        with pytest.raises(FetchError) as exc:
+            do_fetch(parse_source(f"git+{base}/index#subdir=packages"))
+        message = str(exc.value)
+        assert "manifest.yaml" in message
+        assert "not" in message and "capability package" in message
+
+    def test_the_index_root_is_returned_when_it_is_not_required(
+        self, index_repo, git_server, configured, do_fetch,
+    ):
+        head = Repo(str(index_repo)).head().decode()
+        base = git_server({"index": index_repo})
+        result = do_fetch(
+            parse_source(f"git+{base}/index#subdir=packages"),
+            require_manifest=False,
+        )
+
+        assert result.tree.name == "packages"
+        assert not (result.tree / "manifest.yaml").exists()
+        assert sorted(p.name for p in result.tree.iterdir()) == [
+            "alpha", "beta", "gamma", "notes",
+        ]
+        assert (result.tree / "alpha" / "manifest.yaml").is_file()
+        assert result.resolved == head
+        # Still quarantined, and still without the clone's own ``.git``.
+        assert result.tree.resolve().is_relative_to(
+            Path(result.staging).resolve(),
+        )
+        assert list(Path(result.staging).rglob(".git")) == []
+
+    def test_only_the_index_root_is_materialised(
+        self, index_repo, git_server, configured, do_fetch,
+    ):
+        base = git_server({"index": index_repo})
+        result = do_fetch(
+            parse_source(f"git+{base}/index#subdir=packages"),
+            require_manifest=False,
+        )
+        tree_root = Path(result.staging) / "tree"
+        assert not (tree_root / "README.md").exists()
+        assert not (tree_root / "tools").exists()
+
+    def test_the_whole_repository_root_can_be_the_index(
+        self, index_repo, git_server, configured, do_fetch,
+    ):
+        """``subdir_template: '{name}'`` indexes the tree root itself."""
+        base = git_server({"index": index_repo})
+        result = do_fetch(
+            parse_source(f"git+{base}/index"), require_manifest=False,
+        )
+        assert (result.tree / "README.md").is_file()
+        assert (result.tree / "packages" / "alpha" / "manifest.yaml").is_file()
+
+    def test_a_missing_index_root_is_still_refused(
+        self, index_repo, git_server, configured, do_fetch,
+    ):
+        base = git_server({"index": index_repo})
+        with pytest.raises(FetchError) as exc:
+            do_fetch(parse_source(f"git+{base}/index#subdir=absent"),
+                     require_manifest=False)
+        assert "absent" in str(exc.value)
+
+    # ── the caps still bite ──────────────────────────────────────────
+
+    def test_the_file_count_cap_still_bites(
+        self, index_repo, git_server, configured, staging, do_fetch,
+    ):
+        base = git_server({"index": index_repo})
+        with pytest.raises(FetchError) as exc:
+            do_fetch(parse_source(f"git+{base}/index#subdir=packages"),
+                     require_manifest=False, max_files=3)
+        assert "max_files" in str(exc.value)
+        assert "allowed 3" in str(exc.value)
+        assert list(staging.iterdir()) == []
+
+    def test_the_total_byte_cap_still_bites(
+        self, tmp_path, git_server, configured, staging, do_fetch,
+    ):
+        root = tmp_path / "fat-index"
+        write_package(root / "packages", name="alpha",
+                      manifest_yaml=MANIFEST.replace("demo", "alpha"),
+                      files={"padding.txt": "a" * 400_000})
+        _init(root)
+        _commit_all(root)
+        base = git_server({"index": root})
+
+        with pytest.raises(FetchError) as exc:
+            do_fetch(parse_source(f"git+{base}/index#subdir=packages"),
+                     require_manifest=False, max_bytes=50_000)
+        assert "max_bytes" in str(exc.value)
+        assert list(staging.iterdir()) == []
+
+    def test_the_per_file_cap_still_bites(
+        self, tmp_path, git_server, configured, staging, do_fetch,
+    ):
+        root = tmp_path / "wide-index"
+        write_package(root / "packages", name="alpha",
+                      manifest_yaml=MANIFEST.replace("demo", "alpha"),
+                      files={"fat.txt": "b" * 5_000})
+        _init(root)
+        _commit_all(root)
+        base = git_server({"index": root})
+
+        with pytest.raises(FetchError) as exc:
+            do_fetch(parse_source(f"git+{base}/index#subdir=packages"),
+                     require_manifest=False, max_file_bytes=1_000)
+        message = str(exc.value)
+        assert "max_file_bytes" in message
+        assert "5000 bytes in" in message
+        assert list(staging.iterdir()) == []
+
+    def test_the_wall_clock_budget_still_bites(
+        self, index_repo, git_server, configured, staging, do_fetch,
+    ):
+        base = git_server({"index": index_repo}, middleware=_slow(1.0))
+        started = time.monotonic()
+        with pytest.raises(FetchError) as exc:
+            do_fetch(parse_source(f"git+{base}/index#subdir=packages"),
+                     require_manifest=False, timeout_s=0.2)
+        assert "timeout_s" in str(exc.value)
+        assert time.monotonic() - started < 1.0
+        assert list(staging.iterdir()) == []
+
+    # ── the hardening still bites ────────────────────────────────────
+
+    def test_a_symlink_escaping_the_tree_is_still_refused(
+        self, tmp_path, git_server, configured, staging, do_fetch,
+    ):
+        root = tmp_path / "linked-index"
+        pkg = write_package(root / "packages", name="alpha",
+                            manifest_yaml=MANIFEST.replace("demo", "alpha"))
+        os.symlink("../../../../etc/passwd", pkg / "escape")
+        _init(root)
+        _commit_all(root)
+        base = git_server({"index": root})
+
+        with pytest.raises(FetchError) as exc:
+            do_fetch(parse_source(f"git+{base}/index#subdir=packages"),
+                     require_manifest=False)
+        message = str(exc.value)
+        assert "escape" in message
+        assert "outside the fetched tree" in message
+        assert list(staging.iterdir()) == []
+
+    def test_an_absolute_symlink_is_still_refused(
+        self, tmp_path, git_server, configured, do_fetch,
+    ):
+        root = tmp_path / "abs-index"
+        pkg = write_package(root / "packages", name="alpha",
+                            manifest_yaml=MANIFEST.replace("demo", "alpha"))
+        os.symlink("/etc/hosts", pkg / "hosts")
+        _init(root)
+        _commit_all(root)
+        base = git_server({"index": root})
+
+        with pytest.raises(FetchError, match="absolute"):
+            do_fetch(parse_source(f"git+{base}/index#subdir=packages"),
+                     require_manifest=False)
+
+    def test_submodules_are_still_refused(
+        self, tmp_path, git_server, configured, do_fetch,
+    ):
+        root = tmp_path / "sub-index"
+        write_package(root / "packages", name="alpha",
+                      manifest_yaml=MANIFEST.replace("demo", "alpha"))
+        (root / ".gitmodules").write_text(
+            '[submodule "dep"]\n'
+            "\tpath = dep\n"
+            "\turl = https://forge.example/org/dep.git\n",
+        )
+        _init(root)
+        _commit_all(root)
+        base = git_server({"index": root})
+
+        with pytest.raises(FetchError) as exc:
+            do_fetch(parse_source(f"git+{base}/index#subdir=packages"),
+                     require_manifest=False)
+        message = str(exc.value)
+        assert ".gitmodules" in message
+        assert "not transitive" in message
+
+    def test_the_egress_gate_still_runs_first(
+        self, index_repo, git_server, configured, do_fetch, monkeypatch,
+    ):
+        base = git_server({"index": index_repo})
+        monkeypatch.setitem(config.CONFIG, "web_egress_allowlist", [])
+        with pytest.raises(FetchError) as exc:
+            do_fetch(parse_source(f"git+{base}/index#subdir=packages"),
+                     require_manifest=False)
+        assert "web_egress_allowlist" in str(exc.value)
 
 
 # ── credentials (D8) ────────────────────────────────────────────────
