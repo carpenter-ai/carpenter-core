@@ -56,6 +56,7 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "INTERRUPTED_ERROR",
     "PENDING_PACKAGE_INSTALLS_DDL",
     "PendingInstall",
     "PendingInstallError",
@@ -76,6 +77,7 @@ __all__ = [
     "due_for_expiry",
     "ensure_pending_install_table",
     "expires_at_for",
+    "fail_interrupted_installs",
     "get_request",
     "get_request_by_id",
     "list_requests",
@@ -86,8 +88,12 @@ __all__ = [
     "mark_installing",
     "mark_rejected",
     "new_token",
+    "recover_on_startup",
     "rejected_source_ids_since",
+    "remove_staging",
     "set_status",
+    "sweep_expired",
+    "table_exists",
     "token_prefix",
     "utc_now_iso",
 ]
@@ -745,3 +751,182 @@ def mark_failed(
 ) -> PendingInstall:
     """Record a failed batch, with whatever the rollback reported."""
     return set_status(conn, token, STATUS_FAILED, error=error, result=result)
+
+
+# ── expiry, quarantine GC and restart recovery ──────────────────────
+#
+# Three callers, one implementation: the hourly heartbeat hook, the
+# startup recovery pass, and (lazily, for the row in front of it) the
+# approval route.  The route's lazy expiry is what makes a stale link
+# unusable even if the sweep never runs; the sweep is what reclaims the
+# disk the quarantine holds.
+
+#: Marker for an install the platform was performing when it stopped.
+INTERRUPTED_ERROR = "interrupted by restart"
+
+
+def table_exists(conn: sqlite3.Connection) -> bool:
+    """Whether ``pending_package_installs`` exists on this connection.
+
+    The table is created by ``installer.ensure_installer_tables``, not by
+    ``schema.sql``, so a database that has never had the installer tables
+    — a minimal test DB, or a very old install before the first
+    migration run — legitimately does not have it.  Startup recovery
+    must be a no-op there rather than an error.
+    """
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+        ("pending_package_installs",),
+    ).fetchone()
+    return row is not None
+
+
+def _staging_root_dir() -> str | None:
+    """The quarantine root, or None when it cannot be determined."""
+    try:
+        from .. import config
+        from .fetch import STAGING_DIR_NAME
+    except ImportError:  # pragma: no cover — stripped build
+        return None
+    base_dir = config.CONFIG.get("base_dir")
+    if not base_dir:
+        return None
+    from pathlib import Path
+    return str((Path(base_dir) / "cache" / STAGING_DIR_NAME).resolve())
+
+
+def remove_staging(record: PendingInstall) -> bool:
+    """Delete a request's quarantine directory.
+
+    Refuses anything that is not a proper subdirectory of the configured
+    quarantine root: ``staging_root`` is a column, and a column that has
+    been edited or mis-recorded must not be able to turn a routine
+    expiry sweep into ``rmtree`` on an arbitrary path.  The root itself
+    is also refused — removing it would take every *other* pending
+    request's tree with it.
+
+    Returns:
+        True when a directory was removed.
+    """
+    import shutil
+    from pathlib import Path
+
+    raw = record.staging_root
+    if not raw:
+        return False
+    root = _staging_root_dir()
+    if root is None:
+        logger.warning(
+            "Not removing the quarantine of install request %s: the "
+            "quarantine root is not configured",
+            record.token_prefix,
+        )
+        return False
+    try:
+        candidate = Path(raw).resolve()
+    except OSError:  # pragma: no cover — unreadable path
+        return False
+    if str(candidate) == root or root not in [str(p) for p in candidate.parents]:
+        logger.warning(
+            "Not removing the quarantine of install request %s: its "
+            "recorded path is not inside the quarantine root",
+            record.token_prefix,
+        )
+        return False
+    if not candidate.is_dir():
+        return False
+    shutil.rmtree(candidate, ignore_errors=True)
+    logger.info(
+        "Removed the quarantine of install request %s", record.token_prefix,
+    )
+    return True
+
+
+def sweep_expired(
+    conn: sqlite3.Connection, *, now: str | None = None, limit: int = 200,
+) -> list[PendingInstall]:
+    """Expire every request past its TTL and reclaim its quarantine.
+
+    Only ``requested`` rows are touched (:func:`due_for_expiry`): a
+    decided request has an outcome, and an outcome is more informative
+    than "expired".  A row whose transition loses a race with a
+    concurrent decision is skipped rather than retried — the operator's
+    decision wins.
+
+    The caller owns the transaction.  Returns the rows it expired.
+    """
+    if not table_exists(conn):
+        return []
+    swept: list[PendingInstall] = []
+    for record in due_for_expiry(conn, now=now, limit=limit):
+        try:
+            updated = mark_expired(conn, record.token)
+        except PendingInstallStateError:
+            # Decided between the SELECT and the UPDATE.
+            continue
+        remove_staging(record)
+        swept.append(updated)
+    if swept:
+        logger.warning(
+            "Expired %d undecided package-install request(s): %s",
+            len(swept), [r.token_prefix for r in swept],
+        )
+    return swept
+
+
+def fail_interrupted_installs(
+    conn: sqlite3.Connection, *, limit: int = 200,
+) -> list[PendingInstall]:
+    """Fail any install that was in flight when the platform stopped.
+
+    A row in ``installing`` with no live worker was interrupted.  It is
+    never resumed: the batch's partial state is unknown and its
+    compensating rollback may itself have been interrupted, so the
+    honest outcome is a failure the operator can see, with
+    ``verify_install`` and a fresh request as the way forward.  The
+    re-dispatched work item is dropped by the handler's status check
+    precisely because this ran first.
+
+    The caller owns the transaction.  Returns the rows it failed.
+    """
+    if not table_exists(conn):
+        return []
+    cur = conn.execute(
+        "SELECT * FROM pending_package_installs "
+        "WHERE status = ? ORDER BY id LIMIT ?",
+        (STATUS_INSTALLING, int(limit)),
+    )
+    cur.row_factory = sqlite3.Row
+    interrupted = [_row_to_record(r) for r in cur.fetchall()]
+    failed: list[PendingInstall] = []
+    for record in interrupted:
+        try:
+            failed.append(
+                set_status(
+                    conn, record.token, STATUS_FAILED,
+                    error=INTERRUPTED_ERROR, expect=STATUS_INSTALLING,
+                ),
+            )
+        except PendingInstallStateError:  # pragma: no cover — raced
+            continue
+    if failed:
+        logger.warning(
+            "Failed %d package install(s) interrupted by a restart: %s. "
+            "The partial state is unknown; run `python3 -m carpenter "
+            "packages verify` before asking again.",
+            len(failed), [r.token_prefix for r in failed],
+        )
+    return failed
+
+
+def recover_on_startup(conn: sqlite3.Connection) -> tuple[int, int]:
+    """Both startup sweeps, in the order they have to happen.
+
+    Returns ``(expired, interrupted)`` counts so the caller can fold
+    them into its own startup-recovery log line.
+    """
+    if not table_exists(conn):
+        return (0, 0)
+    interrupted = len(fail_interrupted_installs(conn))
+    expired = len(sweep_expired(conn))
+    return (expired, interrupted)

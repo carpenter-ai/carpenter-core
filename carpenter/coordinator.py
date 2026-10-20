@@ -247,6 +247,40 @@ class Coordinator:
         install_approved_handler.register_handlers(main_loop.register_handler)
         logger.info("Approved package-install handler registered")
 
+        # ... and an hourly sweep of approval links nobody decided.  The
+        # approval routes also expire the single row in front of them, so
+        # this is about reclaiming the quarantine each stale request is
+        # still holding on disk, bounded by the TTL rather than by
+        # anyone remembering to clean up.
+        _last_pkg_install_sweep = [0.0]  # mutable container for closure
+
+        def _package_install_sweep_hook():
+            import time
+            now = time.time()
+            if now - _last_pkg_install_sweep[0] < 3600:  # once per hour
+                return
+            _last_pkg_install_sweep[0] = now
+            from .db import db_transaction
+            from .packages import pending_install
+            try:
+                with db_transaction() as db:
+                    if not pending_install.table_exists(db):
+                        return
+                    swept = pending_install.sweep_expired(db)
+            except sqlite3.Error:
+                logger.debug(
+                    "Package-install expiry sweep failed", exc_info=True,
+                )
+                return
+            if swept:
+                logger.info(
+                    "Package-install expiry sweep: expired %d request(s)",
+                    len(swept),
+                )
+
+        main_loop.register_heartbeat_hook(_package_install_sweep_hook)
+        logger.info("Package-install expiry sweep hook registered")
+
     async def _init_trigger_subscription_pipeline(self, base_dir: str, app) -> None:
         """Set up triggers, subscriptions, and endpoint routes."""
         from .core.engine.triggers import registry as trigger_registry

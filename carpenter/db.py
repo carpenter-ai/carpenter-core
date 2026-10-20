@@ -264,7 +264,16 @@ def _recover_on_startup(db) -> None:
         "DELETE FROM arc_state WHERE arc_id = 0 AND key = 'pending_escalation'"
     ).rowcount
 
-    if claimed or active or waiting_reset or crashed or expired or escalation_cleared:
+    # Chat-requested package installs: fail anything that was being
+    # installed when the platform stopped (its partial state is unknown,
+    # and the work item WILL be re-dispatched because we just reset the
+    # claimed items above -- failing the row here is what makes the
+    # handler drop it), then expire any approval link whose TTL ran out
+    # while we were down and reclaim its quarantine.
+    pkg_expired, pkg_interrupted = _recover_pending_installs(db)
+
+    if (claimed or active or waiting_reset or crashed or expired
+            or escalation_cleared or pkg_expired or pkg_interrupted):
         db.commit()
         parts = []
         if claimed:
@@ -279,7 +288,38 @@ def _recover_on_startup(db) -> None:
             parts.append(f"purged {expired} expired session(s)")
         if escalation_cleared:
             parts.append(f"cleared {escalation_cleared} stale escalation prompt(s)")
+        if pkg_interrupted:
+            parts.append(
+                f"failed {pkg_interrupted} package install(s) interrupted "
+                f"by the restart"
+            )
+        if pkg_expired:
+            parts.append(f"expired {pkg_expired} package-install request(s)")
         logger.info("Startup recovery: %s", ", ".join(parts))
+
+
+def _recover_pending_installs(db) -> tuple[int, int]:
+    """Startup recovery for ``pending_package_installs``.
+
+    Returns ``(expired, interrupted)``.  Both are zero when the table
+    does not exist, which is the normal case for a database that has
+    never had the installer tables (they are created by
+    ``packages.installer.ensure_installer_tables``, not by
+    ``schema.sql``).  Any failure here is logged and swallowed: startup
+    recovery must not be the reason a platform refuses to start.
+    """
+    try:
+        from .packages import pending_install
+    except ImportError:  # pragma: no cover — stripped build
+        return (0, 0)
+    try:
+        return pending_install.recover_on_startup(db)
+    except sqlite3.Error:
+        logger.warning(
+            "Startup recovery: could not sweep pending package installs",
+            exc_info=True,
+        )
+        return (0, 0)
 
 
 def _config_seed_dir() -> Path:
