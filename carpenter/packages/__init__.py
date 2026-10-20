@@ -96,6 +96,7 @@ from .registry import (
     get_registry,
     discover_and_register,
     default_search_paths,
+    configured_search_paths,
 )
 from .security import (
     PackageSecurityError,
@@ -154,6 +155,10 @@ from .static_preview import (
     inspect_package_chat_tools,
     write_consent_required,
 )
+from .reload import (
+    PackageLoadOutcome,
+    reload_packages,
+)
 from .archive_cache import (
     ArchiveCacheError,
     ArchiveFetcher,
@@ -181,6 +186,9 @@ __all__ = [
     "get_registry",
     "discover_and_register",
     "default_search_paths",
+    "configured_search_paths",
+    "PackageLoadOutcome",
+    "reload_packages",
     "PackageSecurityError",
     "validate_manifest_security",
     "InstallError",

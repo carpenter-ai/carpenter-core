@@ -115,22 +115,10 @@ class Coordinator:
         Failures are logged and swallowed: a misbehaving package must
         not block the daemon from starting.
         """
-        from pathlib import Path
         from .packages import discover_and_register
+        from .packages.registry import configured_search_paths
 
-        cfg = config.CONFIG.get("capability_packages", {}) or {}
-        configured = cfg.get("search_paths")
-        search_paths: list[Path] | None = None
-        if configured:
-            if not isinstance(configured, list):
-                logger.error(
-                    "config['capability_packages']['search_paths'] must be "
-                    "a list; falling back to defaults",
-                )
-            else:
-                search_paths = [
-                    Path(os.path.expanduser(str(p))) for p in configured
-                ]
+        search_paths = configured_search_paths()
 
         try:
             from .db import db_transaction
