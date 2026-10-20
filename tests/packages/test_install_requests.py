@@ -218,7 +218,12 @@ def test_the_tree_lands_in_quarantine_and_stays_there(
     _hello(fake_fetch)
     out = _request([_git()])
     assert out.staging_root.parent == staging_root
-    assert out.staging_root.name.startswith("req-")
+    # Underscore-prefixed, like every other quarantine directory: it is
+    # the invariant fetch.py documents, and the reason is that package
+    # discovery skips a child starting with "." or "_", so even a search
+    # path misconfigured onto the staging root cannot load from here.
+    assert out.staging_root.name.startswith(ir.BATCH_DIR_PREFIX)
+    assert out.staging_root.name.startswith("_")
     tree = Path(out.preview[0]["tree_path"])
     assert tree.is_dir() and (tree / "manifest.yaml").is_file()
     assert out.staging_root in tree.parents
@@ -334,7 +339,7 @@ def _assert_nothing_written(staging_root: Path):
     with db_connection() as db:
         assert pi.list_requests(db) == []
     leftovers = [
-        p for p in staging_root.glob("req-*")
+        p for p in staging_root.glob("*req-*")
     ] if staging_root.is_dir() else []
     assert leftovers == []
 
@@ -572,3 +577,45 @@ def test_a_caller_may_supply_its_own_connection(fake_fetch, tmp_path):
     assert pi.get_request(conn, out.token).id == out.record.id
     conn.close()
     shutil.rmtree(out.staging_root, ignore_errors=True)
+
+
+# ── the quarantine's naming invariant (F7) ──────────────────────────
+
+
+def test_every_directory_above_a_quarantined_tree_is_skippable(
+    installer_tables, fake_fetch, staging_root,
+):
+    """The invariant's point, stated as the property it has to have.
+
+    ``fetch.py`` documents the ``_`` prefix as defence in depth:
+    package discovery skips a child whose name starts with ``.`` or
+    ``_``, so a search path misconfigured onto the staging root — or
+    onto anything inside it — finds no package.  That only holds if
+    EVERY directory between the root and the tree is prefixed.  The
+    batch directory used to break it by sitting in the root as
+    ``req-<hex>``.
+    """
+    from carpenter.packages.registry import PackageRegistry
+
+    _hello(fake_fetch)
+    out = _request([_git()])
+    tree = Path(out.preview[0]["tree_path"])
+    assert (tree / "manifest.yaml").is_file()  # there IS a package in there
+
+    above = tree.relative_to(staging_root).parts[:-1]
+    assert above, "the tree must sit inside at least one quarantine dir"
+    assert all(part.startswith((".", "_")) for part in above), above
+
+    # Every directory in that chain is skipped by a discovery pass over
+    # its parent: the staging root first, then each quarantine level
+    # down to the one that directly holds the package directory (which
+    # is the package, and cannot be prefixed).
+    registry = PackageRegistry()
+    roots = [staging_root] + [
+        staging_root.joinpath(*above[:index + 1])
+        for index in range(len(above) - 1)
+    ]
+    for root in roots:
+        assert registry._discover_manifests(
+            [root], install_paths=set(),
+        ) == [], root

@@ -55,7 +55,11 @@ from .. import config
 from ..db import db_connection, db_transaction
 from ..packages import fetch as fetch_mod
 from ..packages import pending_install
-from ..packages.install_requests import REQUEST_URL_PREFIX
+from ..packages.install_requests import (
+    BATCH_DIR_PREFIX,
+    LEGACY_BATCH_DIR_PREFIX,
+    REQUEST_URL_PREFIX,
+)
 from ..packages.pending_install import PendingInstallStateError
 from .auth import extract_token
 from .static import load_template, read_asset
@@ -778,16 +782,19 @@ def _normalize_grants(record, raw) -> dict:
 def _cleanup_quarantine(record) -> None:
     """Delete the batch's quarantine directory after a rejection.
 
-    Guarded on the path's shape — it must be a ``req-*`` directory
-    directly inside the quarantine root — so a corrupted or
-    hand-edited row cannot turn a rejection into an arbitrary
-    ``rmtree``.
+    Guarded on the path's shape — it must be a batch directory directly
+    inside the quarantine root — so a corrupted or hand-edited row
+    cannot turn a rejection into an arbitrary ``rmtree``.  The legacy
+    prefix is accepted because a row written before the rename points at
+    a directory with the old name.
     """
     root = record.staging_root
     if not root:
         return
     path = Path(root)
-    if path.parent.name != fetch_mod.STAGING_DIR_NAME or not path.name.startswith("req-"):
+    if path.parent.name != fetch_mod.STAGING_DIR_NAME or not path.name.startswith(
+        (BATCH_DIR_PREFIX, LEGACY_BATCH_DIR_PREFIX),
+    ):
         logger.warning(
             "Refusing to remove quarantine for request %s: %r is not a "
             "package-staging batch directory",

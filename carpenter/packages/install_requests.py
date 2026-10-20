@@ -68,12 +68,27 @@ __all__ = [
     "create_install_request",
     "limits_for",
     "request_path",
+    "BATCH_DIR_PREFIX",
     "request_url",
 ]
 
 #: Route prefix the approval page is served from (WP5 T5 owns the route;
 #: this is the one definition of the path both halves agree on).
 REQUEST_URL_PREFIX = "/api/package-install/"
+
+#: Prefix for a batch's quarantine directory, a child of
+#: :func:`carpenter.packages.fetch.staging_root_dir`.  It starts with
+#: ``_`` for the reason ``fetch._QUARANTINE_PREFIX`` does: package
+#: discovery skips a directory whose name starts with ``.`` or ``_``
+#: (``registry._discover_manifests``), so every directory between the
+#: staging root and a fetched tree has to be prefixed or that
+#: defence-in-depth property is only true of the inner one.
+BATCH_DIR_PREFIX = "_req-"
+
+#: What :data:`BATCH_DIR_PREFIX` used to be.  Rows written before the
+#: rename still point at a directory with this name, so anything that
+#: cleans one up accepts both.
+LEGACY_BATCH_DIR_PREFIX = "req-"
 
 #: Caps, overridable per deployment under the ``package_install`` config
 #: key.  They are deliberately small.  The attack this flow is built
@@ -555,7 +570,7 @@ def create_install_request(
     # One quarantine directory per batch, named with its own random id
     # rather than the request token: the token is the credential, and a
     # path appears in fetcher logs and OS-level error strings.
-    batch_dir = staging_root_dir() / f"req-{uuid.uuid4().hex[:16]}"
+    batch_dir = staging_root_dir() / f"{BATCH_DIR_PREFIX}{uuid.uuid4().hex[:16]}"
     batch_dir.mkdir(parents=True, exist_ok=False)
     try:
         batch_dir.chmod(0o700)

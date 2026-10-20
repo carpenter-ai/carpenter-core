@@ -80,6 +80,11 @@ STAGING_DIR_NAME = "package-staging"
 #: that even a misconfigured search path pointed at the staging root
 #: would skip these directories (package discovery ignores children
 #: starting with ``.`` or ``_``).
+#:
+#: The property is only as good as the whole path: anything that creates
+#: a directory under the staging root prefixes it the same way, which is
+#: why a batch of fetches lives under
+#: ``install_requests.BATCH_DIR_PREFIX`` rather than a bare name.
 _QUARANTINE_PREFIX = "_fetch-"
 
 
