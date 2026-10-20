@@ -149,6 +149,11 @@ from .fetch import (
     register_fetcher,
     staging_root_dir,
 )
+# Importing these registers their fetchers with the dispatcher, which is
+# the only way a remote ``kind`` becomes fetchable.  Import order does not
+# matter, but dropping either import silently disables that kind.
+from .fetch_git import GitFetcher
+from .fetch_archive import ArchiveUrlFetcher
 from .static_preview import (
     StaticPreview,
     StaticToolInfo,
@@ -171,7 +176,9 @@ from .archive_cache import (
 
 __all__ = [
     "ArcTemplateRef",
+    "ArchiveUrlFetcher",
     "EgressGrant",
+    "GitFetcher",
     "EnvCredentialRef",
     "JudgeHandlerRef",
     "KbArticleRef",
