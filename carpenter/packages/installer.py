@@ -324,7 +324,20 @@ CREATE TABLE IF NOT EXISTS installed_packages (
     source_id TEXT,
     -- ``fetched_at``: UTC ISO-8601 time the recorded bytes were
     -- obtained for this install.
-    fetched_at TEXT
+    fetched_at TEXT,
+    -- ``shipped_hash``: root hash of the PRISTINE tree this version
+    -- shipped, which is NOT always ``hash``.  A plain install copies
+    -- the shipped tree verbatim, so the two are equal; a reconciled
+    -- upgrade installs the shipped tree MERGED with the operator's
+    -- local edits, so ``hash`` describes the merged tree on disk while
+    -- this column still describes what upstream shipped.  The upgrade
+    -- engine needs the latter as its ``shipped_old`` anchor: anchoring
+    -- on the merged tree would make surviving operator edits look like
+    -- part of the shipped version, and the next upgrade would overwrite
+    -- them without reporting a conflict.  NULL for a row written before
+    -- this column existed, which reads as "equal to ``hash``" — true of
+    -- every install that predates reconciled upgrades.
+    shipped_hash TEXT
 );
 """
 
@@ -345,6 +358,12 @@ CREATE INDEX IF NOT EXISTS idx_installed_packages_templates_template
 #: Source-provenance columns, in the order they appear in the DDL.  Used
 #: by the column-presence migration and by the row readers so the three
 #: never drift apart.
+#: Root hash of the pristine tree the installed version shipped.  Kept
+#: as a named constant for the same reason as
+#: :data:`_PROVENANCE_COLUMNS`: the DDL, the migration and the row
+#: readers must not drift apart.  See the column's DDL comment.
+_SHIPPED_HASH_COLUMN = "shipped_hash"
+
 _PROVENANCE_COLUMNS = (
     "source_kind",
     "source_url",
@@ -397,6 +416,19 @@ def ensure_installer_tables(conn: sqlite3.Connection) -> None:
             conn.execute(
                 f"ALTER TABLE installed_packages ADD COLUMN {column} TEXT",
             )
+
+    # ── pristine-tree hash migration (reconciled upgrades) ──────────
+    # Older DBs lack ``shipped_hash``.  Nullable with no default: NULL
+    # reads as "the shipped tree is what is on disk", which is exactly
+    # true for every install written before reconciled upgrades
+    # existed.
+    if _SHIPPED_HASH_COLUMN not in cols:
+        conn.execute(
+            "ALTER TABLE installed_packages "
+            f"ADD COLUMN {_SHIPPED_HASH_COLUMN} TEXT",
+        )
+    # ── end pristine-tree hash migration ────────────────────────────
+
     # Chat-requested installs: the pending-request record the two-phase
     # request -> operator approval -> install flow is built on.  It lives
     # here rather than in ``schema.sql`` for the same reason
@@ -421,6 +453,23 @@ def _capability_to_dict(cap: PlatformCapabilityRef) -> dict:
             "credential_ref": cap.grant.credential_ref,
         },
     }
+
+
+def _source_id_of(provenance) -> str | None:
+    """Return ``sources.source_id(provenance)``, or ``None`` if unknown.
+
+    The one place that turns an optional
+    :class:`carpenter.packages.sources.SourceSpec` into the id the
+    archive cache keys on, so the row's ``source_id`` column and the
+    cache's directory name can never disagree.
+    """
+    if provenance is None:
+        return None
+    try:
+        from .sources import source_id as _sid
+        return _sid(provenance)
+    except Exception:  # noqa: BLE001 — a bad spec must not fail an install
+        return None
 
 
 def _provenance_values(
@@ -474,6 +523,7 @@ def _record_install(
     provenance=None,
     resolved: str = "",
     provenance_carry_over: dict | None = None,
+    shipped_hash: str | None = None,
 ) -> None:
     """Write the install row + templates rows.
 
@@ -485,6 +535,15 @@ def _record_install(
     ``provenance_carry_over`` is a prior install record, that row's
     provenance unchanged.  ``source_path`` keeps its original meaning
     either way: the local directory the bytes were copied from.
+
+    ``shipped_hash`` is the root hash of the PRISTINE tree this version
+    shipped.  Pass ``pkg_hash`` when the install materialises the
+    shipped tree verbatim (which is what ``install_package`` does), and
+    the shipped tree's own hash when what lands on disk is a merge of
+    it with the operator's edits (the reconciled-upgrade path).
+    ``None`` carries the prior row's value over when
+    ``provenance_carry_over`` is given, else records NULL — which reads
+    as "the same as ``hash``".
 
     The caller owns the transaction.  When invoked inside
     :func:`carpenter.db.db_transaction`, that wrapper commits on
@@ -508,13 +567,17 @@ def _record_install(
         fetched_at=installed_at,
         carry_over=provenance_carry_over,
     )
+    if shipped_hash is None and provenance_carry_over is not None:
+        carried = provenance_carry_over.get(_SHIPPED_HASH_COLUMN)
+        shipped_hash = carried if isinstance(carried, str) else None
     conn.execute(
         "INSERT OR REPLACE INTO installed_packages "
         "(name, version, hash, source_path, install_path, installed_at, "
         "allowlist_proposals_json, platform_capabilities_json, "
-        "write_chat_tools_allowed, " + ", ".join(_PROVENANCE_COLUMNS) + ") "
+        "write_chat_tools_allowed, " + ", ".join(_PROVENANCE_COLUMNS)
+        + f", {_SHIPPED_HASH_COLUMN}) "
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?"
-        + ", ?" * len(_PROVENANCE_COLUMNS) + ")",
+        + ", ?" * len(_PROVENANCE_COLUMNS) + ", ?)",
         (
             manifest.name,
             manifest.version,
@@ -526,6 +589,7 @@ def _record_install(
             capabilities_payload,
             1 if write_chat_tools_allowed else 0,
             *provenance_values,
+            shipped_hash,
         ),
     )
     # Refresh the templates join table for this package.
@@ -623,7 +687,7 @@ _RECORD_COLUMNS = (
     "name", "version", "hash", "source_path", "install_path", "installed_at",
     "allowlist_proposals_json", "platform_capabilities_json",
     "write_chat_tools_allowed",
-) + _PROVENANCE_COLUMNS
+) + _PROVENANCE_COLUMNS + (_SHIPPED_HASH_COLUMN,)
 
 _RECORD_SELECT = (
     "SELECT " + ", ".join(_RECORD_COLUMNS) + " FROM installed_packages"
@@ -1763,6 +1827,11 @@ def install_package(
         # the source says so; silence means "unknown".
         provenance=provenance,
         resolved=resolved,
+        # An install materialises the source tree verbatim, so the
+        # pristine tree it shipped and the tree now on disk are the
+        # same bytes and the same hash.  (A reconciled upgrade is the
+        # case where they differ.)
+        shipped_hash=pkg_hash,
     )
 
     # B-full: merge the proposed allowlist additions into the platform's
@@ -1810,6 +1879,11 @@ def install_package(
         from . import archive_cache
         cached_path = archive_cache.store_archive(
             installed_manifest.name, installed_manifest.version, dest_path,
+            # Key the snapshot by the LOGICAL source when we know it, so
+            # two remotes publishing the same name@version do not
+            # overwrite each other's pristine tree.  Unknown provenance
+            # keeps the original source-blind path.
+            source_id=_source_id_of(provenance),
         )
         logger.debug(
             "Cached pristine archive for %r v%s at %s",

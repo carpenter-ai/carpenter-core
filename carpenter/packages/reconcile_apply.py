@@ -53,6 +53,7 @@ from .installer import (
     _record_install,
     compute_package_hash,
     get_install_record,
+    granted_verbs_for_package,
 )
 from .manifest import load_manifest
 
@@ -166,6 +167,9 @@ def apply_reconciled_install(
     *,
     conn: sqlite3.Connection,
     dest_path: Path | str | None = None,
+    provenance=None,
+    resolved: str = "",
+    shipped_hash: str | None = None,
 ) -> ApplyResult:
     """Atomically install a reconciled package tree as ``name``.
 
@@ -195,6 +199,20 @@ def apply_reconciled_install(
             from the existing ``installed_packages`` record's
             ``install_path`` (the package must already be installed in that
             case).
+        provenance: Optional
+            :class:`carpenter.packages.sources.SourceSpec` for the
+            source the NEW bytes came from.  An upgrade follows a ref,
+            so the row's ``source_resolved`` moves on even though the
+            logical source is unchanged; passing the spec records that.
+            Omitted, the prior row's provenance carries over unchanged
+            (a reconcile of the same source's bytes).
+        resolved: What pins the new bytes — git commit sha40 or archive
+            sha256.  Only meaningful alongside ``provenance``.
+        shipped_hash: Root hash of the pristine tree the new version
+            shipped, BEFORE the operator's edits were merged back in.
+            This is the anchor the next upgrade reconciles against, so
+            an upgrade caller always passes it; omitting it carries the
+            prior row's value over.
 
     Returns:
         :class:`ApplyResult`.
@@ -287,6 +305,24 @@ def apply_reconciled_install(
     prior_write_allowed = bool(
         record.get("write_chat_tools_allowed") if record is not None else False
     )
+    # Likewise preserve the platform-capability grants the operator
+    # already made, re-bound BY VERB against the new manifest.  Without
+    # this, a reconciled upgrade re-records an empty grant list and
+    # silently revokes every capability verb the package had — the
+    # loader registers only what this column names.  Re-binding by verb
+    # is also what keeps it honest in the other direction: a verb the
+    # new version ADDS is not in the prior grant set, so it is not
+    # granted here, and a verb the new version drops disappears with
+    # it.  Granting a new verb needs the operator's explicit consent,
+    # which lives in the install path, not here.
+    granted_verbs = (
+        granted_verbs_for_package(conn, name) if record is not None
+        else frozenset()
+    )
+    granted_capabilities = tuple(
+        c for c in installed_manifest.platform_capabilities
+        if c.verb in granted_verbs
+    )
     _record_install(
         conn,
         manifest=installed_manifest,
@@ -294,11 +330,16 @@ def apply_reconciled_install(
         install_path=dest_path,
         pkg_hash=pkg_hash,
         installed_at=installed_at,
+        granted_capabilities=granted_capabilities,
         write_chat_tools_allowed=prior_write_allowed,
-        # A reconcile re-records the SAME source's bytes, so the row's
-        # source provenance carries forward unchanged rather than being
-        # erased by the re-record.
+        # A reconcile of the same bytes carries the row's source
+        # provenance forward unchanged rather than erasing it; an
+        # upgrade caller that followed the source's ref passes the new
+        # provenance explicitly, which takes precedence.
+        provenance=provenance,
+        resolved=resolved,
         provenance_carry_over=record,
+        shipped_hash=shipped_hash,
     )
 
     # Refresh KB articles for the reconciled tree the same way install
