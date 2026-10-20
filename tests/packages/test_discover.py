@@ -536,7 +536,9 @@ class TestListRemotePackages:
         stub.serve = solo  # no ``packages/`` anywhere in it
 
         def refuse(spec, dest, *, limits, require_manifest=True):
-            raise fetch.FetchError("the git source has no directory 'packages'")
+            raise fetch.FetchError(
+                "the git source has no directory 'packages'",
+            )
 
         stub.fetch = refuse  # type: ignore[method-assign]
         with pytest.raises(DiscoveryError) as exc:

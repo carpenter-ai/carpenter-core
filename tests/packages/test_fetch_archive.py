@@ -1306,7 +1306,7 @@ def index_archive(tmp_path) -> bytes:
 
 @pytest.fixture
 def wrapped_index_archive(tmp_path) -> bytes:
-    """The same monorepo inside one top-level directory, as a forge serves it."""
+    """The same monorepo in one top-level directory, as a forge serves it."""
     root = _fresh(tmp_path / "wrapped")
     inner = root / "packages-1.0"
     for name in ("alpha", "beta"):
@@ -1446,7 +1446,9 @@ class TestIndexRoot:
     def test_a_redirect_to_a_refused_address_is_still_refused(
         self, site, quarantine,
     ):
-        start = site.redirect("/mono.tar.gz", "http://169.254.169.254/x.tar.gz")
+        start = site.redirect(
+            "/mono.tar.gz", "http://169.254.169.254/x.tar.gz",
+        )
         with pytest.raises(FetchError) as excinfo:
             _fetch(_spec(start, subdir="packages"), quarantine,
                    require_manifest=False)
