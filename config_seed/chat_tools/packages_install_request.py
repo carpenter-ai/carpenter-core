@@ -1,4 +1,19 @@
-"""Chat tool: ask the operator to approve installing capability packages.
+"""Chat tools: find capability packages, and ask to install one.
+
+Two tools, deliberately in one module because they are two halves of
+one workflow: ``list_available_packages`` says what a configured source
+offers, and ``request_package_install`` asks a human to approve
+installing something from it.  Neither installs anything by itself and
+neither runs any of the fetched code.
+
+``list_available_packages(source=None)`` is read-only and exists so a
+person can say "install the email package" without first finding a URL
+to paste: it reads each candidate's ``manifest.yaml`` out of a
+quarantined fetch, caches the listing, and hands back the exact spec
+strings the install tool takes.  It is NOT refused to arc agents — it
+reads metadata, it can only be pointed at a source the operator already
+configured, and the listing cache's TTL bounds how often it can make the
+platform talk to a remote at all.
 
 ``request_package_install(sources)`` installs nothing.  It resolves the
 named sources, fetches them into quarantine, builds a preview without
@@ -204,3 +219,121 @@ def request_package_install(tool_input, **kwargs):
     # reaches the person verbatim: a model paraphrase of a security
     # decision surface is not worth the round trip.
     return FinalReply("\n".join(lines))
+
+
+def _format_listing(listing) -> list[str]:
+    """One source's packages, with the spec string for each."""
+    lines = [
+        f"Source {listing.source!r} ({listing.url}) — listing read from "
+        f"{listing.resolved[:12] or 'an unpinned revision'}, fetched "
+        f"{listing.fetched_at}:",
+    ]
+    if not listing.packages:
+        lines.append("  (this source offers no capability packages)")
+    for pkg in listing.packages:
+        summary = f" — {pkg.description}" if pkg.description else ""
+        lines.append(f"  • {pkg.name} v{pkg.version}{summary}")
+        lines.append(f"      spec: {pkg.spec}")
+    for problem in listing.errors:
+        lines.append(f"  ! {problem}")
+    return lines
+
+
+@chat_tool(
+    description=(
+        "List the capability packages a configured package source offers, "
+        "so a person can ask for one by name instead of pasting a URL. "
+        "Read-only: it reads each package's manifest and NOTHING else — no "
+        "package code is imported or run, and nothing is installed. Call "
+        "it with no arguments to see which sources the operator has "
+        "configured and how many packages each one offers; call it with "
+        "source='<alias>' to see that source's packages, each with the "
+        "exact spec string to pass to request_package_install. The reply "
+        "says which commit or digest the listing was read from and when."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "source": {
+                "type": "string",
+                "description": (
+                    "Alias of a configured package source. Omit to list "
+                    "the configured sources themselves."
+                ),
+            },
+        },
+        "required": [],
+    },
+    # Reads config, the listing cache and the fetched manifests.  The one
+    # write this tool causes is the platform's own listing cache file,
+    # which is why it sits at the platform boundary rather than the chat
+    # one (a chat-boundary tool may not write at all) while declaring
+    # only the read capabilities the caller actually gets.
+    capabilities=["config_read", "filesystem_read"],
+    trust_boundary="platform",
+    always_available=False,
+    requires_user_confirm=False,
+)
+def list_available_packages(tool_input, **kwargs):
+    """Describe what the configured package sources offer."""
+    from carpenter.packages.discover import (
+        DiscoveryError,
+        cached_listing,
+        list_remote_packages,
+        list_source_aliases,
+    )
+
+    nothing_happened = (
+        "Nothing was installed and none of this package code was run: a "
+        "listing reads manifests only. To install one, call "
+        "request_package_install with the spec string above and give the "
+        "person the approval link it returns."
+    )
+
+    source = (tool_input or {}).get("source")
+    try:
+        if source:
+            # Never with refresh=True: the cached listing's TTL is what
+            # keeps a curious agent from making the platform clone a
+            # remote on every question.
+            listing = list_remote_packages(str(source))
+            lines = _format_listing(listing)
+        else:
+            aliases = list_source_aliases()
+            if not aliases:
+                return (
+                    "No package source is configured, so there is nothing "
+                    "to list. An operator adds one to the "
+                    "'package_sources' config key (name, url and, for a "
+                    "repository holding many packages, a subdir_template "
+                    "such as 'packages/{name}'), and adds its host to "
+                    "'web_egress_allowlist' when it is not on the public "
+                    "internet. Nothing was installed."
+                )
+            lines = ["Configured package sources, in search order:"]
+            for alias in aliases:
+                cached = cached_listing(alias)
+                if cached is None:
+                    lines.append(
+                        f"  • {alias} — not listed yet; ask me to list "
+                        f"this source by name and I will read it.",
+                    )
+                    continue
+                pin = cached.resolved[:12] or "an unpinned revision"
+                lines.append(
+                    f"  • {alias} — {len(cached.packages)} package(s), "
+                    f"read from {pin} and last fetched "
+                    f"{cached.fetched_at}",
+                )
+            lines.append(
+                "Counts come from the cached listings, not a fresh fetch. "
+                "Ask for one source by name for its packages and their "
+                "install specs.",
+            )
+    except DiscoveryError as exc:
+        return f"Could not list packages: {exc}. Nothing was installed."
+    except Exception as exc:  # noqa: BLE001 — never raise into the loop
+        return f"Listing packages failed: {exc}. Nothing was installed."
+
+    lines += ["", nothing_happened]
+    return "\n".join(lines)

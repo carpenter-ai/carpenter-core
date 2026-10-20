@@ -49,6 +49,16 @@ PLATFORM_TOOLS = frozenset({
     # config_seed/chat_tools/packages_install_request.py must stay
     # together.
     "request_package_install",
+    # Lists what a configured package source offers.  Read-only - it
+    # reads manifests and runs no package code - but the listing it
+    # caches under ``{base_dir}/cache/`` is a platform write, and a
+    # chat-boundary tool may not write at all.  Ships in the same seed
+    # module as ``request_package_install``, so this entry and that file
+    # must stay together too.  Deliberately NOT in ``CHAT_ONLY_TOOLS``:
+    # an arc may read it, because its only input is an alias the
+    # operator configured and the listing TTL bounds the network it can
+    # cause.
+    "list_available_packages",
 })
 
 # Operator-only tools.  Core requires a human to confirm every call to one
