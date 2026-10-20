@@ -148,7 +148,11 @@ class _StubRemoteFetcher:
 
 
 class TestDispatch:
-    def test_unregistered_kind_names_the_kind(self):
+    def test_unregistered_kind_names_the_kind(self, isolated_fetchers):
+        # Deregister everything: which kinds ship a fetcher is a moving
+        # target, and the dispatcher's refusal is what is under test.  The
+        # lookup happens before the egress guard, so this reaches no network.
+        fetch._FETCHERS.clear()
         spec = parse_source("https://files.example/d/demo-1.0.tar.gz")
         with pytest.raises(FetchError, match="kind 'archive'"):
             fetch_source(spec)
