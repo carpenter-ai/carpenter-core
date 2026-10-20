@@ -791,3 +791,41 @@ def test_the_coordinator_registers_the_handler():
 
     source = inspect.getsource(coordinator.Coordinator._register_work_handlers)
     assert "install_approved_handler" in source
+
+
+# ── the quarantine is reclaimed on every terminal state (D-1) ───────
+
+
+async def test_a_successful_install_reclaims_its_quarantine(
+    installer_tables, fake_fetch,
+):
+    from carpenter.packages import install_approved_handler as handler
+
+    fake_fetch.register("alpha", ALPHA_MANIFEST)
+    out = _approved([_spec("alpha")], {"alpha": {}})
+    assert out.staging_root.is_dir()
+
+    await handler.handle_package_install_approved(
+        1, {"request_id": out.record.id},
+    )
+
+    assert _reload_record(out.record.token).status == pi.STATUS_INSTALLED
+    assert not out.staging_root.exists()
+
+
+async def test_a_failed_install_reclaims_its_quarantine(
+    installer_tables, fake_fetch, fail_install_of,
+):
+    from carpenter.packages import install_approved_handler as handler
+
+    fake_fetch.register("alpha", ALPHA_MANIFEST)
+    out = _approved([_spec("alpha")], {"alpha": {}})
+    fail_install_of("alpha")
+    assert out.staging_root.is_dir()
+
+    await handler.handle_package_install_approved(
+        1, {"request_id": out.record.id},
+    )
+
+    assert _reload_record(out.record.token).status == pi.STATUS_FAILED
+    assert not out.staging_root.exists()

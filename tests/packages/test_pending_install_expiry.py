@@ -456,3 +456,116 @@ def test_an_interrupted_install_reclaims_its_quarantine(installer_tables):
         pi.fail_interrupted_installs(db)
 
     assert not Path(record.staging_root).exists()
+
+
+# ── quarantine left with no row to own it (D-1) ─────────────────────
+
+
+def _orphan(name="_req-orphan", *, age_s=7200.0) -> Path:
+    """A batch quarantine directory with no request row, backdated."""
+    import os
+
+    path = _staging_root() / name
+    (path / "_fetch-1" / "pkg").mkdir(parents=True, exist_ok=True)
+    (path / "_fetch-1" / "pkg" / "manifest.yaml").write_text("name: x\n")
+    stamp = (datetime.now(timezone.utc).timestamp()) - age_s
+    os.utime(path, (stamp, stamp))
+    return path
+
+
+def test_an_orphaned_quarantine_is_swept(installer_tables):
+    orphan = _orphan()
+    with db_transaction() as db:
+        removed = pi.sweep_orphan_quarantines(db)
+    assert removed == [str(orphan)]
+    assert not orphan.exists()
+
+
+def test_the_orphan_sweep_is_idempotent(installer_tables):
+    _orphan()
+    with db_transaction() as db:
+        assert len(pi.sweep_orphan_quarantines(db)) == 1
+    with db_transaction() as db:
+        assert pi.sweep_orphan_quarantines(db) == []
+
+
+def test_the_orphan_sweep_leaves_a_live_request_alone(installer_tables):
+    record = _make(name="_req-live")
+    orphan = _orphan("_req-dead")
+    with db_transaction() as db:
+        removed = pi.sweep_orphan_quarantines(db, min_age_s=0)
+    assert removed == [str(orphan)]
+    assert Path(record.staging_root).is_dir()
+
+
+def test_the_orphan_sweep_reclaims_a_decided_requests_directory(
+    installer_tables,
+):
+    """A terminal row's directory is nobody's, even though the row exists."""
+    record = _make(name="_req-decided-2")
+    with db_transaction() as db:
+        pi.mark_rejected(db, record.token, reason="no thanks")
+    # Rejection on the route removes it; here the row is terminal and
+    # the directory is still there, which is the crash case.
+    assert Path(record.staging_root).is_dir()
+
+    with db_transaction() as db:
+        removed = pi.sweep_orphan_quarantines(db, min_age_s=0)
+    assert removed == [record.staging_root]
+    assert not Path(record.staging_root).exists()
+
+
+def test_the_orphan_sweep_ignores_a_young_directory(installer_tables):
+    fresh = _orphan("_req-fresh-orphan", age_s=0)
+    with db_transaction() as db:
+        assert pi.sweep_orphan_quarantines(db) == []
+    assert fresh.is_dir()
+
+
+def test_the_orphan_sweep_ignores_anything_not_a_batch_directory(
+    installer_tables,
+):
+    import os
+
+    root = _staging_root()
+    other = root / "_fetch-direct-cli-install"
+    other.mkdir(parents=True, exist_ok=True)
+    plain = root / "notes.txt"
+    plain.write_text("x")
+    stamp = datetime.now(timezone.utc).timestamp() - 7200
+    os.utime(other, (stamp, stamp))
+
+    with db_transaction() as db:
+        assert pi.sweep_orphan_quarantines(db) == []
+    assert other.is_dir()
+    assert plain.is_file()
+
+
+def test_the_path_guard_still_refuses_a_crafted_staging_root(
+    installer_tables, tmp_path,
+):
+    """A column that was edited must not turn cleanup into rmtree."""
+    outside = tmp_path / "precious"
+    (outside / "keep").mkdir(parents=True)
+    record = _make(staging=False, name="_req-crafted")
+    crafted = pi.PendingInstall(
+        **{**record.__dict__, "staging_root": str(outside)},
+    )
+    assert pi.remove_staging(crafted) is False
+    assert (outside / "keep").is_dir()
+
+    root_itself = pi.PendingInstall(
+        **{**record.__dict__, "staging_root": str(_staging_root())},
+    )
+    assert pi.remove_staging(root_itself) is False
+    assert _staging_root().is_dir()
+
+
+def test_startup_recovery_sweeps_orphans_too(installer_tables):
+    orphan = _orphan("_req-startup-orphan")
+    db = get_db()
+    try:
+        _recover_on_startup(db)
+    finally:
+        db.close()
+    assert not orphan.exists()

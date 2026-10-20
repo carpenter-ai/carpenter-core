@@ -294,6 +294,11 @@ class Coordinator:
                     if not pending_install.table_exists(db):
                         return
                     swept = pending_install.sweep_expired(db)
+                    pending_install.fail_stale_approved(db)
+                    # Untrusted fetched code with no row to own it:
+                    # a crash between the fetch and the insert leaves
+                    # the directory and nothing else.
+                    pending_install.sweep_orphan_quarantines(db)
             except sqlite3.Error:
                 logger.debug(
                     "Package-install expiry sweep failed", exc_info=True,

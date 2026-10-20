@@ -48,6 +48,7 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -967,6 +968,95 @@ def remove_staging(record: PendingInstall) -> bool:
     return True
 
 
+#: Prefixes a batch quarantine directory may carry: the current one and
+#: the one rows written before the rename point at.  Nothing else in the
+#: staging root is swept by directory — a bare ``_fetch-*`` there belongs
+#: to a direct ``fetch_source`` call that has no request row at all.
+_BATCH_DIR_PREFIXES = ("_req-", "req-")
+
+#: How old an unowned batch directory must be before the sweep removes
+#: it.  A request fetches into its directory *before* it writes its row,
+#: so a young directory with no row may simply be a fetch in flight; a
+#: fetch is capped at a minute or so per source, and this is an hour.
+ORPHAN_QUARANTINE_GRACE_S = 3600.0
+
+
+def sweep_orphan_quarantines(
+    conn: sqlite3.Connection,
+    *,
+    min_age_s: float = ORPHAN_QUARANTINE_GRACE_S,
+    limit: int = 500,
+) -> list[str]:
+    """Remove batch quarantines no live request owns.
+
+    Every status transition reclaims its own quarantine, so this is for
+    the case that has no row to hang the cleanup off: the platform died
+    between the fetch and the insert, or a row was deleted by hand.
+    Without it, up to one fetch cap of **untrusted fetched code** per
+    crash stays on disk forever.
+
+    What it will not do: touch anything that is not a direct child of
+    the configured quarantine root, is not named like a batch directory,
+    is younger than ``min_age_s``, or is the recorded ``staging_root`` of
+    a request that is not in a terminal state.  Idempotent — a second
+    run finds nothing left to remove.
+
+    Returns the paths it removed.
+    """
+    import shutil
+    from pathlib import Path
+
+    if not table_exists(conn):
+        return []
+    root_str = _staging_root_dir()
+    if root_str is None:
+        return []
+    root = Path(root_str)
+    if not root.is_dir():
+        return []
+
+    placeholders = ",".join("?" * len(TERMINAL_STATUSES))
+    rows = conn.execute(
+        f"SELECT staging_root FROM pending_package_installs "
+        f"WHERE staging_root IS NOT NULL AND staging_root != '' "
+        f"AND status NOT IN ({placeholders})",
+        tuple(sorted(TERMINAL_STATUSES)),
+    ).fetchall()
+    owned: set[str] = set()
+    for row in rows:
+        raw = row[0]
+        try:
+            owned.add(str(Path(raw).resolve()))
+        except OSError:  # pragma: no cover — unreadable path
+            continue
+
+    cutoff = time.time() - max(float(min_age_s), 0.0)
+    removed: list[str] = []
+    for child in sorted(root.iterdir()):
+        if len(removed) >= int(limit):
+            break
+        if not child.is_dir() or child.is_symlink():
+            continue
+        if not child.name.startswith(_BATCH_DIR_PREFIXES):
+            continue
+        try:
+            if child.stat().st_mtime > cutoff:
+                continue
+        except OSError:  # pragma: no cover — vanished under us
+            continue
+        if str(child.resolve()) in owned:
+            continue
+        shutil.rmtree(child, ignore_errors=True)
+        removed.append(str(child))
+    if removed:
+        logger.warning(
+            "Removed %d orphaned package-install quarantine director(ies) "
+            "that no live request owns: %s",
+            len(removed), [Path(p).name for p in removed],
+        )
+    return removed
+
+
 def sweep_expired(
     conn: sqlite3.Connection, *, now: str | None = None, limit: int = 200,
 ) -> list[PendingInstall]:
@@ -1064,4 +1154,7 @@ def recover_on_startup(conn: sqlite3.Connection) -> tuple[int, int]:
     interrupted = len(fail_interrupted_installs(conn))
     interrupted += len(fail_stale_approved(conn))
     expired = len(sweep_expired(conn))
+    # Last, so that the three passes above have already released the
+    # directories they own: whatever is left belongs to nobody.
+    sweep_orphan_quarantines(conn)
     return (expired, interrupted)
