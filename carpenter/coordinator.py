@@ -149,6 +149,30 @@ class Coordinator:
         backfill_arc_approval_reviews()
         migrate_review_urls_to_absolute()
 
+    def _recover_approved_installs(self) -> None:
+        """Re-queue (or give up on) installs an operator already approved.
+
+        ``pending_install.recover_on_startup`` runs inside the database
+        connection's own transaction, so it cannot enqueue; this is the
+        half that can.  Idempotent, and a failure here must not stop the
+        platform from starting.
+        """
+        try:
+            from .packages import install_approved_handler
+            requeued, failed = (
+                install_approved_handler.recover_approved_installs()
+            )
+        except Exception:  # noqa: BLE001 — startup must not depend on it
+            logger.warning(
+                "Could not recover approved package installs", exc_info=True,
+            )
+            return
+        if requeued or failed:
+            logger.info(
+                "Package install recovery: re-queued %d approved request(s), "
+                "failed %d that never started", requeued, failed,
+            )
+
     def _register_work_handlers(self) -> None:
         """Register all work-queue event handlers and heartbeat hooks."""
         coding_change_handler.register_handlers(main_loop.register_handler)
@@ -251,7 +275,10 @@ class Coordinator:
         # approval routes also expire the single row in front of them, so
         # this is about reclaiming the quarantine each stale request is
         # still holding on disk, bounded by the TTL rather than by
-        # anyone remembering to clean up.
+        # anyone remembering to clean up.  The same pass re-queues an
+        # approval whose install never started: the enqueue happens
+        # after the approval commits, so a crash in between would
+        # otherwise leave the row stuck in ``approved`` forever.
         _last_pkg_install_sweep = [0.0]  # mutable container for closure
 
         def _package_install_sweep_hook():
@@ -277,6 +304,10 @@ class Coordinator:
                     "Package-install expiry sweep: expired %d request(s)",
                     len(swept),
                 )
+            # Outside the transaction above on purpose: enqueuing opens
+            # one of its own, and the per-thread guard refuses a nested
+            # write transaction outright.
+            self._recover_approved_installs()
 
         main_loop.register_heartbeat_hook(_package_install_sweep_hook)
         logger.info("Package-install expiry sweep hook registered")
@@ -683,6 +714,7 @@ class Coordinator:
         self._load_chat_tools(base_dir)
         self._discover_capability_packages()
         self._recover_review_links()
+        self._recover_approved_installs()
 
         logger.info("Coordinator started")
 

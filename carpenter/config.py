@@ -391,6 +391,7 @@ DEFAULTS = {
     #
     #   package_install:
     #     request_ttl_hours: 24     # link lifetime; expired links 410
+    #     approved_grace_hours: 6   # give up on an approval that never ran
     #     max_open_requests: 3      # undecided requests allowed at once
     #     max_requests_per_hour: 5  # requests the agent may create per hour
     #     max_sources_per_request: 5
@@ -409,6 +410,7 @@ DEFAULTS = {
     # model call for every approval.
     "package_install": {
         "request_ttl_hours": 24,
+        "approved_grace_hours": 6,
         "max_open_requests": 3,
         "max_requests_per_hour": 5,
         "max_sources_per_request": 5,

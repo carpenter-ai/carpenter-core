@@ -146,6 +146,14 @@ _TRANSITIONS: dict[str, frozenset[str]] = {
 #: Default request lifetime when the config key is unset or unusable.
 DEFAULT_TTL_HOURS = 24
 
+#: How long a row may sit in ``approved`` before recovery stops trying
+#: to start its install and fails it instead.  Generous on purpose: the
+#: install is re-enqueued every sweep, so reaching this means the work
+#: item is not being run at all (no main loop, a handler that is never
+#: registered, a batch that cannot start), and an operator asking again
+#: is a better answer than a row that waits forever.
+DEFAULT_APPROVED_GRACE_HOURS = 6
+
 
 # ── the table ───────────────────────────────────────────────────────
 
@@ -323,6 +331,33 @@ def default_ttl_hours(config: dict | None = None) -> float:
         return float(DEFAULT_TTL_HOURS)
     if hours <= 0:
         return float(DEFAULT_TTL_HOURS)
+    return hours
+
+
+def approved_grace_hours(config: dict | None = None) -> float:
+    """Grace period in hours, from ``package_install.approved_grace_hours``.
+
+    Falls back to :data:`DEFAULT_APPROVED_GRACE_HOURS` when the key is
+    absent or not a usable positive number, for the same reason
+    :func:`default_ttl_hours` does: a malformed config value must not
+    produce a row nothing ever gives up on.
+    """
+    section: Any
+    if config is not None:
+        section = config.get("package_install")
+    else:
+        from .. import config as _config
+        section = _config.CONFIG.get("package_install")
+    if isinstance(section, dict):
+        raw = section.get("approved_grace_hours", DEFAULT_APPROVED_GRACE_HOURS)
+    else:
+        raw = DEFAULT_APPROVED_GRACE_HOURS
+    try:
+        hours = float(raw)
+    except (TypeError, ValueError):
+        return float(DEFAULT_APPROVED_GRACE_HOURS)
+    if hours <= 0:
+        return float(DEFAULT_APPROVED_GRACE_HOURS)
     return hours
 
 
@@ -586,6 +621,96 @@ def due_for_expiry(
     )
     cur.row_factory = sqlite3.Row
     return [_row_to_record(r) for r in cur.fetchall()]
+
+
+def approved_awaiting_install(
+    conn: sqlite3.Connection, *, limit: int = 200,
+) -> list[PendingInstall]:
+    """Rows in ``approved``: decided, but the install has not claimed them.
+
+    The install handler's first act is ``approved -> installing``, so a
+    row still in ``approved`` means no handler has it.  Either the work
+    item is queued and waiting (re-enqueuing is then a no-op, because
+    the idempotency key already exists) or the enqueue never happened —
+    it runs after the approval transaction commits, so a crash in
+    between loses it.  The recovery seam re-enqueues both cases and lets
+    the queue's own deduplication sort out which was which.
+    """
+    cur = conn.execute(
+        "SELECT * FROM pending_package_installs "
+        "WHERE status = ? ORDER BY id LIMIT ?",
+        (STATUS_APPROVED, int(limit)),
+    )
+    cur.row_factory = sqlite3.Row
+    return [_row_to_record(r) for r in cur.fetchall()]
+
+
+#: What an operator reads on the status page of an approval the platform
+#: could not start.  Says what to do, because there is nothing else they
+#: can do: the token is spent and the row cannot be re-decided.
+STALE_APPROVAL_ERROR = (
+    "approved, but the install never started within the grace period "
+    "(the platform was down, or the queued work item never ran). "
+    "Nothing was installed and the quarantined copy has been removed; "
+    "ask again if you still want it."
+)
+
+
+def fail_stale_approved(
+    conn: sqlite3.Connection,
+    *,
+    now: str | None = None,
+    grace_hours: float | None = None,
+    config: dict | None = None,
+    limit: int = 200,
+) -> list[PendingInstall]:
+    """Fail approvals whose install never started, and free their disk.
+
+    ``approved`` is not a terminal status and not one
+    :func:`due_for_expiry` selects, so without this a row whose enqueue
+    was lost sits there forever: the page offers no buttons, a second
+    POST is 410 and ``approved -> requested`` is not a legal edge.  The
+    honest outcome after a bounded wait is a failure the operator can
+    see, with "ask again" as the way forward.
+
+    The caller owns the transaction.  Returns the rows it failed.
+    """
+    if not table_exists(conn):
+        return []
+    hours = (
+        grace_hours if grace_hours is not None
+        else approved_grace_hours(config)
+    )
+    cutoff = (
+        datetime.fromisoformat(now or utc_now_iso())
+        - timedelta(hours=float(hours))
+    ).isoformat()
+    cur = conn.execute(
+        "SELECT * FROM pending_package_installs "
+        "WHERE status = ? AND COALESCE(decided_at, requested_at) <= ? "
+        "ORDER BY id LIMIT ?",
+        (STATUS_APPROVED, cutoff, int(limit)),
+    )
+    cur.row_factory = sqlite3.Row
+    stale = [_row_to_record(r) for r in cur.fetchall()]
+    failed: list[PendingInstall] = []
+    for record in stale:
+        try:
+            updated = set_status(
+                conn, record.token, STATUS_FAILED,
+                error=STALE_APPROVAL_ERROR, expect=STATUS_APPROVED,
+            )
+        except PendingInstallStateError:  # pragma: no cover — raced
+            continue
+        remove_staging(record)
+        failed.append(updated)
+    if failed:
+        logger.warning(
+            "Failed %d approved package install(s) that never started "
+            "within %sh: %s",
+            len(failed), hours, [r.token_prefix for r in failed],
+        )
+    return failed
 
 
 # ── state machine ───────────────────────────────────────────────────
@@ -901,14 +1026,16 @@ def fail_interrupted_installs(
     failed: list[PendingInstall] = []
     for record in interrupted:
         try:
-            failed.append(
-                set_status(
-                    conn, record.token, STATUS_FAILED,
-                    error=INTERRUPTED_ERROR, expect=STATUS_INSTALLING,
-                ),
+            updated = set_status(
+                conn, record.token, STATUS_FAILED,
+                error=INTERRUPTED_ERROR, expect=STATUS_INSTALLING,
             )
         except PendingInstallStateError:  # pragma: no cover — raced
             continue
+        # Terminal, so the quarantine is nobody's any more.  The batch
+        # that was copying out of it is not coming back.
+        remove_staging(record)
+        failed.append(updated)
     if failed:
         logger.warning(
             "Failed %d package install(s) interrupted by a restart: %s. "
@@ -920,13 +1047,21 @@ def fail_interrupted_installs(
 
 
 def recover_on_startup(conn: sqlite3.Connection) -> tuple[int, int]:
-    """Both startup sweeps, in the order they have to happen.
+    """Every startup sweep that is pure database work, in order.
 
     Returns ``(expired, interrupted)`` counts so the caller can fold
-    them into its own startup-recovery log line.
+    them into its own startup-recovery log line; a stale approval
+    failed here is counted as interrupted, because that is what it is.
+
+    Re-enqueuing a live approval is deliberately NOT here: it needs
+    ``work_queue.enqueue``, which opens a transaction of its own, and
+    this runs inside the caller's.  That half is
+    :func:`carpenter.packages.install_approved_handler.recover_approved_installs`,
+    which the coordinator calls once the database is open.
     """
     if not table_exists(conn):
         return (0, 0)
     interrupted = len(fail_interrupted_installs(conn))
+    interrupted += len(fail_stale_approved(conn))
     expired = len(sweep_expired(conn))
     return (expired, interrupted)

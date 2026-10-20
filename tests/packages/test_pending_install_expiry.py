@@ -321,3 +321,138 @@ def test_the_heartbeat_hook_swallows_a_database_error(monkeypatch):
 
     monkeypatch.setattr(pi, "table_exists", boom)
     hook()  # must not raise
+
+
+# ── an approved row the enqueue never happened for (F4) ─────────────
+#
+# ``_enqueue_install`` runs after the approval transaction commits, by
+# necessity: ``work_queue.enqueue`` opens a transaction of its own.  A
+# crash in that window used to leave a row no path could reach --
+# ``approved`` is not terminal, not swept, not re-decidable (the route
+# answers 410 and the state machine refuses ``approved -> requested``)
+# -- and a quarantine nothing reclaimed.
+
+
+def _approve_without_enqueuing(record):
+    """The crash window: the approval commits, the enqueue never runs."""
+    with db_transaction() as db:
+        pi.mark_approved(db, record.token, grants={})
+
+
+def _install_work_items():
+    from carpenter.packages.install_approved_handler import EVENT_TYPE
+
+    with db_connection() as db:
+        return [
+            dict(row) for row in db.execute(
+                "SELECT id, status, idempotency_key, payload_json "
+                "FROM work_queue WHERE event_type = ?",
+                (EVENT_TYPE,),
+            ).fetchall()
+        ]
+
+
+def test_an_approved_row_is_re_enqueued_by_recovery(installer_tables):
+    from carpenter.packages import install_approved_handler as handler
+
+    record = _make(name="req-approved-lost")
+    _approve_without_enqueuing(record)
+    assert _install_work_items() == []
+
+    requeued, failed = handler.recover_approved_installs()
+
+    assert (requeued, failed) == (1, 0)
+    items = _install_work_items()
+    assert len(items) == 1
+    assert items[0]["idempotency_key"] == handler.idempotency_key_for(
+        record.id,
+    )
+    with db_connection() as db:
+        after = pi.get_request(db, record.token)
+    assert after.status == pi.STATUS_APPROVED  # now reachable, not stuck
+    assert Path(record.staging_root).is_dir()  # the install still needs it
+
+
+def test_recovery_does_not_enqueue_a_second_item(installer_tables):
+    from carpenter.packages import install_approved_handler as handler
+
+    record = _make(name="req-approved-twice")
+    _approve_without_enqueuing(record)
+
+    handler.recover_approved_installs()
+    second = handler.recover_approved_installs()
+
+    assert second == (0, 0)
+    assert len(_install_work_items()) == 1
+
+
+def test_startup_recovery_re_enqueues_an_approved_row(installer_tables):
+    """The coordinator owns this half: enqueuing needs its own transaction.
+
+    ``pending_install.recover_on_startup`` runs inside the startup
+    connection's transaction, so it cannot enqueue; the coordinator
+    calls the handler's recovery right after the review-link recovery.
+    """
+    import inspect
+
+    from carpenter.coordinator import Coordinator
+
+    assert "_recover_approved_installs" in inspect.getsource(Coordinator.start)
+
+    record = _make(name="req-approved-startup")
+    _approve_without_enqueuing(record)
+
+    Coordinator.__new__(Coordinator)._recover_approved_installs()
+
+    assert len(_install_work_items()) == 1
+    with db_connection() as db:
+        assert pi.get_request(db, record.token).status == pi.STATUS_APPROVED
+
+
+def test_an_approval_beyond_the_grace_period_is_failed(installer_tables):
+    from carpenter.packages import install_approved_handler as handler
+
+    record = _make(name="req-approved-stale")
+    with db_transaction() as db:
+        pi.mark_approved(db, record.token, grants={})
+        # Backdate the decision past the grace period.
+        db.execute(
+            "UPDATE pending_package_installs SET decided_at = ? WHERE id = ?",
+            (_ago(72), record.id),
+        )
+
+    requeued, failed = handler.recover_approved_installs()
+
+    assert (requeued, failed) == (0, 1)
+    with db_connection() as db:
+        after = pi.get_request(db, record.token)
+    assert after.status == pi.STATUS_FAILED
+    assert "approved" in (after.error or "")
+    assert "ask again" in (after.error or "")
+    assert after.finished_at
+    # The quarantine it was holding is reclaimed with it.
+    assert not Path(record.staging_root).exists()
+    assert _install_work_items() == []
+
+
+def test_the_heartbeat_hook_recovers_approved_rows_too(installer_tables):
+    record = _make(name="req-approved-hook")
+    _approve_without_enqueuing(record)
+
+    _sweep_hook()()
+
+    assert len(_install_work_items()) == 1
+    with db_connection() as db:
+        assert pi.get_request(db, record.token).status == pi.STATUS_APPROVED
+
+
+def test_an_interrupted_install_reclaims_its_quarantine(installer_tables):
+    record = _make(name="req-interrupted-disk")
+    with db_transaction() as db:
+        pi.mark_approved(db, record.token, grants={})
+        pi.mark_installing(db, record.token)
+
+    with db_transaction() as db:
+        pi.fail_interrupted_installs(db)
+
+    assert not Path(record.staging_root).exists()

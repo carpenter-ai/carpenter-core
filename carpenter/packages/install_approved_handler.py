@@ -47,6 +47,7 @@ __all__ = [
     "enqueue_approved_install",
     "handle_package_install_approved",
     "idempotency_key_for",
+    "recover_approved_installs",
     "register_handlers",
 ]
 
@@ -112,6 +113,57 @@ def enqueue_approved_install(record) -> int | None:
             record.token_prefix,
         )
     return work_id
+
+
+def recover_approved_installs() -> tuple[int, int]:
+    """Make every ``approved`` row reachable again.  Returns (requeued, failed).
+
+    The gap this closes: :func:`enqueue_approved_install` must run after
+    the approval transaction commits, so a crash in between leaves a row
+    in ``approved`` with no work item — and ``approved`` is not
+    terminal, not swept and not re-decidable, so nothing ever looked at
+    it again and its quarantine was never reclaimed.
+
+    Two passes, both safe to repeat:
+
+    * Approvals past the grace period are **failed** with an error the
+      operator can act on, and their quarantine removed.
+    * Everything still in ``approved`` is **re-enqueued**.  The
+      idempotency key makes that free when an item is already pending or
+      claimed (``enqueue`` returns ``None``), and the handler drops any
+      item whose row is no longer ``approved``, so this cannot cause a
+      double install.
+
+    Called at startup (after the database is open — this opens
+    transactions of its own, so it cannot run inside
+    :func:`carpenter.packages.pending_install.recover_on_startup`) and
+    from the hourly sweep.
+    """
+    from ..db import db_connection, db_transaction
+
+    with db_connection() as db:
+        if not pending_install.table_exists(db):
+            return (0, 0)
+
+    with db_transaction() as db:
+        failed = pending_install.fail_stale_approved(db)
+
+    with db_connection() as db:
+        waiting = pending_install.approved_awaiting_install(db)
+
+    requeued = 0
+    for record in waiting:
+        if enqueue_approved_install(record) is not None:
+            requeued += 1
+            logger.warning(
+                "Re-enqueued the install of approved request %s, which had "
+                "no work item; the approval itself is unchanged",
+                record.token_prefix,
+            )
+    if requeued:
+        from ..core.engine.main_loop import wake_signal
+        wake_signal.set()
+    return (requeued, len(failed))
 
 
 def _load(request_id, token):
@@ -181,6 +233,12 @@ async def handle_package_install_approved(work_id: int, payload: dict) -> None:
                 error=batch.error or "the install failed",
                 result=batch.result,
             )
+
+    # Terminal either way, so the quarantine has no owner left: the
+    # batch has copied what it needed out of it, and a failed batch has
+    # already rolled back. Every other terminal status reclaims it too
+    # (rejection on the route, expiry and interruption in the sweeps).
+    pending_install.remove_staging(record)
 
     await install_notify.notify_install_outcome(record)
 
