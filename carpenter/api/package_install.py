@@ -379,6 +379,21 @@ def _render_credentials(entry: dict) -> str:
     )
 
 
+def _declares_chat_tools(entry: dict) -> bool:
+    """Whether the preview showed any chat tool, named or unreadable.
+
+    The same three fields :func:`_render_chat_tools` renders from, so
+    "nothing was shown" and "nothing can be granted" cannot drift
+    apart.  An unreadable module counts as declaring one: the page says
+    to treat it as write-capable, so the grant is meaningful there.
+    """
+    return bool(
+        entry.get("chat_tools")
+        or entry.get("chat_tools_unresolved")
+        or entry.get("chat_tool_modules")
+    )
+
+
 def _render_chat_tools(entry: dict) -> str:
     """The chat tools, read statically, and what could not be read."""
     tools = entry.get("chat_tools") or []
@@ -470,7 +485,14 @@ def _render_already_installed(entry: dict) -> str:
 
 
 def _render_grants(entry: dict) -> str:
-    """The two per-package checkboxes, both default UNCHECKED."""
+    """The per-package checkboxes, all default UNCHECKED.
+
+    A box is rendered only for a grant this package could use: a
+    capability grant for a package declaring no verbs, or a
+    write-chat-tools grant for a package declaring no chat tools, is
+    consent to something the page never showed as requested, and
+    :func:`_normalize_grants` refuses it even if it is posted.
+    """
     name = _package_name(entry)
     caps = entry.get("capabilities") or []
     boxes = []
@@ -485,21 +507,28 @@ def _render_grants(entry: dict) -> str:
             f'<div class="sub">All or nothing: {_esc(verbs)}. Unticked, the '
             "package still installs with no verbs registered.</div>"
         )
-    boxes.append(
-        '<label><input type="checkbox" '
-        f'name="allow_write_chat_tools[{_esc(name)}]" '
-        f'data-pkg="{_esc(name)}" data-grant="write_chat_tools">'
-        "Allow this package's write-capable chat tools</label>"
-        '<div class="sub">Unticked, a package declaring a write-capable chat '
-        "tool is refused at install time rather than installed without "
-        "it.</div>"
-    )
+    if _declares_chat_tools(entry):
+        boxes.append(
+            '<label><input type="checkbox" '
+            f'name="allow_write_chat_tools[{_esc(name)}]" '
+            f'data-pkg="{_esc(name)}" data-grant="write_chat_tools">'
+            "Allow this package's write-capable chat tools</label>"
+            '<div class="sub">Unticked, a package declaring a write-capable '
+            "chat tool is refused at install time rather than installed "
+            "without it.</div>"
+        )
+    else:
+        boxes.append(
+            '<div class="sub">This package declares no chat tools, so there '
+            "is no write-tools grant to give: it is recorded as not "
+            "granted whatever is sent.</div>"
+        )
     return (
         '<div class="grants">'
         f"<h4>Grants for {_esc(name)}</h4>"
         + "".join(boxes)
-        + '<p class="note">Both start unticked. Nothing here is remembered '
-        "for next time.</p>"
+        + '<p class="note">Every box starts unticked. Nothing here is '
+        "remembered for next time.</p>"
         "</div>"
     )
 
@@ -707,10 +736,15 @@ def _normalize_grants(record, raw) -> dict:
     """Build ``grants_json`` from the posted checkboxes.
 
     Keyed by the package names recorded in the request, never by what
-    the browser sent: an unknown name is ignored, and a capability grant
-    for a package that declares none is forced false.  That is what
-    keeps the page a decision surface — nothing installable comes from
-    the request body.
+    the browser sent: an unknown name is ignored, and a grant the
+    *preview* did not show as requested is forced false — a capability
+    grant for a package declaring no verbs, or a write-chat-tools grant
+    for a package declaring no chat tools.  Recording consent to
+    something that was never asked for is worse than useless: the
+    install reads ``grants_json`` back verbatim, and the row is also the
+    audit record of what the operator agreed to.  That is what keeps the
+    page a decision surface — nothing installable comes from the request
+    body.
     """
     posted = raw if isinstance(raw, dict) else {}
     grants: dict[str, dict] = {}
@@ -721,9 +755,22 @@ def _normalize_grants(record, raw) -> dict:
         sent = posted.get(name)
         sent = sent if isinstance(sent, dict) else {}
         declares_caps = bool(entry.get("capabilities"))
+        declares_tools = _declares_chat_tools(entry)
+        for field, declared in (
+            ("capabilities", declares_caps),
+            ("write_chat_tools", declares_tools),
+        ):
+            if sent.get(field) and not declared:
+                logger.warning(
+                    "Package install request %s: ignoring the %s grant for "
+                    "%r, which declares none",
+                    record.token_prefix, field, name,
+                )
         grants[name] = {
             "capabilities": bool(sent.get("capabilities")) and declares_caps,
-            "write_chat_tools": bool(sent.get("write_chat_tools")),
+            "write_chat_tools": (
+                bool(sent.get("write_chat_tools")) and declares_tools
+            ),
         }
     return grants
 

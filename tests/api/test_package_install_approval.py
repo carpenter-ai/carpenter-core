@@ -397,11 +397,13 @@ def test_the_page_has_one_approve_one_reject_and_no_input_surface(
     page = client.get(f"/api/package-install/{out.token}").text
     assert page.count("decide('approve')") == 1
     assert page.count("decide('reject')") == 1
-    # Two packages, so two write-tools boxes plus one capability box —
-    # and nothing else, because a checkbox is the only control the page
-    # is allowed to have.
+    # Two packages: the one declaring chat tools gets a write-tools box,
+    # the one declaring verbs gets a capability box, and nothing else,
+    # because a checkbox is the only control the page is allowed to
+    # have.  A box is never rendered for a grant the package could not
+    # use (see test_write_chat_tools_is_not_grantable_without_chat_tools).
     inputs = re.findall(r"<input[^>]*>", page)
-    assert len(inputs) == 3
+    assert len(inputs) == 2
     assert all('type="checkbox"' in tag for tag in inputs)
     assert _checked_inputs(page) == []
     # Nothing that could change the destination, name, spec or hash.
@@ -883,3 +885,54 @@ def test_a_wrong_token_in_the_page_url_is_not_echoed(
         f"/api/package-install/{out.token}?token=</script><script>x",
     ).text
     assert "<script>x" not in page
+
+
+# ── a grant that cannot mean anything (F6) ──────────────────────────
+
+
+def test_write_chat_tools_is_not_grantable_without_chat_tools(
+    installer_tables, fake_fetch, client,
+):
+    """F6: consent to something that was never shown as requested."""
+    fake_fetch.register("forge.invalid", CAPS_MANIFEST, CAPS_FILES)
+    out = _request([_git("mail")])
+
+    page = client.get(f"/api/package-install/{out.token}").text
+    assert 'name="allow_write_chat_tools[mailer]"' not in page
+    assert "declares no chat tools" in page
+
+    resp = client.post(
+        f"/api/package-install/{out.token}/decide",
+        json={
+            "decision": "approve",
+            "grants": {"mailer": {
+                "capabilities": False, "write_chat_tools": True,
+            }},
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json()["grants"] == {
+        "mailer": {"capabilities": False, "write_chat_tools": False},
+    }
+    with db_connection() as db:
+        record = pi.get_request(db, out.token)
+    assert record.grants["mailer"]["write_chat_tools"] is False
+
+
+def test_write_chat_tools_stays_grantable_when_tools_are_declared(
+    installer_tables, fake_fetch, client,
+):
+    _hello(fake_fetch)
+    out = _request([_git()])
+
+    page = client.get(f"/api/package-install/{out.token}").text
+    assert 'name="allow_write_chat_tools[hello]"' in page
+
+    resp = client.post(
+        f"/api/package-install/{out.token}/decide",
+        json={
+            "decision": "approve",
+            "grants": {"hello": {"write_chat_tools": True}},
+        },
+    )
+    assert resp.json()["grants"]["hello"]["write_chat_tools"] is True
