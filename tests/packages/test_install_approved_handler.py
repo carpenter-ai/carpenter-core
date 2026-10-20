@@ -671,3 +671,200 @@ def test_the_summary_says_when_no_verbs_were_granted(
     batch = ib.perform_install_batch(out.record.id)
 
     assert "no platform verbs granted" in ib.summarise(batch.result)[0]
+
+
+# ── the async work handler (T7) ─────────────────────────────────────
+
+def _work_items(event_type=None):
+    with db_connection() as db:
+        if event_type is None:
+            rows = db.execute("SELECT * FROM work_queue ORDER BY id").fetchall()
+        else:
+            rows = db.execute(
+                "SELECT * FROM work_queue WHERE event_type = ? ORDER BY id",
+                (event_type,),
+            ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def _system_messages(conv_id):
+    with db_connection() as db:
+        return [
+            dict(r) for r in db.execute(
+                "SELECT role, content, hidden FROM messages "
+                "WHERE conversation_id = ? AND role = 'system' ORDER BY id",
+                (conv_id,),
+            ).fetchall()
+        ]
+
+
+async def test_the_handler_installs_an_approved_request(
+    installer_tables, fake_fetch,
+):
+    """The real thread hop: the install opens its own transactions.
+
+    This goes through ``run_in_work_pool``, so a transaction held across
+    the hop would trip ``db.py``'s per-thread guard and fail the test.
+    """
+    from carpenter.agent import conversation
+    from carpenter.packages import install_approved_handler as handler
+
+    conv_id = conversation.create_conversation()
+    fake_fetch.register("alpha", ALPHA_MANIFEST)
+    out = _approved([_spec("alpha")], {"alpha": {}}, conversation_id=conv_id)
+
+    await handler.handle_package_install_approved(1, {"request_id": out.record.id})
+
+    final = _reload_record(out.record.token)
+    assert final.status == pi.STATUS_INSTALLED
+    assert final.result["packages"][0]["status"] == ib.PKG_STATUS_INSTALLED
+    assert final.attempts == 1
+    assert final.finished_at
+    with db_connection() as db:
+        assert get_install_record(db, "alpha") is not None
+
+    messages = _system_messages(conv_id)
+    assert len(messages) == 1
+    assert "installed alpha v1.0.0" in messages[0]["content"]
+    assert messages[0]["hidden"] == 0
+
+
+async def test_the_handler_records_a_failure_and_says_so_in_chat(
+    installer_tables, fake_fetch, fail_install_of,
+):
+    from carpenter.agent import conversation
+    from carpenter.packages import install_approved_handler as handler
+
+    conv_id = conversation.create_conversation()
+    fake_fetch.register("alpha", ALPHA_MANIFEST)
+    fake_fetch.register("beta", BETA_MANIFEST)
+    out = _approved(
+        [_spec("alpha"), _spec("beta")], {"alpha": {}, "beta": {}},
+        conversation_id=conv_id,
+    )
+    fail_install_of("beta")
+
+    await handler.handle_package_install_approved(1, {"request_id": out.record.id})
+
+    final = _reload_record(out.record.token)
+    assert final.status == pi.STATUS_FAILED
+    assert "beta failed to install" in final.error
+    assert final.result["rolled_back"] == ["alpha"]
+    message = _system_messages(conv_id)[0]["content"]
+    assert "FAILED" in message
+    assert "rolled back alpha" in message
+
+
+async def test_an_installing_row_is_dropped(installer_tables, fake_fetch):
+    """A work item re-dispatched after a restart must install nothing."""
+    from carpenter.packages import install_approved_handler as handler
+
+    fake_fetch.register("alpha", ALPHA_MANIFEST)
+    out = _approved([_spec("alpha")], {"alpha": {}})
+    with db_transaction() as db:
+        pi.mark_installing(db, out.record.token)
+
+    await handler.handle_package_install_approved(7, {"request_id": out.record.id})
+
+    final = _reload_record(out.record.token)
+    assert final.status == pi.STATUS_INSTALLING, "the handler must not touch it"
+    assert final.attempts == 1, "the claim must not be bumped a second time"
+    with db_connection() as db:
+        assert get_install_record(db, "alpha") is None
+
+
+async def test_an_undecided_request_is_dropped(installer_tables, fake_fetch):
+    from carpenter.packages import install_approved_handler as handler
+
+    fake_fetch.register("alpha", ALPHA_MANIFEST)
+    out = ir.create_install_request([_spec("alpha")])
+
+    await handler.handle_package_install_approved(7, {"request_id": out.record.id})
+
+    assert _reload_record(out.record.token).status == pi.STATUS_REQUESTED
+    with db_connection() as db:
+        assert get_install_record(db, "alpha") is None
+
+
+async def test_an_unknown_request_is_dropped(installer_tables):
+    from carpenter.packages import install_approved_handler as handler
+
+    await handler.handle_package_install_approved(7, {"request_id": 4242})
+
+
+async def test_a_crashing_batch_still_fails_the_row(
+    installer_tables, fake_fetch, monkeypatch,
+):
+    from carpenter.packages import install_approved_handler as handler
+
+    fake_fetch.register("alpha", ALPHA_MANIFEST)
+    out = _approved([_spec("alpha")], {"alpha": {}})
+
+    async def boom(_request_id):
+        raise RuntimeError("the worker pool is gone")
+
+    monkeypatch.setattr(handler, "_run_batch", boom)
+
+    await handler.handle_package_install_approved(1, {"request_id": out.record.id})
+
+    final = _reload_record(out.record.token)
+    assert final.status == pi.STATUS_FAILED
+    assert "the worker pool is gone" in final.error
+
+
+# ── the enqueue seam the decide route uses ──────────────────────────
+
+def test_enqueueing_an_approved_install_is_idempotent(
+    installer_tables, fake_fetch,
+):
+    from carpenter.packages import install_approved_handler as handler
+
+    fake_fetch.register("alpha", ALPHA_MANIFEST)
+    out = _approved([_spec("alpha")], {"alpha": {}})
+
+    first = handler.enqueue_approved_install(out.record)
+    second = handler.enqueue_approved_install(out.record)
+
+    assert first is not None
+    assert second is None, "a second POST must not queue a second install"
+    items = _work_items(handler.EVENT_TYPE)
+    assert len(items) == 1
+    assert items[0]["idempotency_key"] == f"pkg_install:{out.record.token}"
+    assert items[0]["max_retries"] == 1
+    assert items[0]["priority"] == handler.PRIORITY
+
+
+def test_the_queued_payload_carries_the_id_not_the_token(
+    installer_tables, fake_fetch,
+):
+    import json
+
+    from carpenter.packages import install_approved_handler as handler
+
+    fake_fetch.register("alpha", ALPHA_MANIFEST)
+    out = _approved([_spec("alpha")], {"alpha": {}})
+    handler.enqueue_approved_install(out.record)
+
+    payload = json.loads(_work_items(handler.EVENT_TYPE)[0]["payload_json"])
+    assert payload == {"request_id": out.record.id}
+    assert out.record.token not in json.dumps(payload)
+
+
+def test_the_handler_is_registered_under_its_event_type():
+    from carpenter.packages import install_approved_handler as handler
+
+    registered = {}
+    handler.register_handlers(lambda event, fn: registered.__setitem__(event, fn))
+    assert registered == {
+        "package.install.approved": handler.handle_package_install_approved,
+    }
+
+
+def test_the_coordinator_registers_the_handler():
+    """The handler is useless unless the coordinator wires it up."""
+    import inspect
+
+    from carpenter import coordinator
+
+    source = inspect.getsource(coordinator.Coordinator._register_work_handlers)
+    assert "install_approved_handler" in source

@@ -240,6 +240,13 @@ class Coordinator:
         arc_notify_handler.register_handlers(main_loop.register_handler)
         logger.info("Arc chat notification handler registered")
 
+        # Chat-requested package installs: the operator's approval
+        # enqueues the install, which runs here rather than in the HTTP
+        # request that approved it.
+        from .packages import install_approved_handler
+        install_approved_handler.register_handlers(main_loop.register_handler)
+        logger.info("Approved package-install handler registered")
+
     async def _init_trigger_subscription_pipeline(self, base_dir: str, app) -> None:
         """Set up triggers, subscriptions, and endpoint routes."""
         from .core.engine.triggers import registry as trigger_registry
