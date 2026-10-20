@@ -98,7 +98,10 @@ class FetchLimits:
 
     Attributes:
         max_bytes: Total bytes a fetch may transfer or expand to.
-        max_files: Total regular files a fetched tree may contain.
+        max_files: Total regular files a fetched tree may contain.  An
+            archive's index is capped at this many entries as it is
+            read, so a member-count bomb cannot be materialised before
+            the cap applies.
         max_file_bytes: Largest single file a fetched tree may contain.
         timeout_s: Wall-clock budget for the whole fetch.
     """

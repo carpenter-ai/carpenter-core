@@ -593,7 +593,9 @@ class TestFileCountCap:
         with pytest.raises(FetchError) as excinfo:
             _fetch(_spec(url), quarantine, max_files=5)
         message = str(excinfo.value)
-        assert "declares 31 files" in message
+        # Lazily enforced: the walk stops at the cap, so the message
+        # bounds the count instead of reporting the whole index.
+        assert "declares more than 5 entries" in message
         assert "max_files limit of 5" in message
 
 
@@ -1204,3 +1206,77 @@ class TestProxyEnvironmentIsIgnored:
         assert (result.tree / "manifest.yaml").is_file()
         # The bytes came from the host the guard checked, not the proxy.
         assert site.headers_for("/demo.tar.gz")
+
+
+# ── the index is walked lazily (F2) ─────────────────────────────────
+
+
+def _counting_tarfile_open(monkeypatch) -> list[str]:
+    """Record every member the extractor's tar reader actually visits."""
+    visited: list[str] = []
+    real_open = tarfile.open
+
+    def counting_open(*args, **kwargs):
+        tar = real_open(*args, **kwargs)
+        real_next = tar.next
+
+        def next_counting():
+            info = real_next()
+            if info is not None:
+                visited.append(info.name)
+            return info
+
+        tar.next = next_counting
+        return tar
+
+    monkeypatch.setattr(fetch_archive.tarfile, "open", counting_open)
+    return visited
+
+
+class TestMemberCountIsEnforcedLazily:
+    """F2: the member count must bite before the index is materialised.
+
+    The shape is the reviewer's: zero-byte members, so no member
+    breaches ``max_file_bytes`` and the declared content total is 0 —
+    only the *count* is over.  A real bomb is ~30M members at the
+    download cap; this proves the mechanism (the walk stops at the cap)
+    on a few hundred, which is the only way to test it without
+    allocating what it was designed to allocate.
+    """
+
+    def test_the_count_is_refused_without_reading_every_member(
+        self, site, quarantine, monkeypatch,
+    ):
+        visited = _counting_tarfile_open(monkeypatch)
+        body = _tar_gz(
+            [_manifest_member()]
+            + [_file_member(f"f{index}.txt", b"") for index in range(400)],
+        )
+        url = site.serve("/bomb.tar.gz", body)
+
+        with pytest.raises(FetchError) as excinfo:
+            _fetch(_spec(url), quarantine, max_files=10)
+
+        message = str(excinfo.value)
+        assert "max_files" in message
+        assert "10" in message
+        # The walk stopped at the cap instead of indexing all 401
+        # members: that difference is the whole finding.
+        assert len(visited) <= 12, visited
+        assert list((quarantine / "_tree").iterdir()) == []
+
+    def test_a_legitimate_archive_still_extracts_every_member(
+        self, site, quarantine, monkeypatch,
+    ):
+        visited = _counting_tarfile_open(monkeypatch)
+        body = _tar_gz(
+            [_manifest_member()]
+            + [_file_member(f"f{index}.txt", b"x") for index in range(20)],
+        )
+        url = site.serve("/ok.tar.gz", body)
+
+        result = _fetch(_spec(url), quarantine, max_files=50)
+
+        assert result.files_fetched == 21
+        assert (result.tree / "f19.txt").read_text() == "x"
+        assert len(visited) == 21

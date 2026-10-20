@@ -27,11 +27,14 @@ What this module is careful about, and why:
   :attr:`~carpenter.packages.fetch.FetchResult.resolved`; when the source
   carried no ``#sha256=`` pin, that digest is also logged at WARNING so
   an operator can paste it back into the source and pin it.
-* **A small archive may declare enormous members.** The tar index is
-  inspected *before* extraction: member count, each member's declared
-  size and their total are checked against the limits, so a
-  decompression bomb is refused without a byte of it reaching the disk.
-  What actually landed is then re-measured, because the index is
+* **A small archive may declare enormous members — or enormous numbers
+  of them.** The tar index is inspected *before* extraction: member
+  count, each member's declared size and their total are checked against
+  the limits, so a decompression bomb is refused without a byte of it
+  reaching the disk.  The index is walked one member at a time and the
+  first cap passed stops the walk, because reading the whole index is
+  itself the bomb when an archive declares millions of members.  What
+  actually landed is then re-measured, because the index is
   attacker-supplied too.
 * **The ambient environment cannot redirect the transport.** The
   client runs with ``trust_env=False``, so a proxy variable in the
@@ -415,26 +418,41 @@ def _verify_digest(spec: SourceSpec, actual: str, url: str) -> None:
 # ── caps over the tar index and over what landed ────────────────────
 
 
-def _check_declared_sizes(
-    members: list[tarfile.TarInfo], limits: FetchLimits, url: str,
-) -> None:
-    """Refuse an archive whose *index* already breaks a limit.
+def _accepted_members(
+    tar: tarfile.TarFile, limits: FetchLimits, url: str,
+) -> list[tarfile.TarInfo]:
+    """Walk the index one member at a time; return what may be extracted.
 
     This runs before a single member is written, which is the whole
     point: a few hundred kilobytes of gzip can declare gigabytes of
     content, and discovering that by filling the disk is not a defence.
-    The index is attacker-supplied, so passing here is necessary but not
-    sufficient — :func:`_measure_extracted` re-checks reality.
+
+    **The walk is lazy, and that is a limit of its own.**  The index is
+    attacker-supplied in its *length* as much as its contents:
+    ``getmembers()`` builds one ``TarInfo`` for every member before any
+    cap is consulted, and at a high compression ratio an archive inside
+    the download cap can declare tens of millions of them — enough
+    resident memory to take the platform down on a single pre-consent
+    request.  So each member is pulled individually and the first cap
+    passed aborts the walk, which bounds it to ``max_files`` entries
+    whatever the archive claims to hold.
+
+    Passing here is necessary, not sufficient: the index can lie about
+    sizes, so :func:`_measure_extracted` re-checks what actually landed.
     """
     where = redact(url)
-    files = [member for member in members if member.isfile()]
-    if len(files) > limits.max_files:
-        raise FetchError(
-            f"package archive {where} declares {len(files)} files, over "
-            f"the max_files limit of {limits.max_files}",
-        )
+    members: list[tarfile.TarInfo] = []
     declared_total = 0
-    for member in files:
+    for member in tar:
+        members.append(member)
+        if len(members) > limits.max_files:
+            raise FetchError(
+                f"package archive {where} declares more than "
+                f"{limits.max_files} entries, over the max_files limit of "
+                f"{limits.max_files}; refusing to expand it",
+            )
+        if not member.isfile():
+            continue
         size = int(member.size)
         if size > limits.max_file_bytes:
             raise FetchError(
@@ -443,12 +461,13 @@ def _check_declared_sizes(
                 f"{limits.max_file_bytes}; refusing to expand it",
             )
         declared_total += size
-    if declared_total > limits.max_bytes:
-        raise FetchError(
-            f"package archive {where} declares {declared_total} bytes of "
-            f"file content, over the max_bytes limit of "
-            f"{limits.max_bytes}; refusing to expand it",
-        )
+        if declared_total > limits.max_bytes:
+            raise FetchError(
+                f"package archive {where} declares {declared_total} bytes of "
+                f"file content, over the max_bytes limit of "
+                f"{limits.max_bytes}; refusing to expand it",
+            )
+    return members
 
 
 def _measure_extracted(
@@ -818,8 +837,8 @@ class ArchiveUrlFetcher:
         where = redact(url)
         try:
             with tarfile.open(str(archive_path), mode="r:*") as tar:
-                _check_declared_sizes(tar.getmembers(), limits, url)
-                _safe_extract(tar, extract_root)
+                members = _accepted_members(tar, limits, url)
+                _safe_extract(tar, extract_root, members=members)
         except ArchiveVerificationError as exc:
             raise FetchError(
                 f"package archive {where} was refused by the archive "

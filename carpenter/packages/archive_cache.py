@@ -390,7 +390,9 @@ def _is_within(base: Path, target: Path) -> bool:
         return False
 
 
-def _safe_extract(tar: tarfile.TarFile, dest: Path) -> None:
+def _safe_extract(
+    tar: tarfile.TarFile, dest: Path, members=None,
+) -> None:
     """Extract ``tar`` into ``dest``, rejecting any unsafe member.
 
     Rejected: absolute member paths, paths with ``..`` that escape
@@ -398,9 +400,20 @@ def _safe_extract(tar: tarfile.TarFile, dest: Path) -> None:
     member (devices, fifos, etc.).  This is a fail-closed allowlist:
     anything not explicitly a plain file or directory inside ``dest`` is
     refused.
+
+    Args:
+        tar: The open archive.
+        dest: Directory to extract into.
+        members: The members to extract, when the caller has already
+            walked the index under its own resource caps (the package
+            fetcher does, so that an archive declaring millions of
+            members is refused before the index is materialised).  The
+            default walks the archive itself — lazily, never through
+            ``getmembers()``, for the same reason.
     """
     dest = dest.resolve()
-    for member in tar.getmembers():
+    vetted: list[tarfile.TarInfo] = []
+    for member in (tar if members is None else members):
         member_name = member.name
         # Reject absolute paths outright.
         if member_name.startswith("/") or os.path.isabs(member_name):
@@ -418,9 +431,10 @@ def _safe_extract(tar: tarfile.TarFile, dest: Path) -> None:
             raise ArchiveVerificationError(
                 f"unsafe archive member (path escape): {member_name!r}",
             )
+        vetted.append(member)
     # All members vetted; extract.  (Members were validated above, so the
     # bandit B202 tarfile-extractall concern is addressed by the guard.)
-    tar.extractall(dest)  # noqa: S202
+    tar.extractall(dest, members=vetted)  # noqa: S202
 
 
 def _expand_to_tree(archive_path: Path) -> dict[str, bytes]:
