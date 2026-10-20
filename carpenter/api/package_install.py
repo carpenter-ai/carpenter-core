@@ -75,10 +75,11 @@ CAPABILITY_BANNER_LINES = (
     "executor scripts. Trusted handler code CANNOT be sandboxed.",
 )
 
-#: The consent sentence that follows the capability list.
-CAPABILITY_CONSENT_LINE = (
-    "Granting trust means you have reviewed this package's handler "
-    "code and accept that it runs with platform privileges."
+#: The consent sentences that follow the capability list, split exactly
+#: as ``confirm_platform_capabilities`` splits them.
+CAPABILITY_CONSENT_LINES = (
+    "Granting trust means you have reviewed this package's handler",
+    "code and accept that it runs with platform privileges.",
 )
 
 #: What ``allowlist_proposals`` cost, stated where they are granted.
@@ -286,6 +287,7 @@ def _render_capabilities(entry: dict) -> str:
     name = _package_name(entry)
     described = "\n".join(str(cap.get("describe") or "") for cap in caps)
     banner = "<br>".join(_esc(line) for line in CAPABILITY_BANNER_LINES)
+    consent = " ".join(_esc(line) for line in CAPABILITY_CONSENT_LINES)
     return (
         '<div class="caps">'
         f"<h4>Security: package &#39;{_esc(name)}&#39; requests "
@@ -294,7 +296,7 @@ def _render_capabilities(entry: dict) -> str:
         f"<div><strong>Capabilities requested "
         f"({len(caps)}):</strong></div>"
         f"<pre>{_esc_pre(described)}</pre>"
-        f'<p class="banner">{_esc(CAPABILITY_CONSENT_LINE)}</p>'
+        f'<p class="banner">{consent}</p>'
         '<p class="note">All or nothing: the grant covers every verb listed, '
         "because the terminal consent prompt is all-or-nothing too. Leaving "
         "the box unticked still installs the package &mdash; it just "

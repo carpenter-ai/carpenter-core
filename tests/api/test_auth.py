@@ -46,6 +46,26 @@ class TestIsProtected:
         assert is_protected("/hooks/signal", "POST") is False
         assert is_protected("/hooks/telegram", "POST") is False
 
+    def test_package_install_token_not_protected(self):
+        # The uuid4 token in the URL is the credential: the approval
+        # link has to open from whatever chat app or mail client the
+        # operator reads it in, which cannot carry the UI bearer token.
+        assert is_protected(
+            "/api/package-install/550e8400-e29b-41d4-a716-446655440000", "GET",
+        ) is False
+
+    def test_package_install_decide_not_protected(self):
+        assert is_protected(
+            "/api/package-install/550e8400-e29b-41d4-a716-446655440000/decide",
+            "POST",
+        ) is False
+
+    def test_package_install_prefix_itself_is_protected(self):
+        # Only a path carrying a token is open; the bare prefix is not,
+        # so nothing can be listed without the UI token.
+        assert is_protected("/api/package-install", "GET") is True
+        assert is_protected("/api/package-installs", "GET") is True
+
 
 # ── extract_token unit tests ────────────────────────────────────────
 
