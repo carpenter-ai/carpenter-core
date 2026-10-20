@@ -1,7 +1,8 @@
 """Bearer token authentication middleware for Carpenter.
 
 Gates protected endpoints when ui_token is configured.  Unprotected
-endpoints (callbacks, webhooks, review detail pages) pass through.
+endpoints (callbacks, webhooks, review detail pages, package-install
+approval pages) pass through.
 """
 
 import hmac
@@ -39,6 +40,14 @@ def is_protected(path: str, method: str) -> bool:
     # Review detail and decide endpoints use one-time UUID auth
     # e.g. /api/review/550e8400-... and /api/review/550e8400-.../decide
     if path.startswith("/api/review/") and path != "/api/review/create":
+        return False
+
+    # Package-install approval page and decide endpoint, same contract:
+    # the unguessable uuid4 token in the URL IS the credential, because
+    # the link has to be openable from whatever chat app or mail client
+    # the operator reads it in, which cannot carry our UI bearer token.
+    # The token is single-use and expires; see api/package_install.py.
+    if path.startswith("/api/package-install/"):
         return False
 
     return True
