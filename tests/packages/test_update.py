@@ -556,6 +556,134 @@ class TestNoop:
         assert (installed.dest_path / "b.py").read_text() == "b-MINE\n"
 
 
+# ── a ref override ──────────────────────────────────────────────────
+
+
+class TestRefOverride:
+    """``plan_update(ref=...)`` — fetch another ref, and remember it."""
+
+    def test_the_override_is_fetched_and_recorded(
+        self, base_dir, db_conn, stub, tmp_path,
+    ):
+        _install(db_conn, tmp_path)
+        assert get_install_record(db_conn, "demo")["source_ref"] == "main"
+        _serve(stub, tmp_path, files={"a.py": "a-v2\n"})
+
+        plan = plan_update("demo", conn=db_conn, ref="v2.0.0")
+
+        # The fetch followed the override, not the recorded ref, and the
+        # spec that will be recorded is the one that was fetched.
+        assert stub.calls[0].ref == "v2.0.0"
+        assert plan.ref_override == "v2.0.0"
+        assert plan.source.ref == "v2.0.0"
+
+        result = apply_update(plan, conn=db_conn)
+
+        assert result.changed is True
+        record = get_install_record(db_conn, "demo")
+        # Persistent: the row now follows the ref the operator named,
+        # pinned at what that ref actually resolved to.
+        assert record["source_ref"] == "v2.0.0"
+        assert record["source_resolved"] == "b" * 40
+        assert record["version"] == "0.2.0"
+        # The logical source is unchanged, so the archive cache key is
+        # too — the next update still finds this version's anchor.
+        assert record["source_id"] == source_id(_spec())
+
+    def test_a_later_update_follows_the_remembered_ref(
+        self, base_dir, db_conn, stub, tmp_path,
+    ):
+        """The point of persistence: no snapping back to the old ref."""
+        _install(db_conn, tmp_path)
+        _serve(stub, tmp_path, files={"a.py": "a-v2\n"})
+        apply_update(
+            plan_update("demo", conn=db_conn, ref="v2.0.0"), conn=db_conn,
+        )
+
+        _serve(stub, tmp_path, version="0.3.0", files={"a.py": "a-v3\n"})
+        plan = plan_update("demo", conn=db_conn)
+
+        assert plan.ref_override is None
+        assert stub.calls[-1].ref == "v2.0.0"
+        cleanup_plan(plan)
+
+    def test_an_invalid_ref_is_refused_before_any_fetch(
+        self, base_dir, db_conn, stub, tmp_path,
+    ):
+        _install(db_conn, tmp_path)
+
+        with pytest.raises(UpdateError) as exc:
+            plan_update("demo", conn=db_conn, ref="--upload-pack=evil")
+
+        assert "ref" in str(exc.value)
+        # Nothing was fetched, so nothing was quarantined either.
+        assert stub.calls == []
+
+    def test_a_ref_on_a_local_source_is_refused(
+        self, base_dir, db_conn, stub, tmp_path,
+    ):
+        src = _write_tree(
+            tmp_path / "local-src", "demo", "0.1.0", {"a.py": "a\n"},
+        )
+        install_package(
+            src, default_install_dest("demo"), conn=db_conn,
+            provenance=SourceSpec(kind="local", raw=str(src), path=src),
+        )
+
+        with pytest.raises(UpdateError) as exc:
+            plan_update("demo", conn=db_conn, ref="v2.0.0")
+
+        message = str(exc.value)
+        assert "local directory" in message
+        assert "no ref" in message or "has none" in message
+        assert stub.calls == []
+
+    def test_a_noop_still_moves_the_recorded_ref(
+        self, base_dir, db_conn, stub, tmp_path,
+    ):
+        """A tag that ships the installed bytes is still a new ref.
+
+        Nothing is installed, but "follow this tag from now on" is a
+        request about the row, so the row moves — and that is the only
+        database write a no-op ever makes.
+        """
+        installed = _install(db_conn, tmp_path)
+        stub.serve = installed.source_path
+        before_disk = _on_disk(installed.dest_path)
+        before = dict(get_install_record(db_conn, "demo"))
+
+        plan = plan_update("demo", conn=db_conn, ref="v1.0.0")
+        assert plan.strategy == STRATEGY_NOOP
+        assert any("the recorded ref moves from" in n for n in plan.notes)
+
+        result = apply_update(plan, conn=db_conn)
+
+        assert result.changed is False
+        assert any("moved from 'main'" in n for n in result.notes)
+        after = dict(get_install_record(db_conn, "demo"))
+        assert after["source_ref"] == "v1.0.0"
+        assert after["source_resolved"] == "b" * 40
+        # Only the provenance moved: not the version, hash, or files.
+        assert (after["version"], after["hash"], after["installed_at"]) == (
+            before["version"], before["hash"], before["installed_at"],
+        )
+        assert _on_disk(installed.dest_path) == before_disk
+
+    def test_a_noop_at_the_same_ref_writes_nothing(
+        self, base_dir, db_conn, stub, tmp_path,
+    ):
+        installed = _install(db_conn, tmp_path)
+        stub.serve = installed.source_path
+        before = dict(get_install_record(db_conn, "demo"))
+
+        result = apply_update(
+            plan_update("demo", conn=db_conn, ref="main"), conn=db_conn,
+        )
+
+        assert result.changed is False
+        assert dict(get_install_record(db_conn, "demo")) == before
+
+
 # ── version sanity ──────────────────────────────────────────────────
 
 
@@ -888,6 +1016,71 @@ class TestCliUpdate:
         assert "Your edits were KEPT" in captured.out
         assert "Restart needed:" in captured.out
         assert (installed.dest_path / "b.py").read_text() == "b-MINE\n"
+
+    def test_ref_follows_and_remembers_another_ref(
+        self, stub, tmp_path, capsys, monkeypatch,
+    ):
+        from carpenter import cli_packages
+        from carpenter.db import db_connection
+
+        installed = self._install_via_api(tmp_path)
+        _serve(stub, tmp_path, files={"a.py": "a-v2\n"})
+        monkeypatch.setattr("builtins.input", lambda *a, **k: pytest.fail(
+            "--yes must not prompt"))
+
+        rc = cli_packages.cmd_packages(
+            ["update", "demo", "--ref", "v2.0.0", "--yes"],
+        )
+
+        captured = capsys.readouterr()
+        assert rc == 0, captured.err
+        assert "Ref      : v2.0.0" in captured.err
+        assert stub.calls[0].ref == "v2.0.0"
+        assert (installed.dest_path / "a.py").read_text() == "a-v2\n"
+        with db_connection() as db:
+            assert get_install_record(db, "demo")["source_ref"] == "v2.0.0"
+
+    def test_a_noop_with_a_ref_records_it_without_yes(
+        self, stub, tmp_path, capsys, monkeypatch,
+    ):
+        """Nothing to install is not nothing to do.
+
+        The verb short-circuits an up-to-date plan before the apply, so
+        a --ref that happened to ship the installed bytes would have
+        been dropped on the floor.  No files change, so no confirmation
+        is asked for.
+        """
+        from carpenter import cli_packages
+        from carpenter.db import db_connection
+
+        installed = self._install_via_api(tmp_path)
+        stub.serve = installed.source_path
+        monkeypatch.setattr("sys.stdin.isatty", lambda: False, raising=False)
+
+        rc = cli_packages.cmd_packages(["update", "demo", "--ref", "v1.0.0"])
+
+        out = capsys.readouterr().out
+        assert rc == 0, out
+        assert "already up to date" in out
+        assert "Recorded ref: v1.0.0" in out
+        with db_connection() as db:
+            assert get_install_record(db, "demo")["source_ref"] == "v1.0.0"
+
+    def test_an_unusable_ref_is_refused_without_fetching(
+        self, stub, tmp_path, capsys, monkeypatch,
+    ):
+        from carpenter import cli_packages
+
+        self._install_via_api(tmp_path)
+        monkeypatch.setattr("sys.stdin.isatty", lambda: False, raising=False)
+
+        rc = cli_packages.cmd_packages(
+            ["update", "demo", "--ref", "bad..ref", "--yes"],
+        )
+
+        assert rc == 1
+        assert "ref" in capsys.readouterr().err
+        assert stub.calls == []
 
     def test_declining_at_the_prompt_changes_nothing(
         self, stub, tmp_path, capsys, monkeypatch,

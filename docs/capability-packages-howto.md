@@ -544,7 +544,8 @@ dispatch.  Today those manifest fields are still declaration-only.
 
 **Upgrading an installed package.**
 `python3 -m carpenter packages update <name>` re-fetches the source the
-install recorded, at its *ref* rather than the commit it was pinned to,
+install recorded, at its *ref* rather than the commit it was pinned to
+(or at `--ref <ref>`, which is then remembered as the package's ref),
 and three-way merges the new version against the operator's edits to the
 installed tree.  A file both sides changed is a conflict that refuses the
 update unless `--accept-conflicts` is given, and capability grants and

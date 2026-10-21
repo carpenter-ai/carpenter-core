@@ -7,11 +7,14 @@ subcommands:
   package from a local directory **or a remote source**, previewing the
   manifest and (for packages declaring ``platform_capabilities``) gating
   the install on PLATFORM-LEVEL TRUST consent.
-* ``update <name>`` — re-fetch the source the install recorded, at its
-  ref, and apply it: a three-way merge that keeps the operator's edits
-  to the installed tree where it can, reports the conflicts it cannot
-  merge, and says plainly when there is no pristine version to merge
-  against.
+* ``update <name> [--ref <ref>]`` — re-fetch the source the install
+  recorded, at its ref, and apply it: a three-way merge that keeps the
+  operator's edits to the installed tree where it can, reports the
+  conflicts it cannot merge, and says plainly when there is no pristine
+  version to merge against.  ``--ref`` follows a different ref instead —
+  the way to move a package from one tag to the next — and the new ref
+  is REMEMBERED as the package's ``source_ref``, so later updates follow
+  it too.
 * ``uninstall <name>`` — remove an installed package (dir + DB rows +
   capability grants).
 * ``list`` — show installed packages and their granted capability verbs.
@@ -790,6 +793,11 @@ def _print_update_plan(plan, *, stream) -> None:
         f"{plan.fetched_hash[:12]}..."
     )
     p(f"  Source   : {describe(plan.source)}")
+    if plan.ref_override:
+        p(
+            f"  Ref      : {plan.ref_override} (--ref; recorded as this "
+            f"package's ref when the update is applied)"
+        )
     if plan.resolved:
         p(f"  Resolved : {plan.resolved}")
     p(
@@ -831,15 +839,27 @@ def _cmd_update(argv: list[str]) -> int:
         prog="python3 -m carpenter packages update",
         description=(
             "Update an installed capability package from the source its "
-            "install recorded, following that source's ref. The plan is "
-            "printed and confirmed before anything is written. Edits you "
-            "made to the installed tree are merged where possible, "
-            "reported where they conflict, and never discarded without "
-            "saying so."
+            "install recorded, following that source's ref — or the ref "
+            "given by --ref, which is then REMEMBERED as the package's "
+            "recorded ref. The plan is printed and confirmed before "
+            "anything is written. Edits you made to the installed tree "
+            "are merged where possible, reported where they conflict, "
+            "and never discarded without saying so."
         ),
     )
     parser.add_argument(
         "name", help="Installed package name (manifest 'name' field).",
+    )
+    parser.add_argument(
+        "--ref", metavar="REF",
+        help="Follow this git ref (branch, tag or 40-hex commit) instead "
+             "of the one the install recorded — how a package is moved "
+             "from one tag to the next. The new ref is REMEMBERED: "
+             "applying the update records it as the package's "
+             "source_ref, so later updates follow it too, and "
+             "source_resolved records the commit actually fetched. "
+             "Refused for a package installed from a local directory, "
+             "which has no ref to follow.",
     )
     parser.add_argument(
         "--yes", action="store_true",
@@ -862,7 +882,7 @@ def _cmd_update(argv: list[str]) -> int:
     # other writer for as long as the operator takes to read.
     try:
         with db_connection() as db:
-            plan = plan_update(args.name, conn=db)
+            plan = plan_update(args.name, conn=db, ref=args.ref)
     except UpdateError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
@@ -889,11 +909,37 @@ def _cmd_update(argv: list[str]) -> int:
 
         _print_update_plan(plan, stream=sys.stderr)
 
-        if plan.strategy == STRATEGY_NOOP:
+        if plan.strategy == STRATEGY_NOOP and not plan.ref_override:
             print(
                 f"{plan.name} is already up to date at "
                 f"{plan.installed_version} "
                 f"(hash {plan.installed_hash[:12]}); nothing was changed."
+            )
+            return 0
+
+        if plan.strategy == STRATEGY_NOOP:
+            # The named ref ships the bytes already installed, so there
+            # is nothing to install and nothing to confirm — no files
+            # are replaced, so --yes is not asked for.  The apply still
+            # runs, because the operator named a ref and that is a
+            # request about the recorded source: dropping it here would
+            # send the next update back to the old ref.  It writes
+            # nothing at all if the row already names this ref.
+            try:
+                with db_transaction() as db:
+                    result = apply_update(plan, conn=db)
+            except UpdateError as exc:
+                print(f"ERROR: update failed: {exc}", file=sys.stderr)
+                return 1
+            print(
+                f"{plan.name} is already up to date at "
+                f"{plan.installed_version} "
+                f"(hash {plan.installed_hash[:12]}); no files were "
+                f"changed."
+            )
+            print(
+                f"  Recorded ref: {plan.ref_override} (pinned at "
+                f"{result.resolved}); later updates follow it."
             )
             return 0
 
@@ -1119,7 +1165,7 @@ def cmd_packages(argv: list[str]) -> int:
             "[--allow-write-chat-tools]\n"
             "  install --path DIR [--accept-capabilities] "
             "[--allow-write-chat-tools]\n"
-            "  update <name> [--yes] [--accept-conflicts]\n"
+            "  update <name> [--ref REF] [--yes] [--accept-conflicts]\n"
             "  uninstall <name> [--force] [--preserve-state]\n"
             "  list\n"
             "\n"

@@ -425,6 +425,60 @@ class TestGitSource:
         assert record["source_resolved"] == second
 
 
+    def test_ref_moves_the_package_from_one_tag_to_the_next(
+        self, monorepo, git_server, non_interactive, capsys,
+    ):
+        """``update --ref`` against a real remote, and it is remembered.
+
+        The ref an install recorded is the only ref an update could
+        follow before this, so a package pinned to a tag could never be
+        moved to the next one without uninstalling it.  Here the operator
+        names the new tag: the fetch follows that tag, the row records
+        it, and a LATER plain update follows the new tag rather than
+        snapping back — the third commit on the branch is deliberately
+        left untagged, so "up to date" is only possible if the recorded
+        ref really moved.
+        """
+        base = git_server({"pkgs": monorepo})
+        pkg = monorepo / "packages" / "demo"
+        porcelain.tag_create(str(monorepo), b"v1")
+
+        (pkg / "manifest.yaml").write_text(
+            MANIFEST.replace('version: "0.1.0"', 'version: "0.2.0"'),
+        )
+        (pkg / "tools.py").write_text("VALUE = 2\n")
+        second = _commit_all(monorepo, b"release 0.2.0")
+        porcelain.tag_create(str(monorepo), b"v2")
+
+        assert cli_packages.cmd_packages([
+            "install", f"git+{base}/pkgs@v1#subdir=packages/demo",
+        ]) == 0
+        installed = Path(config.CONFIG["base_dir"]) / "packages" / "demo"
+        assert (installed / "tools.py").read_text() == "VALUE = 1\n"
+        capsys.readouterr()
+
+        rc = cli_packages.cmd_packages(
+            ["update", "demo", "--ref", "v2", "--yes"],
+        )
+
+        assert rc == 0, capsys.readouterr().err
+        assert "Updated demo 0.1.0 -> 0.2.0" in capsys.readouterr().out
+        assert (installed / "tools.py").read_text() == "VALUE = 2\n"
+        with db_connection() as db:
+            record = installer.get_install_record(db, "demo")
+        assert record["source_ref"] == "v2"
+        assert record["source_resolved"] == second
+
+        # A third release on the branch, with no tag of its own.
+        (pkg / "tools.py").write_text("VALUE = 3\n")
+        _commit_all(monorepo, b"untagged work after v2")
+
+        assert cli_packages.cmd_packages(["update", "demo", "--yes"]) == 0
+        out = capsys.readouterr().out
+        assert "already up to date" in out
+        assert (installed / "tools.py").read_text() == "VALUE = 2\n"
+
+
 # ── install from an archive source ──────────────────────────────────
 
 

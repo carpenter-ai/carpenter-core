@@ -344,13 +344,22 @@ classes).
 ### Upgrades
 
 ```bash
-python3 -m carpenter packages update <name> [--yes] [--accept-conflicts]
+python3 -m carpenter packages update <name> [--ref REF] [--yes] [--accept-conflicts]
 ```
 
 An update takes no source: it re-fetches the one the install recorded, **at its ref**
 rather than at the commit it was pinned to, because "follow the branch and tell me what
 changed" is the point. A package with no recorded remote source is refused, with the
 command that fixes it.
+
+The one input it does take is `--ref`, for moving a package from one tag or branch to the
+next. The new ref is **remembered** — it becomes the row's `source_ref`, so later updates
+follow it rather than snapping back — and `source_resolved` still records the commit
+actually fetched. The ref must pass the same rules as one written after `@` in a source
+spec, and a package installed from a local directory is refused, because a local tree has
+no ref to follow. Where the named ref turns out to ship the bytes already installed,
+nothing is installed and the recorded ref moves anyway: that is the only database write a
+no-op update makes.
 
 The installed tree is a working directory an operator may legitimately have edited, and
 re-installing over it clobbers those edits silently. So an update classifies every path

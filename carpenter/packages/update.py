@@ -7,6 +7,18 @@ that source's *ref* rather than the commit it was pinned to, because
 update.  A package with no recorded remote source therefore cannot be
 updated, and is refused with the command that fixes it.
 
+The one thing an update does take is a **ref override** (``ref=`` here,
+``--ref`` on the CLI), for moving a package from one tag to the next.
+It is **remembered**: the override becomes the row's ``source_ref``, so
+the package goes on following the ref the operator named rather than
+snapping back to the old one at the next update — "update to this tag
+and keep following it" is what asking for it means.  It is threaded in
+by one :func:`dataclasses.replace` on the spec rebuilt from the row, so
+the spec that is fetched and the spec that is recorded are the same
+object and cannot disagree.  A ref is refused before anything is
+fetched if it is not a ref :func:`carpenter.packages.sources.validate_ref`
+accepts, or if the recorded source is local and so has no ref to follow.
+
 What makes this more than a re-install is the three-way reconcile.  The
 installed tree is a working directory an operator may legitimately have
 edited; re-installing over it clobbers those edits silently, which is
@@ -51,7 +63,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from . import archive_cache, reconcile
@@ -64,12 +76,13 @@ from .installer import (
     compute_proposal_diff,
     get_install_record,
     granted_verbs_for_package,
+    record_source_provenance,
 )
 from .manifest import ManifestError, PackageManifest, load_manifest
 from .reconcile import FileStatus
 from .reconcile_apply import apply_reconciled_install
 from .security import PackageSecurityError, validate_manifest_security
-from .sources import SourceSpec, describe
+from .sources import SourceSpec, SourceSpecError, describe, validate_ref
 from .sources import source_id as source_id_of
 
 logger = logging.getLogger(__name__)
@@ -126,7 +139,12 @@ class UpdatePlan:
             archive sha256.
         source: The :class:`~carpenter.packages.sources.SourceSpec`
             rebuilt from the install row's provenance columns, i.e. the
-            source that was re-fetched.
+            source that was re-fetched — carrying ``ref_override`` when
+            one was given, because this is also the spec
+            :func:`apply_update` records.
+        ref_override: The ref the caller asked for instead of the
+            recorded one, or ``None``.  Applying the plan makes it the
+            row's ``source_ref``.
         strategy: :data:`STRATEGY_RECONCILE`, :data:`STRATEGY_CLOBBER`
             or :data:`STRATEGY_NOOP`.
         local_edits: Paths whose on-disk content differs from what the
@@ -154,6 +172,7 @@ class UpdatePlan:
     resolved: str
     source: SourceSpec
     strategy: str
+    ref_override: str | None = None
     local_edits: tuple[str, ...] = ()
     conflicts: tuple[str, ...] = ()
     notes: tuple[str, ...] = ()
@@ -179,7 +198,12 @@ class UpdateResult:
     Attributes:
         name: Package name.
         strategy: The plan's strategy, as carried out.
-        changed: False only for a no-op (no DB write, no disk write).
+        changed: False only for a no-op, which writes nothing to disk.
+            A no-op does not write the database either, with one
+            exception: a ref override that moves the row's
+            ``source_ref`` is recorded even when the ref ships the
+            bytes already installed, because the operator asked for
+            the package to follow it from now on.
         from_version / to_version: Recorded version before and after.
         from_hash: The previously recorded tree hash.
         to_hash: Hash of the tree now on disk.  For a reconcile this is
@@ -369,6 +393,7 @@ def plan_update(
     *,
     conn: sqlite3.Connection | None = None,
     limits: FetchLimits | None = None,
+    ref: str | None = None,
 ) -> UpdatePlan:
     """Fetch the recorded source and plan the update it implies.
 
@@ -383,20 +408,41 @@ def plan_update(
         conn: Open SQLite connection.  Omitted, a read-only connection
             is opened for the call.
         limits: Resource ceilings for the fetch.
+        ref: Fetch this ref instead of the one the install recorded —
+            the way to move a package from one tag or branch to the
+            next.  It is REMEMBERED: applying the resulting plan makes
+            it the row's ``source_ref``, so later updates follow it
+            too.  The override rides on the plan's ``source`` spec, the
+            same spec the apply records, so the fetched and the
+            recorded ref cannot differ.  Refused before any fetch when
+            it is not a valid ref, or when the recorded source is
+            local.
 
     Returns:
         An :class:`UpdatePlan`.
 
     Raises:
         UpdateError: the package is not installed, its install
-            directory is gone, it has no updatable recorded source, the
+            directory is gone, it has no updatable recorded source,
+            ``ref`` is invalid or meaningless for that source, the
             fetch failed, or the fetched tree is not an installable
             package of the same name.
     """
     if conn is None:
         from ..db import db_connection
         with db_connection() as db:
-            return plan_update(name, conn=db, limits=limits)
+            return plan_update(name, conn=db, limits=limits, ref=ref)
+
+    if ref is not None:
+        # The ref rules live in ``sources`` and are applied here before
+        # anything is read or fetched, so an unusable ref costs nothing
+        # and cannot reach a fetcher's command line.
+        try:
+            ref = validate_ref(ref)
+        except SourceSpecError as exc:
+            raise UpdateError(
+                f"the ref given for {name!r} cannot be used: {exc}",
+            ) from exc
 
     record = get_install_record(conn, name)
     if record is None:
@@ -414,7 +460,24 @@ def plan_update(
             f"and install it again.",
         )
 
+    if ref is not None and (record.get("source_kind") or "") == "local":
+        where = record.get("source_path") or "a local directory"
+        raise UpdateError(
+            f"a ref ({ref!r}) cannot be followed for {name!r}: it was "
+            f"installed from {where}, a local directory, and a ref names "
+            f"a point in a remote repository's history — a local tree "
+            f"has none. Change that tree and re-install it with "
+            f"`python3 -m carpenter packages install --path {where}`, or "
+            f"install the package from a remote source to make it "
+            f"updatable at a ref.",
+        )
+
     spec = _spec_from_record(name, record)
+    if ref is not None:
+        # One substitution, on the spec that is BOTH fetched and
+        # recorded: there is deliberately no second path by which the
+        # fetch could use one ref while the row keeps another.
+        spec = replace(spec, ref=ref)
     try:
         fetched = fetch_source(spec, limits=limits)
     except FetchError as exc:
@@ -428,7 +491,7 @@ def plan_update(
 
     try:
         return _plan_from_fetched(
-            name, record, spec, fetched, conn=conn,
+            name, record, spec, fetched, conn=conn, ref_override=ref,
         )
     except Exception:
         cleanup(fetched)
@@ -581,6 +644,7 @@ def _plan_from_fetched(
     fetched: FetchResult,
     *,
     conn: sqlite3.Connection,
+    ref_override: str | None = None,
 ) -> UpdatePlan:
     """Classify a fetched tree against the install.  Owns no I/O errors."""
     manifest = _fetched_manifest(name, fetched.tree)
@@ -600,6 +664,7 @@ def _plan_from_fetched(
             resolved=fetched.resolved,
             source=spec,
             strategy=strategy,
+            ref_override=ref_override,
             install_path=install_path,
             fetched_tree=Path(fetched.tree),
             staging=fetched.staging,
@@ -608,11 +673,24 @@ def _plan_from_fetched(
 
     # ── nothing new ────────────────────────────────────────────────
     if fetched_hash == pristine_hash:
+        moves_ref = bool(
+            ref_override
+            and (record.get("source_ref") or "") != ref_override
+        )
+        # Said once, and said accurately: a ref override is the single
+        # thing a no-op still writes, so the sentence that promises
+        # nothing is written has to know about it.
+        writes = (
+            "nothing will be written to the install directory, and the "
+            "only database write is the recorded ref below"
+            if moves_ref else
+            "nothing will be written — not to the install directory and "
+            "not to the database"
+        )
         notes = [
             f"UP TO DATE: {describe(spec)} ships exactly the bytes "
             f"{name!r} already has (tree hash {fetched_hash[:12]}...), "
-            f"so there is nothing to apply and nothing will be written "
-            f"— not to the install directory and not to the database.",
+            f"so there is nothing to apply and {writes}.",
         ]
         live_hash = compute_package_hash(install_path)
         if live_hash != pristine_hash:
@@ -626,6 +704,15 @@ def _plan_from_fetched(
                 f"{manifest.version!r} while they are recorded as "
                 f"{installed_version!r}; since nothing changed, the "
                 f"recorded version is left alone too.",
+            )
+        if moves_ref:
+            notes.append(
+                f"the recorded ref moves from "
+                f"{record.get('source_ref') or 'none'!r} to "
+                f"{ref_override!r}, which is the one database write a "
+                f"no-op makes: you asked for this package to follow "
+                f"{ref_override!r}, and leaving the row pointing at the "
+                f"old ref would send the next update back to it.",
             )
         return _plan(STRATEGY_NOOP, notes=tuple(notes))
 
@@ -881,6 +968,48 @@ def apply_update(
     return result
 
 
+def _record_noop_ref(
+    plan: UpdatePlan, *, conn: sqlite3.Connection,
+) -> tuple[str, ...]:
+    """Move the recorded ref for a no-op that was given an override.
+
+    The bytes the override's ref ships are the bytes already installed,
+    so there is nothing to install — but "update to this tag and keep
+    following it" is still a request about the row, and dropping it
+    would leave the install pointing at the ref the operator moved off.
+    So the provenance columns alone are rewritten, and only when the
+    recorded ref actually differs: every other no-op writes nothing.
+
+    Returns the notes to add to the result.
+
+    Raises:
+        UpdateError: the package was uninstalled since the plan was
+            made, so there is no row to move.
+    """
+    if not plan.ref_override:
+        return ()
+    record = get_install_record(conn, plan.name)
+    if record is None:
+        raise UpdateError(
+            f"package {plan.name!r} is no longer installed, so the ref "
+            f"{plan.ref_override!r} could not be recorded for it. "
+            f"Nothing was changed.",
+        )
+    previous = record.get("source_ref") or ""
+    if previous == plan.ref_override:
+        return ()
+    record_source_provenance(
+        conn, plan.name, provenance=plan.source, resolved=plan.resolved,
+    )
+    return (
+        f"the recorded ref for {plan.name!r} moved from "
+        f"{previous or 'none'!r} to {plan.ref_override!r} (pinned at "
+        f"{plan.resolved or 'the fetched bytes'}); the installed files "
+        f"are untouched because that ref ships exactly what is already "
+        f"there, and later updates now follow it.",
+    )
+
+
 def _apply(
     plan: UpdatePlan,
     *,
@@ -890,9 +1019,11 @@ def _apply(
     name = plan.name
 
     if plan.strategy == STRATEGY_NOOP:
-        # Deliberately no DB write and no disk write: "already current"
-        # is not an event worth recording, and re-recording the row
-        # would move ``installed_at`` for nothing.
+        # Deliberately no disk write, and no DB write either: "already
+        # current" is not an event worth recording, and re-recording the
+        # row would move ``installed_at`` for nothing.  The single
+        # exception is a ref override, which is about where the package
+        # is followed from rather than about its bytes.
         return UpdateResult(
             name=name,
             strategy=STRATEGY_NOOP,
@@ -904,7 +1035,7 @@ def _apply(
             shipped_hash=plan.fetched_hash,
             resolved=plan.resolved,
             dest_path=plan.install_path,
-            notes=plan.notes,
+            notes=tuple(plan.notes) + _record_noop_ref(plan, conn=conn),
         )
 
     record = get_install_record(conn, name)

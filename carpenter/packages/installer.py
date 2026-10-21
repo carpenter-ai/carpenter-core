@@ -519,6 +519,61 @@ def _provenance_values(
     return (None,) * len(_PROVENANCE_COLUMNS)
 
 
+def record_source_provenance(
+    conn: sqlite3.Connection,
+    name: str,
+    *,
+    provenance,
+    resolved: str,
+    fetched_at: str | None = None,
+) -> bool:
+    """Rewrite ONLY the provenance columns of an existing install row.
+
+    For the one case that moves where a package is followed from
+    without changing a byte of it: an update told to follow a different
+    ref whose tree turns out to be the one already installed.  Nothing
+    is installed, so there is no new ``version``, ``hash`` or
+    ``installed_at`` to record — but the row must still say which ref
+    the operator asked to follow, or it would keep pointing at the old
+    one and the next update would quietly go back there.
+
+    The seven columns are written through the same
+    :func:`_provenance_values` the install path uses, with the existing
+    row as the carry-over, so a field the spec does not define is kept
+    rather than blanked.
+
+    Args:
+        conn: Open SQLite connection; the caller owns the transaction.
+        name: Installed package name.
+        provenance: The :class:`~carpenter.packages.sources.SourceSpec`
+            to record.  Its URL is stored redacted, as everywhere else.
+        resolved: What pins the bytes — git commit sha40 / archive
+            sha256.
+        fetched_at: Timestamp to record; now, by default.
+
+    Returns:
+        True when a row was updated, False when the package is not
+        installed (nothing is written).
+    """
+    record = get_install_record(conn, name)
+    if record is None:
+        return False
+    values = _provenance_values(
+        provenance,
+        resolved=resolved,
+        fetched_at=(
+            fetched_at or datetime.now(timezone.utc).isoformat()
+        ),
+        carry_over=record,
+    )
+    assignments = ", ".join(f"{col} = ?" for col in _PROVENANCE_COLUMNS)
+    conn.execute(
+        f"UPDATE installed_packages SET {assignments} WHERE name = ?",
+        (*values, name),
+    )
+    return True
+
+
 def _record_install(
     conn: sqlite3.Connection,
     *,

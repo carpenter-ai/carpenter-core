@@ -70,6 +70,7 @@ __all__ = [
     "redact",
     "resolve_bare_name",
     "source_id",
+    "validate_ref",
 ]
 
 
@@ -327,8 +328,24 @@ def _validate_subdir(value: str) -> str:
     return "/".join(parts)
 
 
-def _validate_ref(value: str) -> str:
-    """Validate a git ref: a branch/tag name or a 40-hex commit."""
+def validate_ref(value: str) -> str:
+    """Validate a git ref: a branch/tag name or a 40-hex commit.
+
+    Public because the ref is not only parsed out of a spec string: an
+    operator may also name one directly (``packages update --ref``),
+    and that ref must pass exactly the same rules as one written after
+    ``@`` in a source spec rather than a second, laxer copy of them.
+
+    Args:
+        value: The candidate ref.
+
+    Returns:
+        The ref, stripped.
+
+    Raises:
+        SourceSpecError: it is empty, over 255 characters, or not a
+            branch, tag or 40-hex commit.
+    """
     candidate = value.strip()
     if not candidate:
         raise _fail("git ref after '@' is empty")
@@ -410,7 +427,7 @@ def _parse_git(spec: str) -> SourceSpec:
     ref: str | None = None
     if "@" in path:
         path, _, ref_text = path.rpartition("@")
-        ref = _validate_ref(ref_text)
+        ref = validate_ref(ref_text)
     if not path or path == "/":
         raise _fail(
             f"git source {redact(url_part)!r} has no repository path",
