@@ -69,7 +69,11 @@ package_sources:
     credential_ref: HOUSE_FORGE_TOKEN             # a variable NAME, never a value
 ```
 
-- **The list order is the search order.** There is no second key that can disagree with it.
+- **The first entry wins, and the list order is what decides.** Resolving a bare name is
+  pure — it performs no I/O — so it cannot ask a remote whether that remote actually
+  publishes the package, and it does not fall through to the next entry. Give a full spec
+  to install from any other configured source, or reorder the list. (`list_available_packages`
+  lists each source separately, so discovery is not limited this way.)
 - `subdir_template` may contain `{name}`; that is how a monorepo of many packages is
   addressed, and it is also what makes the source [listable](#7-discovery).
 - `credential_ref` names a platform-provided environment variable. The platform injects
@@ -217,7 +221,11 @@ Three rules the page enforces:
 
 `GET` is exempt from the UI-token middleware so the link opens from whatever chat app or
 mail client carried it. `POST /api/package-install/<token>/decide` is **not** exempt: it
-needs a session authenticated to the platform *in addition to* the single-use token.
+needs the platform's own authentication (the configured `ui_token`) *in addition to* the
+single-use token in the path. The page says so in words, and it echoes the token back to
+its own script only when the viewer already presented it — so opening the link from the
+web UI just works, while holding the link alone gets a readable page and buttons that
+refuse.
 
 This is a deliberate departure from the arc-review links, where the unguessable uuid4 in
 the URL is the whole credential. The reason is not link hygiene, it is what the link

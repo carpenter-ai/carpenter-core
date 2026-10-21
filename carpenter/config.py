@@ -396,6 +396,11 @@ DEFAULTS = {
     #     max_requests_per_hour: 5  # requests the agent may create per hour
     #     max_sources_per_request: 5
     #     notify_agent: false       # re-invoke the chat agent on the outcome
+    #     max_fetch_bytes: 67108864     # ceilings on ONE fetch; a remote
+    #     max_fetch_files: 5000         # source is untrusted input, so an
+    #     max_fetch_file_bytes: 16777216  # unbounded download, a file-count
+    #     fetch_timeout_s: 60           # explosion or a hung connection has
+    #                                   # to fail rather than fill the disk
     #
     # The limits exist because the only defence that cannot be hardened
     # is the human reading the page: a request the agent can repeat
@@ -408,6 +413,10 @@ DEFAULTS = {
     # poll.  Turning it on re-invokes the chat agent once per approved
     # install, so the agent can act on the result — at the price of a
     # model call for every approval.
+    # The four fetch ceilings mirror ``packages.fetch.FetchLimits``'s own
+    # defaults (``install_requests.limits_for`` reads them from here); they
+    # are declared so an operator can find them, since this file is the
+    # source of truth for every config key.
     "package_install": {
         "request_ttl_hours": 24,
         "approved_grace_hours": 6,
@@ -415,6 +424,10 @@ DEFAULTS = {
         "max_requests_per_hour": 5,
         "max_sources_per_request": 5,
         "notify_agent": False,
+        "max_fetch_bytes": 64 * 1024 * 1024,
+        "max_fetch_files": 5000,
+        "max_fetch_file_bytes": 16 * 1024 * 1024,
+        "fetch_timeout_s": 60,
     },
     # Tool classification lists — used by the callback API for access control.
     # Each list can be extended (add items) or reduced (remove items) via config.yaml.
@@ -572,10 +585,15 @@ DEFAULTS = {
     #   a package cannot supply or override it, and it is never persisted
     #   or logged.
     #
-    # THE LIST ORDER IS THE SEARCH ORDER: a bare package name is tried
-    # against each entry in turn, so there is no second key that can
-    # disagree with it.  Empty (the default) keeps the pre-registry
-    # behaviour: a bare name resolves to the local source tree.
+    # THE LIST ORDER DECIDES: a bare package name resolves through the
+    # FIRST entry, so there is no second key that can disagree with it.
+    # Resolution is pure (no I/O), so it cannot ask a remote whether it
+    # actually publishes the package and therefore cannot fall through to
+    # the next entry — to install from a source other than the first,
+    # give a full spec, or reorder the list.  ``list_available_packages``
+    # lists each source separately.  Empty (the default) keeps the
+    # pre-registry behaviour: a bare name resolves to the local source
+    # tree.
     #
     # A malformed entry is refused with a clear error rather than skipped,
     # so a typo cannot silently change which remote a package comes from.

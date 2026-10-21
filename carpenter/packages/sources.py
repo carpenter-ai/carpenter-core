@@ -12,8 +12,11 @@ Accepted forms (and nothing else):
 * **bare name** — ``^[a-z0-9][a-z0-9._-]*$``.  Resolved through the
   operator's configured source registry (the top-level
   ``package_sources`` list, see :func:`configured_sources`), whose
-  declaration order IS the order the aliases are tried in.  When no
-  configured source is declared, it falls back to the legacy local layout
+  FIRST entry wins: resolution is pure, so it cannot ask a remote
+  whether that remote actually publishes the package and therefore
+  cannot fall through to the next entry.  To install from any other
+  configured source, give a full spec.  When no configured source is
+  declared, it falls back to the legacy local layout
   ``~/repos/carpenter-packages/packages/<name>`` so existing installs
   keep working untouched.
 * **local directory** — an absolute path (``~`` is expanded) or a
@@ -661,13 +664,16 @@ def resolve_bare_name(
     """Return the configured candidates for a bare package name, in order.
 
     One spec per entry of ``package_sources``, in declaration order —
-    the list order is the search order, so there is no separate key that
+    the list order is what decides, so there is no separate key that
     could disagree with it.  Parsing cannot tell whether a remote
     actually publishes the package (that needs I/O), so the candidates
-    are returned as a tuple and a caller that can fetch may try each in
-    turn; :func:`parse_source` takes the first.  An empty tuple means no
-    source is configured and the caller should use
-    :func:`legacy_local_source`.
+    are returned as a tuple for a caller that can fetch and wants to try
+    each in turn.  **No caller does today**: :func:`parse_source` takes
+    the first, which is what makes a bare name resolve to one
+    predictable source rather than to whichever remote happens to answer
+    — and it is why the CLI and the chat path cannot disagree about where
+    a name came from.  An empty tuple means no source is configured and
+    the caller should use :func:`legacy_local_source`.
     """
     out: list[SourceSpec] = []
     for entry in configured_sources(config):
