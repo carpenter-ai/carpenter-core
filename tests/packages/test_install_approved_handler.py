@@ -14,7 +14,9 @@ the same contract WP1's ``fetch_source`` has.
 
 from __future__ import annotations
 
+import re
 import shutil
+import tarfile
 from pathlib import Path
 from textwrap import dedent
 
@@ -483,11 +485,93 @@ def test_an_upgrade_is_never_rolled_back(
     assert "cannot be rolled back" in blocks["alpha"]["rollback"]
     assert "v1.0.0" in blocks["alpha"]["rollback"]
     assert "archive cache" in blocks["alpha"]["rollback"]
+    # The instruction that cannot work: --path takes a directory, and
+    # the cache holds a .tar.gz file.  See the test below.
+    assert "--path <cached tree>" not in blocks["alpha"]["rollback"]
     # Still installed, at the new version.
     with db_connection() as db:
         record = get_install_record(db, "alpha")
     assert record is not None
     assert record["version"] == "2.0.0"
+
+
+def test_the_restore_instruction_for_an_upgrade_can_be_followed(
+    installer_tables, fake_fetch, fail_install_of, tmp_path,
+):
+    """Follow the message literally and the previous version comes back.
+
+    An upgrade is never rolled back, so this hint is the only thing the
+    operator has.  It used to say `packages install --path <cached
+    tree>`, which could not work: the archive cache holds a gzipped tar
+    FILE and --path takes a DIRECTORY holding a manifest.  This test
+    does exactly what the message now says — read the archive path out
+    of it, extract that archive, install the extracted directory — so a
+    message that drifts back into the impossible fails here.
+    """
+    first = _write_tree(tmp_path / "preinstalled" / "alpha", ALPHA_MANIFEST)
+    with db_transaction() as db:
+        installer.install_package(
+            first, installer.default_install_dest("alpha"), conn=db,
+        )
+    fake_fetch.register("alpha", ALPHA_V2_MANIFEST)
+    fake_fetch.register("beta", BETA_MANIFEST)
+    out = _approved(
+        [_spec("alpha"), _spec("beta")], {"alpha": {}, "beta": {}},
+    )
+    fail_install_of("beta")
+
+    batch = ib.perform_install_batch(out.record.id)
+
+    hint = _blocks(batch.result)["alpha"]["rollback"]
+    match = re.search(r"tar -xzf (\S+) -C", hint)
+    assert match, hint
+    archive = Path(match.group(1))
+    assert archive.is_file(), f"{archive} is not a file: {hint}"
+    assert archive.name.endswith(".tar.gz")
+
+    extracted = tmp_path / "restored"
+    extracted.mkdir()
+    with tarfile.open(archive) as tar:
+        tar.extractall(extracted, filter="data")
+    # The extracted directory is what --path needs, which the archive
+    # itself was not.
+    assert (extracted / "manifest.yaml").is_file()
+
+    with db_transaction() as db:
+        restored = installer.install_package(
+            extracted, installer.default_install_dest("alpha"), conn=db,
+        )
+    assert restored.version == "1.0.0"
+    with db_connection() as db:
+        assert get_install_record(db, "alpha")["version"] == "1.0.0"
+
+
+def test_an_uncached_previous_version_says_so_instead(
+    installer_tables, fake_fetch, fail_install_of, tmp_path, monkeypatch,
+):
+    """No archive, no instruction that pretends there is one."""
+    first = _write_tree(tmp_path / "preinstalled" / "alpha", ALPHA_MANIFEST)
+    with db_transaction() as db:
+        installer.install_package(
+            first, installer.default_install_dest("alpha"), conn=db,
+        )
+    fake_fetch.register("alpha", ALPHA_V2_MANIFEST)
+    fake_fetch.register("beta", BETA_MANIFEST)
+    out = _approved(
+        [_spec("alpha"), _spec("beta")], {"alpha": {}, "beta": {}},
+    )
+    fail_install_of("beta")
+    monkeypatch.setattr(
+        "carpenter.packages.archive_cache.archive_candidates",
+        lambda *a, **k: (),
+    )
+
+    batch = ib.perform_install_batch(out.record.id)
+
+    hint = _blocks(batch.result)["alpha"]["rollback"]
+    assert "NOT in the local archive cache" in hint
+    assert "tar -xzf" not in hint
+    assert "--path" not in hint
 
 
 def test_a_rollback_names_the_security_policies_it_leaves_behind(

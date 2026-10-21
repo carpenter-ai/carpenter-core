@@ -506,6 +506,67 @@ def _record_success(
 
 # ── compensating rollback (D5 / plan §7) ────────────────────────────
 
+
+def _restore_previous_hint(name: str, block: dict) -> str:
+    """Say how the version an upgrade replaced could be put back.
+
+    An upgrade is never rolled back, so this is the one thing the
+    operator is left to do by hand, and the instruction has to be one
+    that works.  The archive cache stores a pristine tree as a gzipped
+    tar **file** (``<cache>/<name>/<source_id>/<version>.tar.gz``) while
+    ``packages install --path`` takes a **directory** holding a
+    ``manifest.yaml`` — so pointing ``--path`` at "the cached tree",
+    which is what this message used to do, cannot work.  Extracting the
+    archive first is the missing step.
+
+    Re-installing from the row's recorded source is deliberately NOT
+    offered: the upgrade moved that row on to the NEW bytes, so it no
+    longer describes the version being restored.
+
+    The archive is named only when it is really on disk — caching a
+    pristine tree is best-effort at install time, and
+    :func:`carpenter.packages.archive_cache.archive_candidates` is the
+    same lookup an update's reconcile uses, including an archive moved
+    aside because its version string was re-published.
+    """
+    from . import archive_cache
+
+    version = block.get("previous_version") or ""
+    if not version:
+        return (
+            "The version it replaced is not recorded for this request, "
+            "so nothing here can name a tree to put back."
+        )
+    try:
+        candidates = archive_cache.archive_candidates(
+            name, version, source_id=(block.get("source_id") or None),
+        )
+    except Exception:  # noqa: BLE001 — this is a report, never a gate
+        logger.warning(
+            "Could not look up the cached pristine tree of %r v%s",
+            name, version, exc_info=True,
+        )
+        candidates = ()
+    if not candidates:
+        return (
+            f"The pristine tree of v{version} is NOT in the local "
+            f"archive cache — caching it is best-effort at install time, "
+            f"and an uninstall reclaims it — so it cannot be restored "
+            f"from this host. Install v{version} again from the source "
+            f"that published it."
+        )
+    return (
+        f"To put v{version} back, extract its pristine tree from the "
+        f"local archive cache into an empty directory — `tar -xzf "
+        f"{candidates[0]} -C <dir>` — and install THAT directory: "
+        f"`python3 -m carpenter packages install --path <dir>`. The "
+        f"cache holds a .tar.gz file while --path takes a directory "
+        f"holding manifest.yaml, so the extract step is not optional. "
+        f"Such a re-install records a local source, which `packages "
+        f"update` cannot follow; install it from its remote source "
+        f"again once the cause is fixed."
+    )
+
 def _compensate(
     record: PendingInstall,
     by_name: dict[str, dict],
@@ -566,12 +627,8 @@ def _compensate(
         block["rollback"] = (
             f"{name} was upgraded from v{previous} to v{block['version']} "
             f"and cannot be rolled back: it was already installed, so "
-            f"uninstalling it would remove software you already had. The "
-            f"previous version's pristine tree is in the archive cache "
-            f"(`python3 -m carpenter packages install --path <cached tree>` "
-            f"to restore it), but that cache is keyed on name and version "
-            f"with no source discriminator and a same-version re-install "
-            f"overwrites it — so this is a report, not a promise."
+            f"uninstalling it would remove software you already had. "
+            + _restore_previous_hint(name, block)
         )
         result["not_rolled_back"].append(
             {"name": name, "reason": "it was an upgrade, not a fresh install"},
