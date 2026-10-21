@@ -137,6 +137,31 @@ Session records are retained indefinitely in the database for audit purposes.
 | **Execution sessions** | Unreviewed/expired code from acting | Code that bypasses review or has expired session could invoke action callbacks |
 | **Callback token** | External callers from invoking callbacks | Any HTTP client on the network could call action tools |
 
+## Package-Install Approval Links
+
+A chat agent may *ask* for a capability package to be installed; it can never install one.
+`request_package_install` fetches the sources into a quarantine, previews them without
+executing any of the fetched code, and returns a one-time link. `GET
+/api/package-install/<token>` is exempt from the UI-token middleware, because the link has
+to open from whatever chat app or mail client carried it; **`POST
+/api/package-install/<token>/decide` is not exempt** — deciding needs a session
+authenticated to the platform in addition to the single-use token.
+
+That split is a deliberate deviation from the arc-review pages above, where the unguessable
+uuid4 in the URL is the whole credential. The reason is what the link authorises. The
+approval URL is returned to the chat agent that asked and is persisted in the conversation,
+and the platform ships an HTTP POST dispatch verb, so the model that requested the install
+would otherwise hold the credential that approves it — a prompt-injected agent could
+request and approve in one move, cutting out the human the design rests on. (`hidden=True`
+hides a message from the UI, not from the model, so it cannot help.) Approving an install
+runs unsandboxed code in the platform process with the platform's credentials and egress,
+which is not comparable to approving a reviewed arc step.
+
+A GET mutates nothing except expiring a row whose TTL has run out; the token is single-use
+and a replay gets `410`; and the page sends back nothing but the per-capability grant
+checkboxes, so nothing installable can be influenced by the browser. See
+[`docs/package-sources.md`](package-sources.md#5-chat-requested-installs).
+
 ## Inbound Channel Webhooks
 
 Paths under `/hooks/` (channel connectors) and `/api/webhooks/` are exempt from the UI-token middleware, because the services that call them cannot carry the UI bearer token. Each handler must therefore authenticate its caller itself; the payload alone proves nothing.

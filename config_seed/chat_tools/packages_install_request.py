@@ -22,7 +22,8 @@ a one-time URL where a human decides.  If they approve, the platform
 performs the install itself, out of the model turn, and reports back into
 the conversation.
 
-Why a request instead of an install (DESIGN D11): the platform's chat
+Why a request instead of an install (D11 in the design doc
+``docs/2026-10-21_package-remote-sources-design.md``): the platform's chat
 confirmation seam is synchronous with no timeout and no conversation id,
 and an operator's "yes" typed in chat while a turn is blocked is
 persisted and then dropped, so a blocking confirmation handler cannot

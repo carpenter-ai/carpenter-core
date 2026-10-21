@@ -1,7 +1,8 @@
 """Operator approval page and decide route for a chat-requested install.
 
 The second half of the two-phase flow a chat agent uses to get a package
-installed (DESIGN D11).  :mod:`carpenter.packages.install_requests` has
+installed (D11 in ``docs/2026-10-21_package-remote-sources-design.md``).
+:mod:`carpenter.packages.install_requests` has
 already resolved, fetched into quarantine and statically previewed the
 sources, and written a ``pending_package_installs`` row; this module
 puts that row in front of a human and records what they decide.

@@ -1,6 +1,7 @@
 """Perform an approved package install — out of the model turn.
 
-This is the second half of the two-phase chat install (D11).  The first
+This is the second half of the two-phase chat install (D11 in
+``docs/2026-10-21_package-remote-sources-design.md``).  The first
 half (:mod:`carpenter.packages.install_requests`) fetched the trees into
 quarantine, previewed them without executing anything, and wrote a
 ``pending_package_installs`` row; a human then approved that row and

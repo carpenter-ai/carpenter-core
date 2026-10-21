@@ -1,7 +1,8 @@
 """Build a package-install request: resolve, fetch, preview, record, URL.
 
 This is the first half of the two-phase flow a chat agent uses to get a
-package installed (DESIGN D11).  It does everything that can be done
+package installed (D11 in ``docs/2026-10-21_package-remote-sources-design.md``).
+It does everything that can be done
 *without* anyone's consent — resolve the source specs, fetch the bytes
 into quarantine, describe what is in them, write the pending row — and
 then stops, handing back a one-time URL for a human to decide on.  The

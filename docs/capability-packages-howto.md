@@ -123,19 +123,47 @@ registry at server-start, not by the manifest itself.
 
 ### 3.1 Install (operator action)
 
-The operator calls the `install_package` chat tool.  The chat agent
-asks for human confirmation; on approval, the platform:
+There are two paths, and both end in the same five steps. Where a
+package may come from, and how its bytes are fetched and authorised, is
+[`docs/package-sources.md`](package-sources.md); this section is only
+about what installing *does*.
 
-1. Reads `~/repos/carpenter-packages/packages/<source-name>/`.
+**From a terminal** — `python3 -m carpenter packages install <spec>`.
+The operator is on a tty, so the trust-ack for a package declaring
+`platform_capabilities` can be obtained interactively (or with
+`--accept-capabilities`).
+
+**From chat** — the agent calls `request_package_install(sources=[...])`,
+which fetches into a quarantine, previews the package *without executing
+any of its code*, and returns a one-time link. A human approves there,
+and the platform installs afterwards on the work queue, with no model in
+the loop. The agent cannot install anything itself.
+
+> The older `install_package` chat tool is **operator-only and
+> unreachable on a platform that registers no confirmation handler** —
+> which is every platform package today. It is stripped from the chat
+> agent's tool set in that case, so it is not an install path; use
+> `request_package_install`.
+
+Either way, the platform then:
+
+1. Resolves the source and, for a remote one, fetches it into a
+   quarantine directory that is on no registry search path.
 2. Validates the manifest (schema + security invariants — see §6).
 3. Computes a deterministic SHA-256 over the package tree.
 4. Atomically swaps the validated tree into
-   `~/carpenter/packages/<name>/`.
-5. Records the install in `installed_packages` (with the hash) and
-   declared template names in `installed_packages_templates`.
+   `{base_dir}/packages/<name>/`.
+5. Records the install in `installed_packages` — with the hash and the
+   [source provenance](package-sources.md#6-provenance-hot-load-and-upgrades) —
+   and declared template names in `installed_packages_templates`.
 
-The package source-tree in `carpenter-packages` is **not** auto-loaded.
-Only `~/carpenter/packages/` is on the registry's search path.
+A local package source-tree is **not** auto-loaded. Only
+`{base_dir}/packages/` is on the registry's search path.
+
+A package installed for the first time in this process is registered
+**live**, without a restart; a re-install of a package whose modules are
+already imported reports `needs_restart` honestly rather than serving the
+old module bodies.
 
 ### 3.2 Server start (every restart)
 
@@ -514,6 +542,15 @@ D24 stage 3c (planned): KB-article seeding into a package-scoped
 namespace, and trigger-subscription wiring through the trigger
 dispatch.  Today those manifest fields are still declaration-only.
 
+**Upgrading an installed package.**
+`python3 -m carpenter packages update <name>` re-fetches the source the
+install recorded, at its *ref* rather than the commit it was pinned to,
+and three-way merges the new version against the operator's edits to the
+installed tree.  A file both sides changed is a conflict that refuses the
+update unless `--accept-conflicts` is given, and capability grants and
+trigger subscriptions survive the swap.  Details and the no-anchor case:
+[`docs/package-sources.md`](package-sources.md#upgrades).
+
 ---
 
 ## 8. Where to look in the platform
@@ -527,7 +564,21 @@ dispatch.  Today those manifest fields are still declaration-only.
 - `carpenter/security/judge.py` — dispatch wrapper that consults the
   package handler registry before falling back to the platform JUDGE.
 - `config_seed/chat_tools/packages.py` — `install_package` /
-  `uninstall_package` chat-tool entrypoints.
+  `uninstall_package` chat-tool entrypoints (operator-only; see the note
+  in §3.1).
+- `config_seed/chat_tools/packages_install_request.py` —
+  `request_package_install` / `list_available_packages`, the path a chat
+  agent actually has.
+- `carpenter/packages/{sources,fetch,fetch_git,fetch_archive}.py` —
+  where a package may come from and how its bytes arrive.
+- `carpenter/packages/{static_preview,install_requests,pending_install}.py`
+  and `carpenter/api/package_install.py` — the pre-consent preview and
+  the operator approval flow.
+- `carpenter/packages/{update,discover,reload}.py` — upgrade, listing a
+  remote source, and live load.
+
+[`docs/package-sources.md`](package-sources.md) covers remote sources,
+the operator approval flow, provenance and upgrades.
 
 For deeper background:
 [`docs/2026-05-01_d24-package-untrusted-templates-plan.md`](2026-05-01_d24-package-untrusted-templates-plan.md)

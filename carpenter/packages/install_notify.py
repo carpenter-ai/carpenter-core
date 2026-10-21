@@ -15,7 +15,7 @@ and the web UI renders a non-hidden system message from its
 the price of one INSERT.  That is the whole design: re-invoking the
 chat agent to have it relay the news — what ``arc_notify_handler`` does
 for arcs — costs a model call per approval, every approval, and buys a
-paraphrase of a report that is already exact (D12).  The re-invocation
+paraphrase of a report that is already exact.  The re-invocation
 exists behind ``package_install.notify_agent``, default **false**, for
 an operator who wants the agent to act on the result; nothing in this
 package turns it on.
@@ -233,8 +233,8 @@ async def _reinvoke_agent(
     """Re-invoke the chat agent on the outcome — only if asked to.
 
     Off by default and never called otherwise.  It costs one model call
-    per approved install, which is exactly the cost D12 refuses to pay
-    for a notification the platform can render itself.
+    per approved install, which is exactly the cost this module exists
+    to avoid for a notification the platform can render itself.
     """
     logger.warning(
         "Package install request %s: package_install.notify_agent is on, "
