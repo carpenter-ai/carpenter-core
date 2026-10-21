@@ -34,6 +34,7 @@ request_package_install(sources=["git+https://forge.example/org/packages.git@<co
 - Prefer the spec string a listing gave you: it pins the exact revision the listing was read from, so the person approving sees the same bytes you described.
 - A credential for a private source comes from the platform, by the variable name the source declares. A package can never supply one, and it is never persisted or logged.
 - A package already loaded in this process needs a restart before a reinstall takes effect; a newly installed one can be loaded live.
+- An operator at a terminal can install the same spec directly with `python3 -m carpenter packages install <spec>`. It fetches through the same gate, caps and quarantine, records the same provenance, and mints no approval link — the person running it is the human this flow exists to ask. Suggest it when someone says they have terminal access; it is not a way for you to install anything.
 
 ## Related
 [[security/trust-boundaries]] · [[self-modification/config-tools]] · [[web/trust-warning]]

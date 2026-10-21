@@ -3,10 +3,10 @@
 Provides ``python3 -m carpenter packages <subcommand>`` with four
 subcommands:
 
-* ``install <source_name>`` (or ``--path <dir>``) — install a capability
-  package, previewing the manifest and (for packages declaring
-  ``platform_capabilities``) gating the install on PLATFORM-LEVEL TRUST
-  consent.
+* ``install <spec>`` (or ``--path <dir>``) — install a capability
+  package from a local directory **or a remote source**, previewing the
+  manifest and (for packages declaring ``platform_capabilities``) gating
+  the install on PLATFORM-LEVEL TRUST consent.
 * ``update <name>`` — re-fetch the source the install recorded, at its
   ref, and apply it: a three-way merge that keeps the operator's edits
   to the installed tree where it can, reports the conflicts it cannot
@@ -24,6 +24,49 @@ on a tty and can therefore obtain the explicit consent the trust-ack
 requires (interactively, or via the explicit ``--accept-capabilities``
 flag).
 
+**What ``install`` accepts** is exactly the grammar of
+:mod:`carpenter.packages.sources`, with no CLI-only subset:
+
+* a bare package name, resolved through the configured
+  ``package_sources`` (declaration order IS search order) and otherwise
+  through the legacy local source tree — either of which may be remote;
+* an absolute path or ``file://`` URL naming a package directory, which
+  is also what ``--path`` takes;
+* ``git+https://host/org/repo.git[@ref][#subdir=rel/path]``;
+* ``https://host/path/pkg.tar.gz[#sha256=<64 lowercase hex>]`` (``.tgz``
+  and ``.tar`` too).
+
+A remote spec is materialised by
+:func:`carpenter.packages.fetch.fetch_source` — the one fetch entry
+point, which owns the ``web_egress_allowlist`` gate, the per-call
+quarantine under ``{base_dir}/cache/package-staging``, the resource caps
+(:func:`carpenter.packages.install_requests.limits_for`), credential
+injection by variable name and the tree hardening — and the package is
+installed from that quarantined tree, which is removed again on **every**
+exit path: success, refusal, failure or ``KeyboardInterrupt``.  Nothing
+about fetching, extracting, hardening or hashing is reimplemented here.
+
+Two things that are deliberately *not* here.  There is **no approval
+link**: the operator at this terminal is the human the chat path's
+approval page exists to ask, so the preview plus the consent prompts
+below are the whole gate, and the pending-request machinery is not
+imported.  And the preview is built with
+:func:`carpenter.packages.static_preview.inspect_package_chat_tools` —
+an ``ast.parse``, never
+``installer.classify_package_chat_tools``, which imports the package's
+modules.  For a tree the operator has not yet consented to, importing it
+would run remote code *before* the prompt meant to inform them; see the
+module docstring of :mod:`carpenter.packages.install_requests`, which is
+careful about the same thing.
+
+Provenance is recorded exactly as the approved-install path records it
+(``source_kind`` / ``source_url`` redacted / ``source_ref`` /
+``source_resolved`` / ``source_subdir`` / ``source_id`` / ``fetched_at``
+/ ``shipped_hash``), because they are the same
+:func:`carpenter.packages.installer.install_package` call with the same
+``provenance`` and ``resolved`` arguments.  A CLI install is therefore
+updatable: ``packages update`` rebuilds its spec from those columns.
+
 The command functions take an ``argv`` list (matching the dispatch style
 of :func:`carpenter.__main__._cmd_setup_credential`) and return an int
 exit code, so they are directly unit-testable without a subprocess.
@@ -33,8 +76,17 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
+from contextlib import contextmanager
 from pathlib import Path
+
+#: A leading URL scheme, used only to tell an operator who passed a
+#: remote source to ``--path`` which flag they wanted.  The grammar in
+#: :mod:`carpenter.packages.sources` remains the only authority on what
+#: a spec means; this just avoids resolving ``git+https://…`` as a
+#: relative directory and reporting "directory not found".
+_SCHEME_RE = re.compile(r"^(?:git\+)?[A-Za-z][A-Za-z0-9+.\-]*://")
 
 
 # ── source / dest path conventions ──────────────────────────────────
@@ -46,19 +98,61 @@ from pathlib import Path
 # disagreed about ``base_dir``).
 
 
+def _spec_for(source_name: str | None, path: str | None):
+    """Parse what the operator named into a canonical ``SourceSpec``.
+
+    One parse for both routes, and the result is both the thing that is
+    fetched and the provenance that is recorded — so the install row can
+    never describe a different source from the one the bytes came from.
+
+    ``--path`` is resolved to an absolute path first and then parsed as a
+    local spec, which is what makes ``--path ./pkg`` and the absolute
+    path it expands to one source with one ``source_id``.
+
+    Args:
+        source_name: The positional spec, or ``None`` when ``--path``
+            was used.
+        path: The ``--path`` value, or ``None``.
+
+    Returns:
+        A :class:`carpenter.packages.sources.SourceSpec`.  Its ``kind``
+        is what decides whether anything is fetched.
+
+    Raises:
+        SourceSpecError: the spec is not one of the accepted forms, or
+            ``--path`` was given a remote source.  The message states
+            the accepted forms, or names the argument that takes one.
+    """
+    from .packages.sources import SourceSpecError, parse_source
+
+    if not path:
+        return parse_source(source_name or "")
+
+    text = path.strip()
+    if text.lower().startswith("file://"):
+        # A local directory written as a URL: the grammar handles it, and
+        # resolving it as a filesystem path would mangle it.
+        return parse_source(text)
+    if _SCHEME_RE.match(text):
+        raise SourceSpecError(
+            f"--path takes a local directory, and {text!r} names a "
+            f"remote source. Pass it as the positional <source> argument "
+            f"instead, which does fetch a remote source.",
+        )
+    return parse_source(str(Path(text).expanduser().resolve()))
+
+
 def _source_dir_for(source_name: str) -> Path:
     """Resolve a source spec to a local package directory.
 
-    Delegates to :func:`carpenter.packages.sources.parse_source`, so the
-    accepted forms are exactly the documented grammar (a bare name
-    resolves through the operator's configured sources and otherwise
-    falls back to the local source tree).
+    Kept for callers that only want the local case (and for symmetry
+    with the pre-remote CLI).  A remote spec has no directory until it
+    is fetched, so it is refused here rather than guessed at — the
+    install path uses :func:`_spec_for` and fetches instead.
 
     Raises:
         SourceSpecError: the spec is not valid, or it resolves to a
-            remote source — fetching those is not wired up yet, so the
-            operator is told that plainly rather than left with a
-            confusing "directory not found".
+            remote source, which has no local directory to name.
     """
     from .packages.sources import SourceSpecError, describe, parse_source
 
@@ -66,10 +160,52 @@ def _source_dir_for(source_name: str) -> Path:
     if spec.kind != "local" or spec.path is None:
         raise SourceSpecError(
             f"source {spec.raw!r} resolves to a remote source "
-            f"({describe(spec)}); installing from a remote source is not "
-            f"supported yet. Use a local directory with --path.",
+            f"({describe(spec)}), which has no local directory until it "
+            f"is fetched",
         )
     return spec.path
+
+
+@contextmanager
+def _fetched(spec):
+    """Fetch a remote ``spec`` into quarantine and always clean it up.
+
+    Delegates wholly to :func:`carpenter.packages.fetch.fetch_source`,
+    which is the only thing in the platform that reaches a package
+    source: it runs the ``web_egress_allowlist`` gate before any
+    fetcher, creates the per-call quarantine under
+    ``{base_dir}/cache/package-staging``, enforces the
+    :class:`~carpenter.packages.fetch.FetchLimits` this CLI takes from
+    :func:`carpenter.packages.install_requests.limits_for` (one set of
+    numbers for both install paths, not two), injects a configured
+    source's ``credential_ref`` by variable name, and hardens the tree.
+
+    The quarantine is removed in a ``finally``, so it goes whether the
+    install succeeded, was refused, raised, or the operator pressed
+    ctrl-c at a consent prompt.  A *failed* fetch leaves nothing to
+    remove — the dispatcher deletes its own quarantine before raising —
+    so this contract holds on that path too.
+
+    Yields:
+        The :class:`~carpenter.packages.fetch.FetchResult`.
+
+    Raises:
+        FetchError: the egress gate refused the destination, a cap was
+            exceeded, or the fetch failed.  The message is the
+            dispatcher's or the fetcher's own; it already names the host
+            and the config key when the gate was the refusal, and is
+            quoted rather than reworded.
+    """
+    from .packages import fetch as fetch_mod
+    from .packages.install_requests import limits_for
+    from .packages.sources import describe
+
+    print(f"  Fetching {describe(spec)} ...", file=sys.stderr)
+    result = fetch_mod.fetch_source(spec, limits=limits_for())
+    try:
+        yield result
+    finally:
+        fetch_mod.cleanup(result)
 
 
 def _install_destination_for(name: str) -> Path:
@@ -99,10 +235,24 @@ def _print_manifest_preview(
     *,
     stream,
     static=None,
+    source=None,
+    resolved: str = "",
+    fetched=None,
 ) -> None:
     """Print a human-readable summary of what installing this package does.
 
     Args:
+        source: optional :class:`carpenter.packages.sources.SourceSpec`
+            the tree came from.  Given, the preview names the source,
+            what the fetch resolved to (git commit sha40 or archive
+            sha256) and what it transferred, so the operator decides
+            about *these* bytes from *that* remote rather than about a
+            package name.  Built from the canonical, credential-free
+            fields, so it can never print a token.
+        resolved: What pins the fetched bytes, from
+            :attr:`carpenter.packages.fetch.FetchResult.resolved`.
+        fetched: Optional :class:`~carpenter.packages.fetch.FetchResult`,
+            for the transferred byte/file counts.
         static: optional
             :class:`carpenter.packages.static_preview.StaticPreview`.
             When provided, the preview enumerates the package's chat
@@ -124,6 +274,18 @@ def _print_manifest_preview(
     desc = (manifest.description or "").strip().splitlines()
     if desc:
         p(f"  About   : {desc[0]}")
+    if source is not None:
+        from .packages.sources import describe
+
+        p(f"  Source  : {describe(source)}")
+        if resolved:
+            p(f"  Resolved: {resolved}")
+        if fetched is not None and fetched.staging is not None:
+            p(
+                f"  Fetched : {fetched.bytes_fetched} byte(s) in "
+                f"{fetched.files_fetched} file(s), into a quarantine that "
+                f"is removed when this command exits"
+            )
     p("")
     p("  Contributes:")
     p(f"    chat tools           : {len(manifest.chat_tools)}")
@@ -226,31 +388,41 @@ def _print_manifest_preview(
 
 
 def _cmd_install(argv: list[str]) -> int:
-    """Handle: python3 -m carpenter packages install <source_name|--path dir>."""
-    from .db import db_transaction
-    from .packages import installer, static_preview
-    from .packages.manifest import ManifestError, load_manifest
-    from .packages.security import PackageSecurityError
-
+    """Handle: python3 -m carpenter packages install <spec|--path dir>."""
     parser = argparse.ArgumentParser(
         prog="python3 -m carpenter packages install",
         description=(
-            "Install a capability package. A bare <source_name> resolves "
-            "through the configured package sources (config "
-            "package_sources, in list order) and otherwise falls "
-            "back to ~/repos/carpenter-packages/packages/<source_name>/; "
-            "the package installs to <base_dir>/packages/<manifest_name>/."
+            "Install a capability package from a local directory or a "
+            "remote source. Accepted forms for <source>: a bare package "
+            "name, resolved through the configured package sources "
+            "(config package_sources, in list order) and otherwise under "
+            "~/repos/carpenter-packages/packages/<name>/; an absolute "
+            "path or file:// URL naming a package directory; "
+            "git+https://host/org/repo.git[@ref][#subdir=rel/path]; or "
+            "https://host/path/pkg.tar.gz[#sha256=<64 lowercase hex>] "
+            "(.tgz and .tar too). Plain http:// is accepted only for a "
+            "loopback host. A remote source is fetched into a quarantine "
+            "under <base_dir>/cache/package-staging/, which is removed "
+            "again however this command exits; its host must be listed in "
+            "the web_egress_allowlist config key. The package installs to "
+            "<base_dir>/packages/<manifest_name>/ either way, and the "
+            "source is recorded so `packages update` can re-fetch it."
         ),
     )
     parser.add_argument(
-        "source_name", nargs="?",
-        help="Package name, resolved through the configured package sources "
-             "and otherwise under ~/repos/carpenter-packages/packages/.",
+        "source_name", nargs="?", metavar="source",
+        help="Package source: a bare name (resolved through the configured "
+             "package sources, else under "
+             "~/repos/carpenter-packages/packages/), an absolute path or "
+             "file:// URL, git+https://host/org/repo.git[@ref]"
+             "[#subdir=rel/path], or https://host/path/pkg.tar.gz"
+             "[#sha256=<64 hex>].",
     )
     parser.add_argument(
         "--path",
-        help="Install from an explicit source directory instead of the "
-             "conventional source repo location.",
+        help="Install from an explicit local source directory. Equivalent "
+             "to naming that directory as <source>; it accepts no remote "
+             "form.",
     )
     parser.add_argument(
         "--accept-capabilities", action="store_true",
@@ -271,30 +443,83 @@ def _cmd_install(argv: list[str]) -> int:
 
     if bool(args.path) == bool(args.source_name):
         print(
-            "ERROR: provide exactly one of <source_name> or --path <dir>.",
+            "ERROR: provide exactly one of <source> or --path <dir>.",
             file=sys.stderr,
         )
         return 2
 
-    from .packages.sources import SourceSpecError, parse_source
+    from .packages.fetch import FetchError
+    from .packages.sources import SourceSpecError
 
     try:
-        source_path = (
-            Path(args.path).expanduser().resolve()
-            if args.path
-            else _source_dir_for(args.source_name)
-        )
+        spec = _spec_for(args.source_name, args.path)
     except SourceSpecError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 
-    # Provenance for the install record.  Both routes are local
-    # directories here; parsing the resolved path gives the install a
-    # canonical spec (kind, resolved path, stable source id) to record.
+    # A local source is the operator's own tree and the trust anchor for
+    # the install: it is read in place, nothing is fetched and nothing is
+    # quarantined (``LocalDirectoryFetcher`` would copy nothing either).
+    if spec.kind == "local":
+        return _install_from_tree(
+            Path(spec.path or ""), spec=spec, resolved="", args=args,
+        )
+
+    # A remote source: one fetch, through the one fetch entry point, and
+    # the quarantine goes on every exit path including a ctrl-c at a
+    # consent prompt.  No approval link is minted — the operator at this
+    # terminal is the human that flow exists to ask.
     try:
-        provenance = parse_source(str(source_path))
-    except SourceSpecError:  # pragma: no cover — a resolved path always parses
-        provenance = None
+        with _fetched(spec) as fetched:
+            return _install_from_tree(
+                Path(fetched.tree), spec=spec,
+                resolved=fetched.resolved, args=args, fetched=fetched,
+            )
+    except FetchError as exc:
+        # Quoted, not reworded: the dispatcher's egress refusal already
+        # names the host and the web_egress_allowlist key that fixes it,
+        # and a fetcher's cap refusal names the cap it hit.
+        print(
+            f"ERROR: could not fetch {spec.raw!r}: {exc}", file=sys.stderr,
+        )
+        return 1
+
+
+def _install_from_tree(
+    source_path: Path, *, spec, resolved: str, args, fetched=None,
+) -> int:
+    """Preview, consent to, and install the package tree at ``source_path``.
+
+    The one install body for both routes: ``source_path`` is either the
+    operator's own directory or the quarantined tree a fetch produced,
+    and from here on they are treated identically — same preview, same
+    consent gates, same installer call, same provenance columns.  That
+    sameness is the point: a CLI install from a remote must not produce a
+    row ``packages update`` cannot use, and it cannot, because ``spec``
+    and ``resolved`` go straight to
+    :func:`carpenter.packages.installer.install_package`, exactly as
+    :mod:`carpenter.packages.install_batch` passes them after an approved
+    fetch.
+
+    Args:
+        source_path: The package root (the directory holding
+            ``manifest.yaml``).
+        spec: The :class:`~carpenter.packages.sources.SourceSpec` the
+            tree came from, recorded as provenance.
+        resolved: Git commit sha40 or archive sha256; ``""`` for local.
+        args: The parsed ``install`` arguments.
+        fetched: The :class:`~carpenter.packages.fetch.FetchResult`, for
+            the preview's transfer counts.  ``None`` for a local source.
+
+    Returns:
+        The process exit code.
+    """
+    from .db import db_transaction
+    from .packages import installer, static_preview
+    from .packages.manifest import ManifestError, load_manifest
+    from .packages.security import PackageSecurityError
+
+    provenance = spec
 
     if not source_path.is_dir():
         print(
@@ -330,6 +555,10 @@ def _cmd_install(argv: list[str]) -> int:
 
     _print_manifest_preview(
         manifest, pkg_hash, stream=sys.stderr, static=static,
+        # A local source needs no provenance line: the operator is
+        # standing in the directory they named.  A remote one does.
+        source=spec if spec.kind != "local" else None,
+        resolved=resolved, fetched=fetched,
     )
 
     dest_path = _install_destination_for(manifest.name)
@@ -438,7 +667,14 @@ def _cmd_install(argv: list[str]) -> int:
                 capability_input_fn=capability_input_fn,
                 capability_prompt_stream=sys.stderr,
                 allow_write_chat_tools=allow_write_chat_tools,
+                # The provenance the install row records, and the pin of
+                # the bytes it records it for.  Together with
+                # ``shipped_hash`` (which install_package sets from the
+                # tree hash) this is the whole of what ``packages
+                # update`` later rebuilds its source spec from, and what
+                # keys the pristine-archive cache by logical source.
                 provenance=provenance,
+                resolved=resolved,
             )
     except (installer.InstallError, ManifestError, PackageSecurityError) as exc:
         print(f"ERROR: install failed: {exc}", file=sys.stderr)
@@ -450,6 +686,17 @@ def _cmd_install(argv: list[str]) -> int:
         f"{verb} {result.name} v{result.version} "
         f"(hash {result.hash[:12]}) at {result.dest_path}"
     )
+
+    if spec.kind != "local":
+        from .packages.sources import describe
+
+        print(f"  Source   : {describe(spec)}")
+        if resolved:
+            print(f"  Resolved : {resolved}")
+        print(
+            f"  The source is recorded, so `python3 -m carpenter packages "
+            f"update {result.name}` re-fetches it at its ref."
+        )
 
     if result.platform_capabilities_granted:
         print("")
@@ -868,11 +1115,30 @@ def cmd_packages(argv: list[str]) -> int:
             "usage: python3 -m carpenter packages <command> [options]\n"
             "\n"
             "commands:\n"
-            "  install <source_name> [--path DIR] [--accept-capabilities] "
+            "  install <source> [--accept-capabilities] "
+            "[--allow-write-chat-tools]\n"
+            "  install --path DIR [--accept-capabilities] "
             "[--allow-write-chat-tools]\n"
             "  update <name> [--yes] [--accept-conflicts]\n"
             "  uninstall <name> [--force] [--preserve-state]\n"
-            "  list\n",
+            "  list\n"
+            "\n"
+            "<source> for install is one of:\n"
+            "  <name>                       a bare package name, resolved "
+            "through the\n"
+            "                               configured package_sources, "
+            "else the local\n"
+            "                               source tree\n"
+            "  /abs/path | file:///abs/path a local package directory "
+            "(same as --path)\n"
+            "  git+https://host/org/repo.git[@ref][#subdir=rel/path]\n"
+            "  https://host/path/pkg.tar.gz[#sha256=<64 hex>]   (.tgz, "
+            ".tar too)\n"
+            "\n"
+            "A remote source is fetched into a quarantine that is removed "
+            "when the\n"
+            "command exits; its host must be in the web_egress_allowlist "
+            "config key.\n",
             file=sys.stderr if (argv and argv[0] not in ("-h", "--help"))
             else sys.stdout,
         )

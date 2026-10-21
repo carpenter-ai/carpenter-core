@@ -31,6 +31,26 @@ from carpenter.packages.installer import (
 from carpenter.packages.manifest import load_manifest
 
 
+def _local_spec_resolver(resolve):
+    """A ``cli_packages._spec_for`` stand-in naming a local tree.
+
+    The CLI resolves a source spec once and uses the result both as the
+    thing to fetch and as the provenance to record, so a test that wants
+    the install pointed at its own directory substitutes that one
+    resolution.  ``kind="local"`` is what keeps these tests on the
+    read-in-place path with no fetch.
+    """
+    from carpenter.packages.sources import SourceSpec
+
+    def _spec_for(source_name, path):
+        return SourceSpec(
+            kind="local", raw=str(source_name),
+            path=Path(resolve(source_name)),
+        )
+
+    return _spec_for
+
+
 # A package with BOTH a read-only chat tool and a write-capable
 # (arc_create) chat tool.
 MIXED_TOOLS_PY = """\
@@ -329,7 +349,8 @@ class TestCliInstallPreview:
 
         src_root = self._src_root(tmp_path)
         monkeypatch.setattr(
-            cli_packages, "_source_dir_for", lambda n: src_root / n,
+            cli_packages, "_spec_for",
+            _local_spec_resolver(lambda n: src_root / n),
         )
         monkeypatch.setattr(
             cli_packages, "_install_destination_for",
@@ -360,7 +381,8 @@ class TestCliInstallPreview:
 
         src_root = self._src_root(tmp_path)
         monkeypatch.setattr(
-            cli_packages, "_source_dir_for", lambda n: src_root / n,
+            cli_packages, "_spec_for",
+            _local_spec_resolver(lambda n: src_root / n),
         )
         monkeypatch.setattr(
             cli_packages, "_install_destination_for",
@@ -377,7 +399,8 @@ class TestCliInstallPreview:
 
         src_root = self._src_root(tmp_path)
         monkeypatch.setattr(
-            cli_packages, "_source_dir_for", lambda n: src_root / n,
+            cli_packages, "_spec_for",
+            _local_spec_resolver(lambda n: src_root / n),
         )
         monkeypatch.setattr(
             cli_packages, "_install_destination_for",
@@ -408,7 +431,7 @@ class TestCliInstallPreview:
             Path(__file__).parent / "fixtures" / "hostile_preview_pkg"
         )
         monkeypatch.setattr(
-            cli_packages, "_source_dir_for", lambda n: fixture,
+            cli_packages, "_spec_for", _local_spec_resolver(lambda n: fixture),
         )
         monkeypatch.setattr(
             cli_packages, "_install_destination_for",
@@ -441,7 +464,8 @@ class TestCliInstallPreview:
         src_root = tmp_path / "dyn_root"
         _make_source(src_root, "dyncaps", DYNCAPS_MANIFEST, DYNCAPS_TOOLS_PY)
         monkeypatch.setattr(
-            cli_packages, "_source_dir_for", lambda n: src_root / n,
+            cli_packages, "_spec_for",
+            _local_spec_resolver(lambda n: src_root / n),
         )
         monkeypatch.setattr(
             cli_packages, "_install_destination_for",
@@ -475,7 +499,8 @@ class TestCliInstallPreview:
         )
         (pkg / "broken.py").write_text("def nope(:\n    pass\n")
         monkeypatch.setattr(
-            cli_packages, "_source_dir_for", lambda n: src_root / n,
+            cli_packages, "_spec_for",
+            _local_spec_resolver(lambda n: src_root / n),
         )
         monkeypatch.setattr(
             cli_packages, "_install_destination_for",
@@ -501,7 +526,8 @@ class TestCliInstallPreview:
         src_root = tmp_path / "dyn_root"
         _make_source(src_root, "dyncaps", DYNCAPS_MANIFEST, DYNCAPS_TOOLS_PY)
         monkeypatch.setattr(
-            cli_packages, "_source_dir_for", lambda n: src_root / n,
+            cli_packages, "_spec_for",
+            _local_spec_resolver(lambda n: src_root / n),
         )
         monkeypatch.setattr(
             cli_packages, "_install_destination_for",
@@ -519,7 +545,8 @@ class TestCliInstallPreview:
         src_root = tmp_path / "dyn_root"
         _make_source(src_root, "dyncaps", DYNCAPS_MANIFEST, DYNCAPS_TOOLS_PY)
         monkeypatch.setattr(
-            cli_packages, "_source_dir_for", lambda n: src_root / n,
+            cli_packages, "_spec_for",
+            _local_spec_resolver(lambda n: src_root / n),
         )
         monkeypatch.setattr(
             cli_packages, "_install_destination_for",

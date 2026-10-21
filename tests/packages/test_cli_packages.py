@@ -291,11 +291,24 @@ class TestSourceResolution:
         )
         assert (installed / "manifest.yaml").is_file()
 
-    def test_remote_bare_name_is_refused_with_a_clear_error(
+    def test_a_bare_name_may_now_resolve_to_a_remote_source(
         self, test_db, monkeypatch, capsys,
     ):
-        from carpenter import config
+        """A configured remote source is FETCHED, not refused for being one.
 
+        The stopping point here is the egress gate rather than a
+        CLI-level "remote is not supported": the host resolves to a
+        private address through the guard's own resolver seam, so the
+        refusal arrives without any network contact, and it names the
+        host and the config key that would allow it.
+        """
+        from carpenter import config
+        from carpenter.security import egress
+
+        monkeypatch.setattr(
+            egress, "_resolve_host", lambda host, port: ["10.0.0.7"],
+        )
+        monkeypatch.setitem(config.CONFIG, "web_egress_allowlist", [])
         monkeypatch.setitem(config.CONFIG, "package_sources", [{
             "name": "house",
             "url": "git+https://forge.example/org/pkgs.git",
@@ -304,9 +317,23 @@ class TestSourceResolution:
         rc = cli_packages.cmd_packages(["install", "plainpkg"])
         assert rc == 1
         err = capsys.readouterr().err
-        assert "remote source" in err
         assert "forge.example" in err
-        assert "--path" in err
+        assert "web_egress_allowlist" in err
+
+    def test_source_dir_for_still_refuses_a_remote_spec(
+        self, test_db, monkeypatch,
+    ):
+        """The local-only helper has no directory to give for a remote."""
+        from carpenter import config
+        from carpenter.packages.sources import SourceSpecError
+
+        monkeypatch.setitem(config.CONFIG, "package_sources", [{
+            "name": "house",
+            "url": "git+https://forge.example/org/pkgs.git",
+        }])
+        with pytest.raises(SourceSpecError) as exc:
+            cli_packages._source_dir_for("plainpkg")
+        assert "remote source" in str(exc.value)
 
     def test_malformed_source_spec_is_refused(self, test_db, capsys):
         rc = cli_packages.cmd_packages(["install", "Not A Name"])
