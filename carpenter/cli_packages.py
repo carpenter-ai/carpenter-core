@@ -1,6 +1,6 @@
 """Operator CLI for capability-package management.
 
-Provides ``python3 -m carpenter packages <subcommand>`` with four
+Provides ``python3 -m carpenter packages <subcommand>`` with five
 subcommands:
 
 * ``install <spec>`` (or ``--path <dir>``) — install a capability
@@ -18,6 +18,13 @@ subcommands:
 * ``uninstall <name>`` — remove an installed package (dir + DB rows +
   capability grants).
 * ``list`` — show installed packages and their granted capability verbs.
+* ``verify [<name>]`` — recompute the installed tree's hash and compare
+  it with the one the install recorded, for one package or for every
+  installed package, exiting nonzero if any fails.  It reports and
+  repairs nothing, which is the point: it is what the platform's own
+  recovery messages tell an operator to run when a package install was
+  rolled back, failed to roll back, or was interrupted by a restart, and
+  those messages were naming a subcommand that did not exist.
 
 This fills the gap left by the chat-tool ``install_package``: that tool
 passes no ``capability_input_fn``, so a package that declares
@@ -1139,6 +1146,76 @@ def _cmd_list(argv: list[str]) -> int:
     return 0
 
 
+# ── verify ──────────────────────────────────────────────────────────
+
+
+def _cmd_verify(argv: list[str]) -> int:
+    """Handle: python3 -m carpenter packages verify [<name>]."""
+    from .db import db_connection
+    from .packages import installer
+
+    parser = argparse.ArgumentParser(
+        prog="python3 -m carpenter packages verify",
+        description=(
+            "Verify installed capability packages: recompute each one's "
+            "tree hash and compare it with the hash its install "
+            "recorded. Checks the named package, or every installed "
+            "package when no name is given. Nothing is written and "
+            "nothing is repaired — this is the read-only check the "
+            "platform's own loader applies at startup, which refuses to "
+            "load a package whose tree does not match its row. Exits "
+            "nonzero when any package fails, so a script can gate on it."
+        ),
+    )
+    parser.add_argument(
+        "name", nargs="?",
+        help="Installed package name (manifest 'name' field). Omitted, "
+             "every installed package is verified.",
+    )
+    args = parser.parse_args(argv)
+
+    with db_connection() as db:
+        if args.name:
+            names = [args.name]
+        else:
+            names = [r["name"] for r in installer.list_install_records(db)]
+            if not names:
+                print("No capability packages installed.")
+                return 0
+        # One connection for the whole sweep, as `list` does: a verify
+        # is a snapshot of what is installed right now.
+        results = [installer.verify_install(n, conn=db) for n in names]
+
+    name_w = max([len("NAME")] + [len(r.name) for r in results])
+    print(f"{'NAME':<{name_w}}  {'STATUS':<6}  DETAIL")
+    for r in results:
+        detail = (
+            f"hash {(r.actual_hash or '')[:12]} matches the install record"
+            if r.ok else r.message
+        )
+        print(f"{r.name:<{name_w}}  {'OK' if r.ok else 'FAILED':<6}  {detail}")
+
+    failed = [r for r in results if not r.ok]
+    print("")
+    if not failed:
+        print(f"  {len(results)} package(s) verified.")
+        return 0
+    print(
+        f"  {len(failed)} of {len(results)} package(s) FAILED "
+        f"verification, and the registry will NOT load them."
+    )
+    print(
+        "  A hash mismatch means the installed tree is no longer the "
+        "tree the row describes: either it was edited in place — "
+        "`packages update <name>` merges your edits into the recorded "
+        "source's current version and re-records the hash — or the "
+        "install is damaged, in which case install it again from its "
+        "source, or uninstall it."
+    )
+    print("")
+    return 1
+
+
 # ── dispatcher ──────────────────────────────────────────────────────
 
 
@@ -1147,6 +1224,7 @@ _SUBCOMMANDS = {
     "update": _cmd_update,
     "uninstall": _cmd_uninstall,
     "list": _cmd_list,
+    "verify": _cmd_verify,
 }
 
 
@@ -1168,6 +1246,7 @@ def cmd_packages(argv: list[str]) -> int:
             "  update <name> [--ref REF] [--yes] [--accept-conflicts]\n"
             "  uninstall <name> [--force] [--preserve-state]\n"
             "  list\n"
+            "  verify [<name>]\n"
             "\n"
             "<source> for install is one of:\n"
             "  <name>                       a bare package name, resolved "

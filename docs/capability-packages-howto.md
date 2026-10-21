@@ -186,6 +186,13 @@ signature), the platform logs the error to `load_errors` on the
 package still load.  Hash verification is the only hard gate — that
 one is fatal for the package as a whole.
 
+That same check runs on demand: `python3 -m carpenter packages verify
+[<name>]` re-hashes one installed package, or every one of them, prints
+what matched and what did not, and exits nonzero if any failed.  It is
+what the platform's own recovery messages point an operator at after an
+install was rolled back, failed to roll back, or was interrupted by a
+restart.
+
 ### 3.3 Uninstall (operator action)
 
 `uninstall_package <name>` checks for blocking arcs, deletes the
