@@ -14,6 +14,7 @@ order changes, or pooling-mask bugs.
 from __future__ import annotations
 
 import math
+import os
 
 import pytest
 
@@ -41,8 +42,46 @@ _GOLDEN: list[tuple[str, list[float]]] = [
 _TOL = 1e-4
 
 
-@pytest.fixture(scope="module")
-def _local_provider() -> LocalEmbeddingProvider:
+#: Where to find a local copy of the model weights, for a run that
+#: wants these vectors checked.  Both backends resolve their weights
+#: under ``base_dir``, which is a fresh temp directory for every test,
+#: so there is no path the suite itself can put them at.
+_WEIGHTS_DIR_ENV = "CARPENTER_TEST_MODEL_DIR"
+
+
+@pytest.fixture
+def _local_provider(monkeypatch) -> LocalEmbeddingProvider:
+    """The provider, or a skip when its weights are not on this machine.
+
+    Both backends load ``all-MiniLM-L6-v2`` from
+    ``{base_dir}/models/`` and **download it from a public CDN** when it
+    is missing.  Every test gets a fresh temp ``base_dir``, so running
+    these golden vectors fetched ~90 MB over the internet on every full
+    suite run — which only ever worked because the machine happened to
+    be online, and is exactly what ``tests/conftest`` now refuses.
+
+    So the weights have to come from the machine: point
+    ``CARPENTER_TEST_MODEL_DIR`` at a directory holding
+    ``models/all-MiniLM-L6-v2/model.safetensors`` to check these
+    vectors.  Without it there is nothing to compute them from, and a
+    skip that says so is the honest outcome — a test that downloads a
+    model is not a test of this repository.
+    """
+    from carpenter import config
+    from carpenter.kb import numpy_inference
+
+    weights_dir = os.environ.get(_WEIGHTS_DIR_ENV, "")
+    if weights_dir:
+        monkeypatch.setitem(config.CONFIG, "base_dir", weights_dir)
+    model_path = numpy_inference._resolve_model_path()
+    if not os.path.isfile(model_path):
+        pytest.skip(
+            f"no all-MiniLM-L6-v2 weights at {model_path}: these golden "
+            f"vectors need the real model, and this suite does not "
+            f"download one. Set {_WEIGHTS_DIR_ENV} to a directory "
+            f"holding models/all-MiniLM-L6-v2/model.safetensors to run "
+            f"them."
+        )
     return LocalEmbeddingProvider()
 
 
@@ -76,7 +115,13 @@ def test_embedding_is_unit_normalised(_local_provider: LocalEmbeddingProvider):
     assert abs(norm - 1.0) < 1e-3
 
 
-def test_dim_is_384(_local_provider: LocalEmbeddingProvider):
-    """The local provider exposes the 384-dim convention."""
-    assert _local_provider.vector_dim == 384
-    assert _local_provider.model_name == "all-MiniLM-L6-v2"
+def test_dim_is_384():
+    """The local provider exposes the 384-dim convention.
+
+    Reads class attributes only, so it deliberately does not take the
+    fixture above: this one needs no weights and must keep running on a
+    machine that has none.
+    """
+    provider = LocalEmbeddingProvider()
+    assert provider.vector_dim == 384
+    assert provider.model_name == "all-MiniLM-L6-v2"

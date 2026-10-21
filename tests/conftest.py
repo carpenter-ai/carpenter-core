@@ -13,7 +13,9 @@ if "TMPDIR" not in os.environ and os.path.isdir("/dev/shm"):
     os.environ["TMPDIR"] = "/dev/shm"
 
 import hashlib
+import ipaddress
 import shutil
+import socket
 import sys
 import tempfile
 import threading
@@ -497,6 +499,15 @@ def _hermetic_egress_resolver(monkeypatch):
     network, so names resolve to a fixed public address here, except
     ``localhost``.  Numeric hosts never reach the resolver.  Tests of
     the guard itself substitute their own resolver.
+
+    The address has to be a globally routable one: the guard refuses
+    anything whose ``ipaddress`` form is not ``is_global``, so handing
+    back a private or documentation address (``192.0.2.1`` included)
+    would make the guard REFUSE ``example.com`` and break every web-tool
+    test that needs it to pass.  Which means this fixture makes a
+    placeholder host look reachable, and the address it names is real.
+    That is harmless only as long as nothing actually connects —
+    :func:`_no_outbound_connections` is what keeps it that way.
     """
     def _fake_resolve(host, port):
         if host.lower() in ("localhost", "localhost.localdomain"):
@@ -506,6 +517,106 @@ def _hermetic_egress_resolver(monkeypatch):
     monkeypatch.setattr(
         "carpenter.security.egress._resolve_host", _fake_resolve,
     )
+
+
+class OutboundConnectionBlocked(Exception):
+    """A test tried to open a socket to something that is not loopback.
+
+    Deliberately NOT an :class:`OSError`: the code under test translates
+    socket errors into its own failure types (a package fetch turns one
+    into a ``FetchError``), and a hermeticity breach must read as a
+    hermeticity breach rather than as a plausible network hiccup.
+    """
+
+
+def _loopback_endpoint(address) -> bool:
+    """True when ``address`` is a loopback endpoint, or not an IP one.
+
+    ``connect`` takes a different address shape per family.  Only the
+    ``(host, port, ...)`` shape of AF_INET / AF_INET6 is judged here; an
+    AF_UNIX path (a ``str``/``bytes``) or an exotic family's tuple of
+    integers is not an outbound IP connection and is left alone.  A
+    host that is a name rather than a literal is refused, because
+    nothing hermetic has to resolve one.
+    """
+    if not isinstance(address, tuple) or not address:
+        return True
+    host = address[0]
+    if isinstance(host, bytes):
+        host = host.decode("utf-8", "replace")
+    if not isinstance(host, str):
+        return True
+    try:
+        # Drop an IPv6 zone index, which ipaddress will not parse.
+        return ipaddress.ip_address(host.split("%", 1)[0]).is_loopback
+    except ValueError:
+        return False
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _no_outbound_connections():
+    """Refuse any socket connection to an address that is not loopback.
+
+    The suite is meant to be hermetic, and for a long time it was so by
+    accident: the web tools are mocked, so nothing connected after
+    :func:`_hermetic_egress_resolver` had told the egress guard that
+    ``example.com`` resolves to a real public address.  The package
+    fetchers do connect.  A test that fetched an invented public host
+    would therefore send real traffic to whatever lives at that
+    address — which happened once, and the test was deleted for it.
+
+    Fixing the resolver is not available: the guard refuses any address
+    that is not ``is_global``, so a private or reserved stand-in would
+    make it refuse the placeholder hosts the web-tool tests need it to
+    accept.  So the refusal goes one layer down, at ``connect``, where
+    it can tell loopback from everything else — which is exactly the
+    line the suite's own fixture servers (the loopback git and HTTP
+    servers in ``tests/packages``) sit on the right side of.
+
+    The failure names the address and the test, immediately, rather
+    than hanging until a timeout.  DNS is deliberately left alone: a
+    lookup is not a connection, resolution is already stubbed where it
+    matters, and intercepting ``getaddrinfo`` would reach the many
+    places that resolve a loopback literal or the local hostname.
+    """
+    original_connect = socket.socket.connect
+    original_connect_ex = socket.socket.connect_ex
+
+    def _refuse(address):
+        where = os.environ.get("PYTEST_CURRENT_TEST", "an unknown test")
+        return OutboundConnectionBlocked(
+            f"blocked an outbound connection to {address!r} from "
+            f"{where}. This test suite is hermetic: only loopback "
+            f"connections are allowed. Note that the egress guard's "
+            f"test resolver maps every unknown hostname to a real "
+            f"public address, so fetching a made-up host reaches a real "
+            f"server rather than failing. Serve the fixture over "
+            f"loopback (see tests/packages for a git and an HTTP "
+            f"server that do), or stub the fetcher."
+        )
+
+    def connect(self, address):
+        if not _loopback_endpoint(address):
+            raise _refuse(address)
+        return original_connect(self, address)
+
+    def connect_ex(self, address):
+        if not _loopback_endpoint(address):
+            raise _refuse(address)
+        return original_connect_ex(self, address)
+
+    socket.socket.connect = connect
+    socket.socket.connect_ex = connect_ex
+    try:
+        yield
+    finally:
+        # These are inherited from the C base class, so dropping the
+        # override restores the real ones rather than rebinding them.
+        for name in ("connect", "connect_ex"):
+            try:
+                delattr(socket.socket, name)
+            except AttributeError:  # pragma: no cover — defensive
+                pass
 
 
 @pytest.fixture(autouse=True)
