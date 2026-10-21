@@ -176,7 +176,8 @@ def apply_reconciled_install(
     Steps:
 
     1. Materialize ``resolved_tree`` (``path -> bytes``) into a fresh temp
-       staging dir (honours ``TMPDIR``, e.g. ``/dev/shm``).  Every key is
+       staging dir (honours ``TMPDIR``; point it at disk rather than a
+       RAM-backed tmpfs, since a whole package tree lands there).  Every key is
        path-safety vetted before any write (no absolute paths, no ``..``
        escaping the staging root).
     2. Atomically install the materialized tree into ``dest_path`` via

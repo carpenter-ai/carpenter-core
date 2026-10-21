@@ -574,7 +574,8 @@ def _safe_extract(
 def _expand_to_tree(archive_path: Path) -> dict[str, bytes]:
     """Expand an archive into a ``path -> bytes`` mapping (safely).
 
-    Uses a temp dir honouring ``TMPDIR`` (e.g. ``/dev/shm``), extracts
+    Uses a temp dir honouring ``TMPDIR`` (disk-backed for preference: an
+    expanded tree can be large), extracts
     with :func:`_safe_extract`, then reads each regular file back as
     bytes keyed by its POSIX relative path.  The temp dir is always
     cleaned up.
