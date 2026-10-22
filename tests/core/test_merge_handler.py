@@ -35,6 +35,10 @@ class TestAttemptMerge:
     @pytest.mark.asyncio
     async def test_clean_merge_succeeds(self, test_db, git_repo):
         """Clean merge completes the arc tree."""
+        # The branch ``porcelain.init`` starts on is dulwich's choice, not
+        # ours (it has been both ``master`` and ``main``), so ask the repo.
+        base_branch = porcelain.active_branch(git_repo)
+
         # Create a branch with a non-conflicting change
         porcelain.checkout(git_repo, target=b"HEAD", new_branch=b"feature")
         with open(os.path.join(git_repo, "feature.py"), "w") as f:
@@ -48,7 +52,7 @@ class TestAttemptMerge:
         )
 
         # Go back to the original branch
-        porcelain.checkout(git_repo, target=b"master")
+        porcelain.checkout(git_repo, target=base_branch)
 
         arc_id = arc_manager.create_arc(name="merge-resolution", goal="test merge")
         arc_manager.update_status(arc_id, "active")
@@ -66,6 +70,8 @@ class TestAttemptMerge:
     @pytest.mark.asyncio
     async def test_conflict_captures_state(self, test_db, git_repo):
         """Merge conflict captures conflict details in arc state."""
+        base_branch = porcelain.active_branch(git_repo)
+
         # Create a branch with conflicting change
         porcelain.checkout(git_repo, target=b"HEAD", new_branch=b"conflict-branch")
         with open(os.path.join(git_repo, "main.py"), "w") as f:
@@ -79,7 +85,7 @@ class TestAttemptMerge:
         )
 
         # Go back and make conflicting change on original branch
-        porcelain.checkout(git_repo, target=b"master")
+        porcelain.checkout(git_repo, target=base_branch)
         with open(os.path.join(git_repo, "main.py"), "w") as f:
             f.write("print('main version')\n")
         porcelain.add(git_repo, paths=["main.py"])
