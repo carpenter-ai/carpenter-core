@@ -28,7 +28,11 @@ dependencies = [
     "attrs>=25.0",
     "cattrs>=26.0",
     "six>=1.0",
-    "dulwich>=0.22.0",
+    # dulwich's three-way merge (carpenter.core.workspace_manager,
+    # carpenter.core.workflows.merge_handler) is only importable with the
+    # "merge" extra, which pulls in merge3; without it every content merge
+    # raises ImportError instead of merging or reporting a conflict.
+    "dulwich[merge]>=0.22.0",
     "RestrictedPython>=8.0",
     "numpy>=1.24",
     "safetensors>=0.4",

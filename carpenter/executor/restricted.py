@@ -25,6 +25,7 @@ from RestrictedPython import compile_restricted, safe_builtins, PrintCollector
 from RestrictedPython.Guards import (
     full_write_guard,
     guarded_unpack_sequence,
+    raise_ as _GETATTR_RAISE,
     safer_getattr,
 )
 from RestrictedPython.Eval import default_guarded_getitem, default_guarded_getiter
@@ -125,7 +126,9 @@ def _inplacevar_(op, x, y):
     raise NotImplementedError(f"Unsupported in-place operator: {op}")
 
 
-def _module_blocking_getattr(object, name, default=None, getattr=getattr):
+def _module_blocking_getattr(
+    object, name, default=_GETATTR_RAISE, getattr=getattr,
+):
     """``_getattr_`` guard: ``safer_getattr`` plus a module re-export block.
 
     ``safer_getattr`` already blocks underscore/private/inspect attribute names.
@@ -141,6 +144,17 @@ def _module_blocking_getattr(object, name, default=None, getattr=getattr):
     ModuleType check, and do NOT special-case any module name as "trusted".
     The carpenter_tools proxies are ``_ToolModule``/``_CarpenterToolsRoot``/etc.
     (custom objects, NOT ModuleType), so they are unaffected.
+
+    TRIPWIRE: ``default`` MUST stay ``raise_``. RestrictedPython compiles every
+    attribute access to a two-argument ``_getattr_(obj, name)`` call, so the
+    default is what a MISSING attribute resolves to -- and ``safer_getattr``
+    forwards anything that is not its ``raise_`` sentinel straight to
+    ``getattr(obj, name, default)``. A ``default=None`` here therefore turns
+    every missing attribute in executor code into ``None`` instead of an
+    ``AttributeError``, which silently swallows typos and -- worse -- makes the
+    module-re-export tests above pass for the wrong reason on any interpreter
+    where the re-export happens not to exist (CPython 3.14 dropped
+    ``datetime.sys``). Do not reintroduce a non-raising default.
     """
     # First apply all of safer_getattr's checks (underscore, format, inspect
     # attrs, default handling). This resolves and returns the attribute value.
