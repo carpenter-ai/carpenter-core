@@ -135,18 +135,24 @@ def test_chat_invalid_conversation_returns_404(client):
 def test_chat_pending_true_when_task_registered(client):
     """GET /api/chat/pending returns true when a task exists for the conversation."""
     conv_id = 42
-    # Simulate a pending background task via InvocationTracker
+    # Simulate a pending background task via InvocationTracker.  The task only
+    # has to be un-finished and carry ``add_done_callback``, so an unresolved
+    # future on a loop that is never run is enough -- and the loop has to be an
+    # explicit one: this test is synchronous (TestClient drives its own loop in
+    # a worker thread), so there is no current event loop to borrow, and
+    # ``asyncio.get_event_loop()`` no longer conjures one.
     tracker = get_invocation_tracker()
-    loop = asyncio.get_event_loop()
-    future = loop.create_future()
-    fake_task = asyncio.ensure_future(future)
-    tracker.track(conv_id, fake_task)
+    loop = asyncio.new_event_loop()
     try:
+        future = loop.create_future()
+        fake_task = asyncio.ensure_future(future, loop=loop)
+        tracker.track(conv_id, fake_task)
         resp = client.get(f"/api/chat/pending?c={conv_id}")
         assert resp.json()["pending"] is True
     finally:
         future.cancel()
         tracker.clear()
+        loop.close()
 
 
 def test_chat_pending_false_when_idle(client):
