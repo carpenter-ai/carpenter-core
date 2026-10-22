@@ -755,6 +755,30 @@ def _reset_kb_store():
 
 
 @pytest.fixture(autouse=True)
+def _reset_security_policies():
+    """Drop the SecurityPolicies singleton between tests.
+
+    ``get_policies()`` caches one instance per PROCESS, built from the DB
+    and config on first use.  Test databases are per-test but worker
+    processes are reused, so an allowlist entry added by one test stays
+    readable to every later test in that worker -- and because the
+    allowlists are the default-deny gate, a leak does not make a test
+    error, it makes it PASS something it should have refused.
+
+    That is how it showed up: the I9 default-deny test passed under
+    ``-n 0`` and failed under ``-n 2``.  Nothing was racing.  Serial runs
+    happened to schedule a test that calls ``reload_policies()`` after the
+    test that adds ``domain: example.com``, so the pollution was cleaned
+    up by luck; splitting the suite across workers put the two on
+    different processes and left the entry in place.
+    """
+    import carpenter.security.policies as policies_module
+    policies_module._singleton = None
+    yield
+    policies_module._singleton = None
+
+
+@pytest.fixture(autouse=True)
 def _mock_local_embed(monkeypatch):
     """Provide deterministic fake embeddings for all tests.
 
