@@ -707,12 +707,38 @@ class TestModuleReExportEscape:
         assert result.exit_code == 1
 
     def test_datetime_sys_attribute_blocked(self):
-        """datetime re-exports sys as datetime.sys; reaching it is blocked."""
+        """``datetime.sys`` must not resolve to a value inside the sandbox.
+
+        Whether ``datetime`` re-exports ``sys`` is an interpreter detail
+        (CPython dropped the re-export in 3.14), so this asserts the
+        property that does not depend on it: the expression FAILS.  It
+        fails through the module guard where the re-export exists and
+        through ``AttributeError`` where it does not -- what must never
+        happen is the guard handing back a value.
+        """
         executor = RestrictedExecutor()
         result = executor.execute(
             "import datetime\nx = datetime.sys"
         )
         assert result.exit_code == 1
+        assert result.error
+
+    def test_missing_attribute_is_not_silently_none(self):
+        """A missing attribute raises; the guard must not substitute a default.
+
+        RestrictedPython compiles ``a.b`` to a two-argument
+        ``_getattr_(a, "b")``, so a non-raising ``default`` in the guard
+        would turn every missing attribute in executor code into ``None``.
+        That also makes the re-export tests above pass for the wrong
+        reason, since a module that no longer re-exports the dangerous
+        name looks "blocked" when it is merely absent.
+        """
+        executor = RestrictedExecutor()
+        result = executor.execute(
+            "import json\nx = json.no_such_attribute\nprint(repr(x))"
+        )
+        assert result.exit_code == 1, result.output
+        assert "AttributeError" in result.error
 
     def test_guard_function_blocks_module_value(self):
         """Unit-test the guard: resolving a module-typed attr raises."""
