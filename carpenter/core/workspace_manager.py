@@ -15,6 +15,7 @@ import time
 
 import dulwich.porcelain as porcelain
 from dulwich.errors import NotGitRepository
+from dulwich.index import ConflictedIndexEntry
 from dulwich.repo import Repo
 
 from ..db import get_db, db_connection
@@ -278,6 +279,47 @@ def _get_current_branch(source_dir: str) -> str:
         raise RuntimeError("Failed to get current branch in source repo")
 
 
+def abort_merge(source_dir: str, ref: str) -> None:
+    """Undo a conflicted merge, leaving the work tree at ``ref``.
+
+    A conflicted merge leaves three things behind: stage 1/2/3 entries in
+    the index, conflict markers in the work-tree files, and MERGE_HEAD /
+    MERGE_MSG in the control dir.  ``porcelain.reset(..., "hard", ...)``
+    alone clears none of them -- it builds a tree from the index to diff
+    against, and a conflicted index has no single tree, so dulwich raises
+    ``UnmergedEntries`` before it touches anything.
+
+    Dropping the conflicted paths from the index first makes the index
+    tree-able again AND makes the hard reset see each of those paths as
+    missing, so it rewrites the file from ``ref`` -- which is what clears
+    the conflict markers.  The merge state files are then removed so the
+    repository is no longer mid-merge.
+
+    Args:
+        source_dir: Path to the git repository.
+        ref: Ref to reset to, e.g. ``refs/heads/main`` or ``HEAD``.
+    """
+    with Repo(source_dir) as repo:
+        index = repo.open_index()
+        conflicted = [
+            path for path in list(index)
+            if isinstance(index[path], ConflictedIndexEntry)
+        ]
+        if conflicted:
+            for path in conflicted:
+                del index[path]
+            index.write()
+        control_dir = repo.controldir()
+
+    for name in ("MERGE_HEAD", "MERGE_MSG"):
+        try:
+            os.remove(os.path.join(control_dir, name))
+        except FileNotFoundError:
+            pass
+
+    porcelain.reset(source_dir, "hard", ref)
+
+
 def _create_temp_branch_and_apply_changes(
     source_dir: str,
     workspace_path: str,
@@ -380,8 +422,8 @@ def _handle_merge_conflict(
         # Suppression intentional: best-effort diff capture for diagnostics.
         logger.info("Failed to capture conflict diff", exc_info=True)
 
-    # Abort: reset to original branch state
-    porcelain.reset(source_dir, "hard", f"refs/heads/{original_branch}")
+    # Abort: drop the conflicted merge and restore the original branch state
+    abort_merge(source_dir, f"refs/heads/{original_branch}")
     porcelain.checkout(source_dir, target=original_branch.encode(), force=True)
 
     # Delete temp branch

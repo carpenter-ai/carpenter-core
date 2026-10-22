@@ -173,17 +173,18 @@ async def handle_attempt_merge(work_id: int, payload: dict):
             # can't produce it we still want to proceed with the abort+resolve flow.
             logger.debug("Could not produce conflict diff for arc %d", arc_id, exc_info=True)
 
-        # Abort: reset to pre-merge state
+        # Abort: drop the conflicted merge and reset to the pre-merge state.
+        # A plain hard reset is not enough -- see workspace_manager.abort_merge.
         r = Repo(source_dir)
         try:
             head_symrefs = r.refs.get_symrefs()
             head_ref = head_symrefs[b"HEAD"]
             branch_name = head_ref.split(b"/")[-1].decode()
-            porcelain.reset(source_dir, "hard", f"refs/heads/{branch_name}")
+            workspace_manager.abort_merge(source_dir, f"refs/heads/{branch_name}")
         except (KeyError, IndexError, UnicodeDecodeError):
             # Fall back to HEAD if the symref lookup or branch-name decode fails
             # (detached HEAD, missing HEAD symref, non-utf8 ref name).
-            porcelain.reset(source_dir, "hard", "HEAD")
+            workspace_manager.abort_merge(source_dir, "HEAD")
 
         # Store conflict state for the resolve step
         _set_arc_state(arc_id, "conflict_diff", conflict_diff)
