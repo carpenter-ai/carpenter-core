@@ -2,15 +2,35 @@
 
 import os
 
-# Ensure pytest basetemp uses RAM-backed tmpfs (/dev/shm) instead of the SD
-# card's /tmp.  This MUST happen before ``import tempfile`` because
-# tempfile.gettempdir() caches its result on first call.  Without this, a
-# long xdist run under /tmp is vulnerable to:
-#   - No cleanup-lock protection (tmp_path_retention_count=0 skips locks)
-#   - Concurrent pytest invocations deleting the basetemp mid-run
-# A TMPDIR already set by the caller is respected.
-if "TMPDIR" not in os.environ and os.path.isdir("/dev/shm"):
-    os.environ["TMPDIR"] = "/dev/shm"
+# The suite's temp dir is NOT forced onto a RAM-backed filesystem.
+#
+# It used to be: ``TMPDIR`` was set to ``/dev/shm`` whenever the caller had
+# not set it, sparing an SD-card host the writes and buying tmpfs speed.
+# The cost is paid in memory, and it is not small: one ``tests/packages``
+# run leaves ~800 MiB behind and a full run ~1.2 GiB.  tmpfs pages are
+# charged to the cgroup of whatever writes them and are released only when
+# the FILES are deleted, not when pytest exits — so under a memory-capped
+# supervisor a couple of runs are an out-of-memory kill, with the suite
+# long gone and nothing obvious to blame.  Measured on one such host:
+# tmpfs was ~20% faster on ``tests/packages`` and held ~800 MiB per run
+# until something removed it.
+#
+# A host that wants that trade names the filesystem explicitly:
+#
+#     CARPENTER_TEST_TMPFS=/dev/shm pytest ...
+#
+# A ``TMPDIR`` set by the caller always wins.  This has to happen before
+# ``import tempfile``, because ``gettempdir()`` caches its first answer.
+#
+# Two things worth knowing whichever you pick.  ``/tmp`` is itself tmpfs on
+# many systems, so "not /dev/shm" does not mean "not RAM" — check rather
+# than assume.  And ``tmp_path_retention_count = 0`` (pyproject.toml)
+# disables the cleanup lock, so concurrent pytest invocations sharing one
+# temp root can delete each other's basetemp mid-run: give each run its own
+# ``--basetemp`` when running them in parallel.
+_tmpfs = os.environ.get("CARPENTER_TEST_TMPFS")
+if "TMPDIR" not in os.environ and _tmpfs and os.path.isdir(_tmpfs):
+    os.environ["TMPDIR"] = _tmpfs
 
 import hashlib
 import ipaddress
@@ -38,11 +58,13 @@ _TEMPLATE_DB_MAX_AGE = 86400  # 1 day
 
 
 def _cleanup_old_template_dbs():
-    """Remove old template databases from /dev/shm to prevent accumulation.
+    """Remove old template databases to prevent accumulation.
 
     Template DBs are created once per pytest session and persist after the
-    session ends. Over time, they can fill up /dev/shm (tmpfs). This cleanup
-    runs at session start and removes any template DBs older than 1 day.
+    session ends, so they pile up in whatever ``tempfile.gettempdir()``
+    resolves to — and if that is a tmpfs, they are held in memory until
+    something deletes them. This cleanup runs at session start and removes
+    any template DBs older than 1 day.
     """
     tmpdir = Path(tempfile.gettempdir())
     if not tmpdir.exists():
