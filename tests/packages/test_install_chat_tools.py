@@ -47,10 +47,16 @@ def _make_source(root: Path, name: str) -> Path:
 
 @pytest.fixture
 def fake_carpenter_dirs(tmp_path, monkeypatch):
-    """Redirect ~/repos/carpenter-packages and ~/carpenter to tmp_path.
+    """Redirect the legacy local source tree under ``$HOME`` to tmp_path.
 
-    The chat tools resolve sources / dests via ``os.path.expanduser``,
-    so we monkeypatch HOME for the duration of the test.
+    A bare source name resolves through
+    ``carpenter.packages.sources.parse_source``, which expands ``~`` for
+    the legacy ``~/repos/carpenter-packages/packages/<name>/`` fallback,
+    so HOME is monkeypatched for the duration of the test.
+
+    The install DESTINATION does not come from HOME: it follows the
+    platform ``base_dir`` (set to ``tmp_path`` by the autouse ``test_db``
+    fixture), which is what ``_install_destination_for`` resolves.
     """
     home = tmp_path / "home"
     home.mkdir()
@@ -127,11 +133,11 @@ class TestInstallChatTool:
         # Hash row was recorded.
         record = get_install_record(fake_db, "p")
         assert record is not None
-        # Install dir was materialized.
-        installed = (
-            fake_carpenter_dirs / "carpenter" / "packages" / "p"
-        )
+        # Install dir was materialized under the configured base_dir.
+        from carpenter import config
+        installed = Path(config.CONFIG["base_dir"]) / "packages" / "p"
         assert (installed / "manifest.yaml").is_file()
+        assert record["install_path"] == str(installed)
 
     def test_install_missing_source(self, fake_carpenter_dirs, fake_db):
         mod = _import_packages_chat_tools()
@@ -202,3 +208,89 @@ class TestUninstallChatTool:
         out = mod.uninstall_package({"name": "p"})
         assert "Cannot uninstall" in out
         assert "tri" in out
+
+
+# ── one resolver for both entry points ──────────────────────────────
+
+
+class TestSharedResolution:
+    """The chat tool and the operator CLI must resolve identically.
+
+    They used to keep separate copies of these conventions and the
+    copies drifted: the chat tool hardcoded ``~/carpenter/packages/<name>``
+    and ignored ``base_dir``, so on a deployment with a relocated
+    ``base_dir`` it installed where the registry never looks.
+    """
+
+    def test_destination_follows_base_dir_not_home(
+        self, fake_carpenter_dirs, monkeypatch, tmp_path,
+    ):
+        from carpenter import cli_packages, config
+
+        relocated = tmp_path / "relocated-base"
+        monkeypatch.setitem(config.CONFIG, "base_dir", str(relocated))
+        mod = _import_packages_chat_tools()
+
+        expected = relocated / "packages" / "p"
+        assert mod._install_destination_for("p") == expected
+        assert cli_packages._install_destination_for("p") == expected
+        # And emphatically NOT the hardcoded home layout.
+        assert mod._install_destination_for("p") != (
+            fake_carpenter_dirs / "carpenter" / "packages" / "p"
+        )
+
+    def test_install_lands_under_base_dir(
+        self, fake_carpenter_dirs, fake_db, monkeypatch, tmp_path,
+    ):
+        from carpenter import config
+
+        relocated = tmp_path / "relocated-base"
+        monkeypatch.setitem(config.CONFIG, "base_dir", str(relocated))
+        mod = _import_packages_chat_tools()
+        _make_source(
+            fake_carpenter_dirs / "repos" / "carpenter-packages" / "packages",
+            "p",
+        )
+        out = mod.install_package({"source_name": "p"})
+        assert "Installed" in out
+        assert (relocated / "packages" / "p" / "manifest.yaml").is_file()
+
+    def test_source_resolution_matches_the_cli(self, fake_carpenter_dirs):
+        from carpenter import cli_packages
+
+        mod = _import_packages_chat_tools()
+        assert mod._source_dir_for("p") == cli_packages._source_dir_for("p")
+        assert mod._source_dir_for("p") == (
+            fake_carpenter_dirs / "repos" / "carpenter-packages"
+            / "packages" / "p"
+        )
+
+    def test_remote_source_is_refused_with_a_clear_error(
+        self, fake_carpenter_dirs, fake_db, monkeypatch,
+    ):
+        from carpenter import config
+
+        monkeypatch.setitem(config.CONFIG, "package_sources", [{
+            "name": "house",
+            "url": "git+https://forge.example/org/pkgs.git",
+            "subdir_template": "packages/{name}",
+        }])
+        mod = _import_packages_chat_tools()
+        out = mod.install_package({"source_name": "p"})
+        assert "Error" in out
+        assert "remote source" in out
+        assert "forge.example" in out
+
+    def test_install_records_local_provenance(
+        self, fake_carpenter_dirs, fake_db,
+    ):
+        mod = _import_packages_chat_tools()
+        src = _make_source(
+            fake_carpenter_dirs / "repos" / "carpenter-packages" / "packages",
+            "p",
+        )
+        assert "Installed" in mod.install_package({"source_name": "p"})
+        record = get_install_record(fake_db, "p")
+        assert record["source_kind"] == "local"
+        assert record["source_resolved"] == ""
+        assert record["source_path"] == str(src.resolve())

@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Package Install Approval - {token_short}</title>
+    <style>{css}</style>
+</head>
+<body>
+    <div class="header">
+        <h2>Package install approval</h2>
+        <div class="subtitle">{subtitle}</div>
+    </div>
+    {attribution}
+    {timing}
+    {packages}
+    <div class="decision">
+        <h3>Your decision applies to the whole batch</h3>
+        {auth_note}
+        <p class="note">Nothing has been installed yet. Approving installs every
+        package listed above, with exactly the grants ticked above. Rejecting
+        installs nothing and deletes the quarantined copy. There is no third
+        option and no way to approve part of the batch &mdash; reject and ask
+        again for a smaller one.</p>
+        <div class="actions">
+            <button class="btn btn-approve" onclick="decide('approve')">Approve and install</button>
+            <button class="btn btn-reject" onclick="decide('reject')">Reject</button>
+        </div>
+    </div>
+    <div class="footnote">{footnote}</div>
+    <script>{js}</script>
+</body>
+</html>

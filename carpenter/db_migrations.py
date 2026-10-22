@@ -834,11 +834,19 @@ def _migrate_installed_packages(
     uninstall code can refuse to remove a package that still has live
     arcs referencing its templates (SD9).
 
-    Both tables are additive (no existing data touched) and idempotent
+    ``ensure_installer_tables`` also creates ``pending_package_installs``
+    (``carpenter.packages.pending_install``), the request record behind
+    chat-requested installs: a chat agent writes a row and mints a
+    one-time approval link, and the operator's decision on that link is
+    what authorises the install.  It rides along here because this is
+    the one path both production migration and the tests take.
+
+    All of these are additive (no existing data touched) and idempotent
     (CREATE IF NOT EXISTS).  Migration is safe to re-run.
 
     The actual schema strings live in ``carpenter.packages.installer``
-    so the install machinery and the migration agree.
+    and ``carpenter.packages.pending_install`` so the install machinery
+    and the migration agree.
     """
     from .packages.installer import ensure_installer_tables
     ensure_installer_tables(conn)

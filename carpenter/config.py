@@ -384,6 +384,51 @@ DEFAULTS = {
     # JUDGE value allowlists under ``security`` (domain_allowlist etc.).
     # See carpenter/security/egress.py.
     "web_egress_allowlist": [],
+    # Chat-requested package installs (the two-phase request -> operator
+    # approval -> install flow).  A chat agent can only ASK for a package;
+    # the operator approves on a one-time link, and these keys bound how
+    # long that link lives and how often the agent may ask.
+    #
+    #   package_install:
+    #     request_ttl_hours: 24     # link lifetime; expired links 410
+    #     approved_grace_hours: 6   # give up on an approval that never ran
+    #     max_open_requests: 3      # undecided requests allowed at once
+    #     max_requests_per_hour: 5  # requests the agent may create per hour
+    #     max_sources_per_request: 5
+    #     notify_agent: false       # re-invoke the chat agent on the outcome
+    #     max_fetch_bytes: 67108864     # ceilings on ONE fetch; a remote
+    #     max_fetch_files: 5000         # source is untrusted input, so an
+    #     max_fetch_file_bytes: 16777216  # unbounded download, a file-count
+    #     fetch_timeout_s: 60           # explosion or a hung connection has
+    #                                   # to fail rather than fill the disk
+    #
+    # The limits exist because the only defence that cannot be hardened
+    # is the human reading the page: a request the agent can repeat
+    # without limit is a retry loop against their patience.  Requests
+    # are never auto-approved, whatever these are set to.
+    #
+    # ``notify_agent`` is OFF because the outcome notification needs no
+    # model: the platform writes a visible system message into the
+    # conversation that asked, which the UI renders from its existing
+    # poll.  Turning it on re-invokes the chat agent once per approved
+    # install, so the agent can act on the result — at the price of a
+    # model call for every approval.
+    # The four fetch ceilings mirror ``packages.fetch.FetchLimits``'s own
+    # defaults (``install_requests.limits_for`` reads them from here); they
+    # are declared so an operator can find them, since this file is the
+    # source of truth for every config key.
+    "package_install": {
+        "request_ttl_hours": 24,
+        "approved_grace_hours": 6,
+        "max_open_requests": 3,
+        "max_requests_per_hour": 5,
+        "max_sources_per_request": 5,
+        "notify_agent": False,
+        "max_fetch_bytes": 64 * 1024 * 1024,
+        "max_fetch_files": 5000,
+        "max_fetch_file_bytes": 16 * 1024 * 1024,
+        "fetch_timeout_s": 60,
+    },
     # Tool classification lists — used by the callback API for access control.
     # Each list can be extended (add items) or reduced (remove items) via config.yaml.
     # Format in config.yaml:
@@ -506,7 +551,66 @@ DEFAULTS = {
     #         imap-inbound-poll:
     #           enabled: false
     # Read at trigger install/startup, so a change needs a restart.
+    #
+    # EVERY key in this mapping is a package name.  The source registry is
+    # deliberately NOT nested here (it lives in top-level
+    # ``package_sources``): this mapping would otherwise reserve the names
+    # of the registry's keys, and because the YAML layer replaces a
+    # top-level value wholesale (precedence is shallow), an operator who
+    # set a single per-package override would silently drop the registry.
     "packages": {},
+    # The operator's package source registry: an ordered list of
+    # ``{name, url, subdir_template, credential_ref}`` entries saying where
+    # a bare package name may be installed from.
+    #
+    #   package_sources:
+    #     - name: house
+    #       url: git+https://forge.example/org/packages.git
+    #       subdir_template: packages/{name}
+    #       credential_ref: HOUSE_FORGE_TOKEN
+    #
+    # * ``name`` is the alias the source is referred to by (in previews,
+    #   logs and provenance), and must be unique.
+    # * ``url`` is a ``git+https://host/org/repo.git`` repository or an
+    #   ``https://host/path/pkg.tar.gz`` archive (see
+    #   ``carpenter/packages/sources.py`` for the full grammar).  It may NOT
+    #   contain a ``{name}`` placeholder.
+    # * ``subdir_template`` (optional) locates the package root inside the
+    #   fetched tree and may use ``{name}``, e.g. ``packages/{name}`` — that
+    #   is how a monorepo of many packages is addressed.  Absent means the
+    #   repository/archive root IS the package.
+    # * ``credential_ref`` (optional) is the NAME of a platform-provided
+    #   environment variable holding a read token for a private source — a
+    #   name, never a value.  The platform injects the value at fetch time;
+    #   a package cannot supply or override it, and it is never persisted
+    #   or logged.
+    #
+    # THE LIST ORDER DECIDES: a bare package name resolves through the
+    # FIRST entry, so there is no second key that can disagree with it.
+    # Resolution is pure (no I/O), so it cannot ask a remote whether it
+    # actually publishes the package and therefore cannot fall through to
+    # the next entry — to install from a source other than the first,
+    # give a full spec, or reorder the list.  ``list_available_packages``
+    # lists each source separately.  Empty (the default) keeps the
+    # pre-registry behaviour: a bare name resolves to the local source
+    # tree.
+    #
+    # A malformed entry is refused with a clear error rather than skipped,
+    # so a typo cannot silently change which remote a package comes from.
+    # Reaching a source's host also needs that host to be allowed by
+    # ``web_egress_allowlist`` when it is not globally routable.
+    "package_sources": [],  # [{name, url, subdir_template, credential_ref}]
+    # How long a remote source's package LISTING is served from
+    # ``{base_dir}/cache/package-listings/`` before it is fetched again.
+    # Discovery (``carpenter/packages/discover.py``, the read-only
+    # ``list_available_packages`` chat tool) reads manifests only and
+    # installs nothing, but it does make the platform talk to a remote,
+    # so the cache is also the rate limit: an agent asking the same
+    # question all afternoon causes at most one fetch per source per TTL.
+    # Short enough that a package published this morning shows up this
+    # afternoon.  ``0`` means always refetch; an unusable value falls
+    # back to 6 rather than to "never refresh".
+    "package_sources_listing_ttl_hours": 6,
     "model_presets": {},  # User overrides for model selector presets (see model_selector.py)
     # Platform-integrity classifier config.  Read by
     # ``carpenter/security/platform_paths.py`` to drive path-tier and

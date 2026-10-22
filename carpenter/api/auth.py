@@ -1,7 +1,9 @@
 """Bearer token authentication middleware for Carpenter.
 
 Gates protected endpoints when ui_token is configured.  Unprotected
-endpoints (callbacks, webhooks, review detail pages) pass through.
+endpoints (callbacks, webhooks, review detail pages, package-install
+approval pages) pass through.  Reading a package-install approval page
+is unprotected; POSTing its decision is not — see :func:`is_protected`.
 """
 
 import hmac
@@ -40,6 +42,28 @@ def is_protected(path: str, method: str) -> bool:
     # e.g. /api/review/550e8400-... and /api/review/550e8400-.../decide
     if path.startswith("/api/review/") and path != "/api/review/create":
         return False
+
+    # Package-install approval: READING is open, DECIDING is not.
+    #
+    # A deliberate deviation from the arc-review precedent above, where
+    # the uuid4 in the URL is the whole credential.  The deviation is
+    # not about link hygiene; it is about what the link approves.  The
+    # approval URL is returned to the chat agent that asked and is then
+    # persisted in the conversation, so the model that requested the
+    # install holds the token that would approve it, and the platform
+    # ships an HTTP POST dispatch verb.  A prompt-injected agent could
+    # therefore request and approve in one move, which is exactly the
+    # human the design rests on being cut out.
+    #
+    # Approving an install runs unsandboxed platform-side code with the
+    # platform's credentials and egress — not comparable to approving an
+    # arc step, which the review pipeline has already constrained.  So a
+    # GET (the page a human reads from whatever chat app or mail client
+    # carried the link, which cannot carry our UI bearer token) stays
+    # open, and anything that decides needs a session authenticated to
+    # the platform in addition to the single-use token in the path.
+    if path.startswith("/api/package-install/"):
+        return method.upper() not in ("GET", "HEAD")
 
     return True
 

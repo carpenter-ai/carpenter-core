@@ -12,6 +12,7 @@ from ..coordinator import Coordinator
 from .webhooks import routes as webhooks_routes
 from .chat import routes as chat_routes
 from .review import routes as review_routes
+from .package_install import routes as package_install_routes
 from .credentials import routes as credentials_routes
 from .oauth import routes as oauth_routes
 from .analytics import routes as analytics_routes
@@ -39,6 +40,7 @@ def create_app() -> Starlette:
         webhooks_routes
         + chat_routes
         + review_routes
+        + package_install_routes
         + credentials_routes
         + oauth_routes
         + analytics_routes

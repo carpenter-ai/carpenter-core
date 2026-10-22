@@ -115,22 +115,10 @@ class Coordinator:
         Failures are logged and swallowed: a misbehaving package must
         not block the daemon from starting.
         """
-        from pathlib import Path
         from .packages import discover_and_register
+        from .packages.registry import configured_search_paths
 
-        cfg = config.CONFIG.get("capability_packages", {}) or {}
-        configured = cfg.get("search_paths")
-        search_paths: list[Path] | None = None
-        if configured:
-            if not isinstance(configured, list):
-                logger.error(
-                    "config['capability_packages']['search_paths'] must be "
-                    "a list; falling back to defaults",
-                )
-            else:
-                search_paths = [
-                    Path(os.path.expanduser(str(p))) for p in configured
-                ]
+        search_paths = configured_search_paths()
 
         try:
             from .db import db_transaction
@@ -160,6 +148,30 @@ class Coordinator:
         recover_review_links()
         backfill_arc_approval_reviews()
         migrate_review_urls_to_absolute()
+
+    def _recover_approved_installs(self) -> None:
+        """Re-queue (or give up on) installs an operator already approved.
+
+        ``pending_install.recover_on_startup`` runs inside the database
+        connection's own transaction, so it cannot enqueue; this is the
+        half that can.  Idempotent, and a failure here must not stop the
+        platform from starting.
+        """
+        try:
+            from .packages import install_approved_handler
+            requeued, failed = (
+                install_approved_handler.recover_approved_installs()
+            )
+        except Exception:  # noqa: BLE001 — startup must not depend on it
+            logger.warning(
+                "Could not recover approved package installs", exc_info=True,
+            )
+            return
+        if requeued or failed:
+            logger.info(
+                "Package install recovery: re-queued %d approved request(s), "
+                "failed %d that never started", requeued, failed,
+            )
 
     def _register_work_handlers(self) -> None:
         """Register all work-queue event handlers and heartbeat hooks."""
@@ -251,6 +263,59 @@ class Coordinator:
         from .core.workflows import arc_notify_handler
         arc_notify_handler.register_handlers(main_loop.register_handler)
         logger.info("Arc chat notification handler registered")
+
+        # Chat-requested package installs: the operator's approval
+        # enqueues the install, which runs here rather than in the HTTP
+        # request that approved it.
+        from .packages import install_approved_handler
+        install_approved_handler.register_handlers(main_loop.register_handler)
+        logger.info("Approved package-install handler registered")
+
+        # ... and an hourly sweep of approval links nobody decided.  The
+        # approval routes also expire the single row in front of them, so
+        # this is about reclaiming the quarantine each stale request is
+        # still holding on disk, bounded by the TTL rather than by
+        # anyone remembering to clean up.  The same pass re-queues an
+        # approval whose install never started: the enqueue happens
+        # after the approval commits, so a crash in between would
+        # otherwise leave the row stuck in ``approved`` forever.
+        _last_pkg_install_sweep = [0.0]  # mutable container for closure
+
+        def _package_install_sweep_hook():
+            import time
+            now = time.time()
+            if now - _last_pkg_install_sweep[0] < 3600:  # once per hour
+                return
+            _last_pkg_install_sweep[0] = now
+            from .db import db_transaction
+            from .packages import pending_install
+            try:
+                with db_transaction() as db:
+                    if not pending_install.table_exists(db):
+                        return
+                    swept = pending_install.sweep_expired(db)
+                    pending_install.fail_stale_approved(db)
+                    # Untrusted fetched code with no row to own it:
+                    # a crash between the fetch and the insert leaves
+                    # the directory and nothing else.
+                    pending_install.sweep_orphan_quarantines(db)
+            except sqlite3.Error:
+                logger.debug(
+                    "Package-install expiry sweep failed", exc_info=True,
+                )
+                return
+            if swept:
+                logger.info(
+                    "Package-install expiry sweep: expired %d request(s)",
+                    len(swept),
+                )
+            # Outside the transaction above on purpose: enqueuing opens
+            # one of its own, and the per-thread guard refuses a nested
+            # write transaction outright.
+            self._recover_approved_installs()
+
+        main_loop.register_heartbeat_hook(_package_install_sweep_hook)
+        logger.info("Package-install expiry sweep hook registered")
 
     async def _init_trigger_subscription_pipeline(self, base_dir: str, app) -> None:
         """Set up triggers, subscriptions, and endpoint routes."""
@@ -654,6 +719,7 @@ class Coordinator:
         self._load_chat_tools(base_dir)
         self._discover_capability_packages()
         self._recover_review_links()
+        self._recover_approved_installs()
 
         logger.info("Coordinator started")
 

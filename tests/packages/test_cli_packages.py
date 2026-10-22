@@ -15,10 +15,15 @@ Coverage:
   recorded + capabilities echoed.
 * ``list`` shows installed packages + their granted verbs.
 * ``uninstall`` removes the install dir + DB row.
+* ``verify`` re-hashes the installed tree, one package or all of them,
+  and exits nonzero when one does not match its install record — plus
+  the guard that every subcommand the platform's messages tell an
+  operator to run actually exists.
 """
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from textwrap import dedent
 
@@ -259,3 +264,221 @@ def test_install_requires_exactly_one_source(test_db, capsys):
     rc = cli_packages.cmd_packages(["install"])
     assert rc == 2
     assert "exactly one" in capsys.readouterr().err
+
+
+# ── source resolution ───────────────────────────────────────────────
+
+
+class TestSourceResolution:
+    def test_bare_name_uses_the_legacy_local_layout(
+        self, test_db, monkeypatch, tmp_path,
+    ):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        assert cli_packages._source_dir_for("demo") == (
+            tmp_path / "repos" / "carpenter-packages" / "packages" / "demo"
+        )
+
+    def test_install_by_bare_name_lands_under_base_dir(
+        self, test_db, monkeypatch, tmp_path, capsys,
+    ):
+        from carpenter import config
+
+        home = tmp_path / "home"
+        src_tree = home / "repos" / "carpenter-packages" / "packages"
+        src_tree.mkdir(parents=True)
+        _write_plain_pkg(src_tree)
+        monkeypatch.setenv("HOME", str(home))
+
+        rc = cli_packages.cmd_packages(["install", "plainpkg"])
+        assert rc == 0
+        installed = (
+            Path(config.CONFIG["base_dir"]) / "packages" / "plainpkg"
+        )
+        assert (installed / "manifest.yaml").is_file()
+
+    def test_a_bare_name_may_now_resolve_to_a_remote_source(
+        self, test_db, monkeypatch, capsys,
+    ):
+        """A configured remote source is FETCHED, not refused for being one.
+
+        The stopping point here is the egress gate rather than a
+        CLI-level "remote is not supported": the host resolves to a
+        private address through the guard's own resolver seam, so the
+        refusal arrives without any network contact, and it names the
+        host and the config key that would allow it.
+        """
+        from carpenter import config
+        from carpenter.security import egress
+
+        monkeypatch.setattr(
+            egress, "_resolve_host", lambda host, port: ["10.0.0.7"],
+        )
+        monkeypatch.setitem(config.CONFIG, "web_egress_allowlist", [])
+        monkeypatch.setitem(config.CONFIG, "package_sources", [{
+            "name": "house",
+            "url": "git+https://forge.example/org/pkgs.git",
+            "subdir_template": "packages/{name}",
+        }])
+        rc = cli_packages.cmd_packages(["install", "plainpkg"])
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "forge.example" in err
+        assert "web_egress_allowlist" in err
+
+    def test_source_dir_for_still_refuses_a_remote_spec(
+        self, test_db, monkeypatch,
+    ):
+        """The local-only helper has no directory to give for a remote."""
+        from carpenter import config
+        from carpenter.packages.sources import SourceSpecError
+
+        monkeypatch.setitem(config.CONFIG, "package_sources", [{
+            "name": "house",
+            "url": "git+https://forge.example/org/pkgs.git",
+        }])
+        with pytest.raises(SourceSpecError) as exc:
+            cli_packages._source_dir_for("plainpkg")
+        assert "remote source" in str(exc.value)
+
+    def test_malformed_source_spec_is_refused(self, test_db, capsys):
+        rc = cli_packages.cmd_packages(["install", "Not A Name"])
+        assert rc == 1
+        assert "accepted source forms" in capsys.readouterr().err
+
+    def test_install_records_local_provenance(
+        self, test_db, src_root, capsys,
+    ):
+        pkg = _write_plain_pkg(src_root)
+        assert cli_packages.cmd_packages(["install", "--path", str(pkg)]) == 0
+        with db_connection() as db:
+            rec = installer.get_install_record(db, "plainpkg")
+        assert rec["source_kind"] == "local"
+        assert rec["source_url"] == ""
+        assert rec["source_resolved"] == ""
+        assert rec["source_id"]
+        assert rec["source_path"] == str(pkg.resolve())
+
+
+# ── verify ──────────────────────────────────────────────────────────
+
+
+class TestVerify:
+    """``packages verify`` — the check two recovery messages name."""
+
+    def test_verify_all_reports_each_installed_package(
+        self, test_db, src_root, monkeypatch, capsys,
+    ):
+        monkeypatch.setattr("sys.stdin.isatty", lambda: False, raising=False)
+        assert cli_packages.cmd_packages(
+            ["install", "--path", str(_write_plain_pkg(src_root))],
+        ) == 0
+        assert cli_packages.cmd_packages([
+            "install", "--path", str(_write_cap_pkg(src_root)),
+            "--accept-capabilities",
+        ]) == 0
+        capsys.readouterr()
+
+        rc = cli_packages.cmd_packages(["verify"])
+
+        out = capsys.readouterr().out
+        assert rc == 0, out
+        assert "NAME" in out and "STATUS" in out
+        assert re.search(r"plainpkg\s+OK", out)
+        assert re.search(r"cappkg\s+OK", out)
+        assert "2 package(s) verified." in out
+
+    def test_a_tampered_tree_fails_and_exits_nonzero(
+        self, test_db, src_root, monkeypatch, capsys,
+    ):
+        monkeypatch.setattr("sys.stdin.isatty", lambda: False, raising=False)
+        assert cli_packages.cmd_packages(
+            ["install", "--path", str(_write_plain_pkg(src_root))],
+        ) == 0
+        with db_connection() as db:
+            installed = Path(
+                installer.get_install_record(db, "plainpkg")["install_path"],
+            )
+        (installed / "sneaked_in.py").write_text("print('not mine')\n")
+        capsys.readouterr()
+
+        rc = cli_packages.cmd_packages(["verify"])
+
+        out = capsys.readouterr().out
+        assert rc == 1
+        assert re.search(r"plainpkg\s+FAILED", out)
+        assert "hash mismatch" in out
+        assert "will NOT load them" in out
+        # Read-only: the row is left exactly as it was for the operator.
+        with db_connection() as db:
+            assert installer.get_install_record(db, "plainpkg") is not None
+
+    def test_one_package_by_name(
+        self, test_db, src_root, monkeypatch, capsys,
+    ):
+        monkeypatch.setattr("sys.stdin.isatty", lambda: False, raising=False)
+        assert cli_packages.cmd_packages(
+            ["install", "--path", str(_write_plain_pkg(src_root))],
+        ) == 0
+        assert cli_packages.cmd_packages(
+            ["install", "--path", str(_write_plain_pkg(src_root, "second"))],
+        ) == 0
+        capsys.readouterr()
+
+        rc = cli_packages.cmd_packages(["verify", "second"])
+
+        out = capsys.readouterr().out
+        assert rc == 0, out
+        assert "second" in out
+        assert "plainpkg" not in out
+        assert "1 package(s) verified." in out
+
+    def test_an_uninstalled_name_is_a_failure(
+        self, test_db, capsys,
+    ):
+        rc = cli_packages.cmd_packages(["verify", "absent"])
+
+        out = capsys.readouterr().out
+        assert rc == 1
+        assert "no install record" in out
+
+    def test_nothing_installed_is_not_a_failure(self, test_db, capsys):
+        rc = cli_packages.cmd_packages(["verify"])
+
+        assert rc == 0
+        assert "No capability packages installed." in capsys.readouterr().out
+
+    def test_every_subcommand_the_platform_names_exists(self):
+        """The bug this subcommand closed, as a standing guard.
+
+        Two recovery messages told an operator to run `packages verify`
+        while the dispatcher knew only install/update/uninstall/list, so
+        the advice given at the worst possible moment produced "unknown
+        packages subcommand".  Any message that names a subcommand must
+        name one that exists.
+        """
+        pattern = re.compile(r"carpenter packages ([a-z][a-z-]*)")
+        carpenter_root = Path(cli_packages.__file__).resolve().parent
+        roots = [carpenter_root, carpenter_root.parent / "config_seed"]
+        found: dict[str, set[str]] = {}
+        for root in roots:
+            for path in sorted(root.rglob("*.py")):
+                # Flatten the source so a message split across adjacent
+                # string literals still reads as one sentence.
+                text = path.read_text()
+                for prefix in ('f"', "f'"):
+                    text = text.replace(prefix, prefix[1])
+                flat = re.sub(
+                    r"\s+", " ", text.replace('"', " ").replace("'", " "),
+                )
+                for name in pattern.findall(flat):
+                    found.setdefault(name, set()).add(path.name)
+
+        assert "verify" in found, "the messages under test moved or changed"
+        unknown = {
+            name: sorted(where) for name, where in found.items()
+            if name not in cli_packages._SUBCOMMANDS
+        }
+        assert unknown == {}, (
+            f"these messages name a packages subcommand that does not "
+            f"exist: {unknown}"
+        )

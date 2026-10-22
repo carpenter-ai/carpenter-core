@@ -155,6 +155,35 @@ def default_search_paths() -> list[Path]:
     return deduped
 
 
+def configured_search_paths() -> list[Path] | None:
+    """Return the operator-configured search paths, or ``None``.
+
+    Reads ``config["capability_packages"]["search_paths"]``.  ``None``
+    means "use :func:`default_search_paths`" (per D22 — zero-action
+    discovery).  A malformed value is logged and treated as unset.
+
+    Shared by the startup path (:class:`carpenter.coordinator.Coordinator`)
+    and the live reload path
+    (:func:`carpenter.packages.reload.reload_packages`) so the two can
+    never look in different places.
+    """
+    try:
+        from .. import config as _config_mod
+        cfg = _config_mod.CONFIG.get("capability_packages", {}) or {}
+    except Exception:  # pragma: no cover — defensive
+        return None
+    configured = cfg.get("search_paths")
+    if not configured:
+        return None
+    if not isinstance(configured, list):
+        logger.error(
+            "config['capability_packages']['search_paths'] must be "
+            "a list; falling back to defaults",
+        )
+        return None
+    return [Path(os.path.expanduser(str(p))) for p in configured]
+
+
 def _read_raw_yaml(path: Path) -> dict:
     """Read the raw YAML dict for a manifest, for security validation."""
     import yaml
@@ -451,351 +480,311 @@ class PackageRegistry:
 
         return tuple(registered), tuple(gated), tuple(errors)
 
-    def discover_and_register(
-        self,
-        search_paths: list[Path] | None = None,
-        *,
-        db_conn=None,
-    ) -> list[RegisteredPackage]:
-        """Discover packages on the search paths and register their artifacts.
+    # ── Internal seam shared by startup discovery and live reload ────
+    #
+    # ``discover_and_register`` is the startup path.  The helpers it is
+    # built from — :meth:`resolve_search_paths`,
+    # :meth:`prepare_manifest`, :meth:`register_package` and
+    # :meth:`cross_validate_tools` — are also called by
+    # :func:`carpenter.packages.reload.reload_packages`, so a live
+    # reload registers a newly installed package's components through
+    # EXACTLY the same code a cold start uses instead of a second,
+    # drifting implementation.
 
-        Idempotent in the sense that calling twice produces no
-        duplicate registrations: a package whose name is already loaded
-        is skipped (with a debug log).  Hot-reload semantics are NOT a
-        Phase A concern — restart the daemon to pick up changes.
+    def resolve_search_paths(
+        self, search_paths: list[Path] | None = None,
+    ) -> tuple[list[Path], set[Path]]:
+        """Return ``(search_paths, install_paths)`` for a discovery run.
 
-        Args:
-            search_paths: Override the default search paths.  ``None``
-                uses :func:`default_search_paths`.
-            db_conn: Optional SQLite connection for hash-verification
-                of installed packages (D24 SD6).  When provided, every
-                package discovered under an install path has its
-                recorded hash compared to a fresh recomputation; on
-                mismatch the package is logged-and-skipped.  When
-                None, hash verification is skipped (e.g. tests that
-                don't initialise the DB).
-
-        Returns:
-            List of :class:`RegisteredPackage` actually loaded by this
-            call (excludes packages already loaded from a prior call
-            and excludes packages that failed validation).
+        ``install_paths`` is the subset of roots whose packages get the
+        hash-pin check (D24 SD6).  When the caller passes custom
+        search paths (tests, or an explicit config override), all of
+        them count as install paths so a fixture is verified exactly
+        as a real install would be.
         """
         if search_paths is None:
             search_paths = default_search_paths()
-        with self._lock:
-            self._search_paths = list(search_paths)
-
-        # Build the set of install paths so we can flag each manifest
-        # as "installed" or "shim-loaded".  When the caller passes
-        # custom search_paths (tests), treat all of them as installed
-        # paths so test fixtures don't trigger the shim warning by
-        # accident.
-        if search_paths is None or search_paths == default_search_paths():
+        if search_paths == default_search_paths():
             install_paths = {p.resolve() for p in default_install_paths()}
             # Env-var override paths are explicit overrides — treat
             # them as install paths so they don't trigger shim-mode.
             install_paths |= {p.resolve() for p in _env_var_paths()}
         else:
             install_paths = {p.resolve() for p in search_paths}
+        return list(search_paths), install_paths
 
-        # Pull the names of installed packages so the back-compat shim
-        # can skip a same-named source-repo package when the install
-        # already won.  Uses ``db_conn`` when provided.
-        installed_names: set[str] = set()
+    def prepare_manifest(
+        self, manifest_path: Path, *, is_install: bool, db_conn=None,
+    ) -> tuple[PackageManifest | None, str | None]:
+        """Parse, security-check and hash-pin-gate one discovered manifest.
+
+        Returns ``(manifest, None)`` when the package may be
+        registered, or ``(manifest_or_None, reason)`` when it must be
+        skipped.  Every skip is logged here exactly as it is at
+        startup; the returned reason exists so a caller that reports
+        per-package outcomes (the live reload path) can repeat it
+        without re-deriving the decision.
+        """
+        try:
+            raw = _read_raw_yaml(manifest_path)
+            manifest = load_manifest(manifest_path)
+            validate_manifest_security(
+                manifest,
+                raw_manifest=raw,
+                manifest_path=manifest_path,
+            )
+        except (ManifestError, PackageSecurityError, FileNotFoundError) as exc:
+            logger.error(
+                "Skipping capability package at %s: %s",
+                manifest_path, exc,
+            )
+            return None, f"manifest rejected: {exc}"
+        except Exception as exc:  # pragma: no cover — defensive
+            logger.exception(
+                "Unexpected error loading capability package %s: %s",
+                manifest_path, exc,
+            )
+            return None, (
+                f"manifest load failed: {type(exc).__name__}: {exc}"
+            )
+
+        # SD6: hash-verify installed packages on every load.
+        if is_install and db_conn is not None:
+            from .installer import verify_install
+            try:
+                vr = verify_install(manifest.name, conn=db_conn)
+            except Exception as exc:  # pragma: no cover — defensive
+                logger.exception(
+                    "verify_install raised for %r at %s: %s",
+                    manifest.name, manifest_path, exc,
+                )
+                return manifest, (
+                    f"install verification raised: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+            if not vr.ok:
+                # SD6 / spec §5.5: refuse to load on hash mismatch
+                # OR missing install record.  An install-path dir
+                # with no ``installed_packages`` row is a sign of
+                # tampering or a partial install (the install
+                # transaction either commits both or neither);
+                # loading without verification would give an
+                # attacker who can drop files into the install root
+                # the ability to bypass hash checks.  Tightened
+                # from the prior soft-warn (PR #306 followup
+                # NIT #7).
+                missing_row = (
+                    " (no installed_packages row — re-run "
+                    "install_package)" if vr.expected_hash is None else ""
+                )
+                logger.error(
+                    "Refusing to load capability package %r from "
+                    "%s: %s%s",
+                    manifest.name, manifest_path, vr.message, missing_row,
+                )
+                return manifest, (
+                    f"refused by the install hash pin: "
+                    f"{vr.message}{missing_row}"
+                )
+        return manifest, None
+
+    def register_package(
+        self, manifest: PackageManifest, *, db_conn=None,
+    ) -> RegisteredPackage:
+        """Register one package's components and record it as loaded.
+
+        The single registration path for capability-package components:
+        chat tools, data models, arc templates, JUDGE handlers, step
+        handlers, granted platform capabilities and in-process
+        triggers.  Startup discovery and the live reload both call it.
+
+        The caller is responsible for having run
+        :meth:`prepare_manifest` first (manifest validated, security
+        guards passed, install hash pin verified) and for the package
+        not already being loaded.
+        """
+        # Per-package operator opt-in for WRITE chat tools.  Read the
+        # install record's ``write_chat_tools_allowed`` flag — the
+        # authoritative record of operator consent.  Without a DB
+        # connection we cannot prove consent, so we fail-closed
+        # (treat as not-opted-in; write chat tools are gated off).
+        write_allowed = False
         if db_conn is not None:
             try:
-                from .installer import list_install_records
-                installed_names = {
-                    r["name"] for r in list_install_records(db_conn)
-                }
+                from .installer import (
+                    write_chat_tools_allowed_for_package,
+                )
+                write_allowed = write_chat_tools_allowed_for_package(
+                    db_conn, manifest.name,
+                )
             except Exception:  # pragma: no cover — defensive
                 logger.exception(
-                    "list_install_records failed; "
-                    "back-compat shim deduplication skipped",
+                    "Package %r: could not read write_chat_tools_allowed "
+                    "flag; defaulting to gated-off (read-only)",
+                    manifest.name,
                 )
+                write_allowed = False
 
-        manifest_pairs = self._discover_manifests(
-            search_paths, install_paths=install_paths,
+        registered_names, gated_names, errors = self._register_chat_tools(
+            manifest, write_chat_tools_allowed=write_allowed,
         )
-        if not manifest_pairs:
-            logger.info(
-                "No capability packages discovered on search paths: %s",
-                [str(p) for p in search_paths],
+
+        # D24 stage 3b: load arc templates, JUDGE handlers, data
+        # models, and step handlers from the package.  Each loader
+        # returns its own error list which we fold into the
+        # package's load_errors so list_packages stays observable.
+        artifact_counts: dict[str, int] = {}
+        template_names: tuple[str, ...] = ()
+        try:
+            from .loaders import load_package_artifacts
+            counts, art_errors, tnames = load_package_artifacts(
+                manifest, db_conn=db_conn,
             )
-            return []
+            artifact_counts = counts
+            errors = errors + tuple(art_errors)
+            template_names = tuple(tnames)
+        except Exception as exc:  # pragma: no cover — defensive
+            logger.exception(
+                "Package %r: artifact loader raised: %s",
+                manifest.name, exc,
+            )
+            errors = errors + (
+                f"artifact loader raised: {type(exc).__name__}: {exc}",
+            )
 
-        loaded: list[RegisteredPackage] = []
-
-        for manifest_path, is_install in manifest_pairs:
-            try:
-                raw = _read_raw_yaml(manifest_path)
-                manifest = load_manifest(manifest_path)
-                validate_manifest_security(
-                    manifest,
-                    raw_manifest=raw,
-                    manifest_path=manifest_path,
+        # Package-capability framework: register the package's GRANTED
+        # trusted dispatch verbs.  Only verbs recorded as granted in
+        # the install record (operator-confirmed at install time) are
+        # registered; declared-but-not-confirmed verbs are skipped.
+        # Requires the DB to read the grant record — without it we
+        # cannot prove the operator consented, so we register nothing
+        # (fail-closed).
+        if manifest.platform_capabilities:
+            if db_conn is None:
+                logger.warning(
+                    "Package %r declares platform capabilities but no "
+                    "DB connection was provided; cannot verify grants, "
+                    "registering none",
+                    manifest.name,
                 )
-            except (ManifestError, PackageSecurityError, FileNotFoundError) as exc:
-                logger.error(
-                    "Skipping capability package at %s: %s",
-                    manifest_path, exc,
-                )
-                continue
-            except Exception as exc:  # pragma: no cover — defensive
-                logger.exception(
-                    "Unexpected error loading capability package %s: %s",
-                    manifest_path, exc,
-                )
-                continue
-
-            # SD6: hash-verify installed packages on every load.
-            if is_install and db_conn is not None:
-                from .installer import verify_install
+            else:
                 try:
-                    vr = verify_install(manifest.name, conn=db_conn)
-                except Exception as exc:  # pragma: no cover — defensive
-                    logger.exception(
-                        "verify_install raised for %r at %s: %s",
-                        manifest.name, manifest_path, exc,
-                    )
-                    continue
-                if not vr.ok:
-                    # SD6 / spec §5.5: refuse to load on hash mismatch
-                    # OR missing install record.  An install-path dir
-                    # with no ``installed_packages`` row is a sign of
-                    # tampering or a partial install (the install
-                    # transaction either commits both or neither);
-                    # loading without verification would give an
-                    # attacker who can drop files into the install root
-                    # the ability to bypass hash checks.  Tightened
-                    # from the prior soft-warn (PR #306 followup
-                    # NIT #7).
-                    logger.error(
-                        "Refusing to load capability package %r from "
-                        "%s: %s%s",
-                        manifest.name, manifest_path, vr.message,
-                        " (no installed_packages row — re-run "
-                        "install_package)" if vr.expected_hash is None
-                        else "",
-                    )
-                    continue
-
-            # D24 stage 3b: back-compat shim removed.  Every loaded
-            # package must come from an install path; non-install paths
-            # may still be passed in by tests for fixture flexibility,
-            # but a non-install path is no longer special-cased.
-            with self._lock:
-                already_loaded = manifest.name in self._packages
-            if already_loaded:
-                # Surface the duplicate as a load_errors entry on a
-                # placeholder RegisteredPackage so the second
-                # occurrence is observable via list_packages — without
-                # this, a malicious local clone discovered AFTER a
-                # legitimate sibling-repo package would be silently
-                # dropped.  We don't refuse-to-start; we log + record.
-                err_msg = (
-                    f"Duplicate package name {manifest.name!r}: a "
-                    f"package with this name was already loaded from "
-                    f"a different path.  This second occurrence at "
-                    f"{manifest_path} was skipped."
-                )
-                logger.error(
-                    "Capability package %r at %s collides with an "
-                    "already-loaded package; skipping",
-                    manifest.name, manifest_path,
-                )
-                # Annotate the existing RegisteredPackage with a
-                # load_errors entry so it surfaces in list_packages.
-                with self._lock:
-                    existing = self._packages.get(manifest.name)
-                    if existing is not None:
-                        self._packages[manifest.name] = RegisteredPackage(
-                            manifest=existing.manifest,
-                            chat_tool_names=existing.chat_tool_names,
-                            template_names=existing.template_names,
-                            artifact_counts=existing.artifact_counts,
-                            load_errors=existing.load_errors + (err_msg,),
-                            gated_chat_tool_names=existing.gated_chat_tool_names,
-                        )
-                continue
-
-            # Per-package operator opt-in for WRITE chat tools.  Read the
-            # install record's ``write_chat_tools_allowed`` flag — the
-            # authoritative record of operator consent.  Without a DB
-            # connection we cannot prove consent, so we fail-closed
-            # (treat as not-opted-in; write chat tools are gated off).
-            write_allowed = False
-            if db_conn is not None:
-                try:
-                    from .installer import (
-                        write_chat_tools_allowed_for_package,
-                    )
-                    write_allowed = write_chat_tools_allowed_for_package(
+                    from .installer import granted_verbs_for_package
+                    from .loaders import load_platform_capabilities
+                    granted = granted_verbs_for_package(
                         db_conn, manifest.name,
                     )
-                except Exception:  # pragma: no cover — defensive
+                    cap_n, cap_errs = load_platform_capabilities(
+                        manifest, granted_verbs=granted,
+                    )
+                    errors = errors + tuple(cap_errs)
+                    if cap_n:
+                        artifact_counts["platform_capabilities"] = cap_n
+                except Exception as exc:  # pragma: no cover — defensive
                     logger.exception(
-                        "Package %r: could not read write_chat_tools_allowed "
-                        "flag; defaulting to gated-off (read-only)",
-                        manifest.name,
+                        "Package %r: capability loader raised: %s",
+                        manifest.name, exc,
                     )
-                    write_allowed = False
-
-            registered_names, gated_names, errors = self._register_chat_tools(
-                manifest, write_chat_tools_allowed=write_allowed,
-            )
-
-            # D24 stage 3b: load arc templates, JUDGE handlers, data
-            # models, and step handlers from the package.  Each loader
-            # returns its own error list which we fold into the
-            # package's load_errors so list_packages stays observable.
-            artifact_counts: dict[str, int] = {}
-            template_names: tuple[str, ...] = ()
-            try:
-                from .loaders import load_package_artifacts
-                counts, art_errors, tnames = load_package_artifacts(
-                    manifest, db_conn=db_conn,
-                )
-                artifact_counts = counts
-                errors = errors + tuple(art_errors)
-                template_names = tuple(tnames)
-            except Exception as exc:  # pragma: no cover — defensive
-                logger.exception(
-                    "Package %r: artifact loader raised: %s",
-                    manifest.name, exc,
-                )
-                errors = errors + (
-                    f"artifact loader raised: {type(exc).__name__}: {exc}",
-                )
-
-            # Package-capability framework: register the package's GRANTED
-            # trusted dispatch verbs.  Only verbs recorded as granted in
-            # the install record (operator-confirmed at install time) are
-            # registered; declared-but-not-confirmed verbs are skipped.
-            # Requires the DB to read the grant record — without it we
-            # cannot prove the operator consented, so we register nothing
-            # (fail-closed).
-            if manifest.platform_capabilities:
-                if db_conn is None:
-                    logger.warning(
-                        "Package %r declares platform capabilities but no "
-                        "DB connection was provided; cannot verify grants, "
-                        "registering none",
-                        manifest.name,
+                    errors = errors + (
+                        f"capability loader raised: "
+                        f"{type(exc).__name__}: {exc}",
                     )
-                else:
-                    try:
-                        from .installer import granted_verbs_for_package
-                        from .loaders import load_platform_capabilities
-                        granted = granted_verbs_for_package(
-                            db_conn, manifest.name,
-                        )
-                        cap_n, cap_errs = load_platform_capabilities(
-                            manifest, granted_verbs=granted,
-                        )
-                        errors = errors + tuple(cap_errs)
-                        if cap_n:
-                            artifact_counts["platform_capabilities"] = cap_n
-                    except Exception as exc:  # pragma: no cover — defensive
-                        logger.exception(
-                            "Package %r: capability loader raised: %s",
-                            manifest.name, exc,
-                        )
-                        errors = errors + (
-                            f"capability loader raised: "
-                            f"{type(exc).__name__}: {exc}",
-                        )
 
-            # Phase 3a PR-B follow-up: instantiate + start the package's
-            # in-process Trigger instances at STARTUP.  install_package
-            # does this once at install time, but a daemon restart never
-            # re-ran it, so a package's poll triggers silently vanished
-            # after a restart (they were never re-added to the pollable-
-            # trigger registry and never ticked).  We reuse
-            # ``_install_triggers`` — it is load-not-copy (imports the
-            # trigger modules, instantiates via ``load_package_triggers``,
-            # and calls ``start()``); it does NOT copy files or write the
-            # install record, so it is safe to call on a load.  It is
-            # idempotent: it drops any prior registrations for the package
-            # via ``unregister_for_package`` before re-loading, so a second
-            # ``discover_and_register`` in the same process replaces rather
-            # than duplicates the package's trigger instances.  The active
-            # ``db_conn`` is threaded so a trigger's start-time
-            # package_state reads/writes do not open a nested transaction
-            # (mirrors #47).  Trigger-load failures are surfaced as
-            # non-fatal load_errors rather than crashing startup.
-            try:
-                from .installer import _install_triggers
-                triggers_n = _install_triggers(
-                    manifest, Path(manifest.source_path), conn=db_conn,
-                )
-                if triggers_n:
-                    artifact_counts["triggers"] = triggers_n
-            except Exception as exc:  # pragma: no cover — defensive
-                logger.exception(
-                    "Package %r: trigger loader raised: %s",
-                    manifest.name, exc,
-                )
-                errors = errors + (
-                    f"trigger loader raised: {type(exc).__name__}: {exc}",
-                )
-
-            entry = RegisteredPackage(
-                manifest=manifest,
-                chat_tool_names=registered_names,
-                template_names=template_names,
-                artifact_counts=artifact_counts,
-                load_errors=errors,
-                gated_chat_tool_names=gated_names,
+        # Phase 3a PR-B follow-up: instantiate + start the package's
+        # in-process Trigger instances at STARTUP.  install_package
+        # does this once at install time, but a daemon restart never
+        # re-ran it, so a package's poll triggers silently vanished
+        # after a restart (they were never re-added to the pollable-
+        # trigger registry and never ticked).  We reuse
+        # ``_install_triggers`` — it is load-not-copy (imports the
+        # trigger modules, instantiates via ``load_package_triggers``,
+        # and calls ``start()``); it does NOT copy files or write the
+        # install record, so it is safe to call on a load.  It is
+        # idempotent: it drops any prior registrations for the package
+        # via ``unregister_for_package`` before re-loading, so a second
+        # ``discover_and_register`` in the same process replaces rather
+        # than duplicates the package's trigger instances.  The active
+        # ``db_conn`` is threaded so a trigger's start-time
+        # package_state reads/writes do not open a nested transaction
+        # (mirrors #47).  Trigger-load failures are surfaced as
+        # non-fatal load_errors rather than crashing startup.
+        try:
+            from .installer import _install_triggers
+            triggers_n = _install_triggers(
+                manifest, Path(manifest.source_path), conn=db_conn,
             )
-            with self._lock:
-                self._packages[manifest.name] = entry
-            loaded.append(entry)
-            artifact_summary = (
-                ", ".join(
-                    f"{n} {k}" for k, n in artifact_counts.items() if n
-                )
-                or "no D24 artifacts"
+            if triggers_n:
+                artifact_counts["triggers"] = triggers_n
+        except Exception as exc:  # pragma: no cover — defensive
+            logger.exception(
+                "Package %r: trigger loader raised: %s",
+                manifest.name, exc,
             )
-            if gated_names:
-                logger.warning(
-                    "Package %r: %d write-capable chat tool(s) GATED "
-                    "(requires operator opt-in; not registered): %s",
-                    manifest.name, len(gated_names),
-                    ", ".join(gated_names),
-                )
-            # Surface each non-fatal load error individually at WARNING.
-            # Previously only the COUNT was logged in the summary below,
-            # which made the "N non-fatal error(s)" message opaque -- an
-            # operator could see "7 errors" with no way to tell what they
-            # were without instrumenting the code.  Logging them here keeps
-            # them observable in the daemon journal.
-            for _err in errors:
-                logger.warning(
-                    "Package %r: non-fatal load error: %s",
-                    manifest.name, _err,
-                )
-            logger.info(
-                "Loaded capability package %r v%s from %s "
-                "(%d chat tool(s)%s; %s%s)",
-                manifest.name,
-                manifest.version,
-                manifest.source_path,
-                len(registered_names),
-                f", {len(gated_names)} gated (operator opt-in required)"
-                if gated_names else "",
-                artifact_summary,
-                f"; {len(errors)} non-fatal error(s)" if errors else "",
+            errors = errors + (
+                f"trigger loader raised: {type(exc).__name__}: {exc}",
             )
 
-        # Cross-package consistency check on the merged tool set.
-        # ``register_extension_tool`` already validates each tool
-        # individually, but running ``validate_tool_defs`` over the
-        # whole loaded set catches any remaining inconsistencies that
-        # only emerge across packages — including collisions that
-        # somehow slipped past the per-tool collision check above.
-        # Errors here are logged and recorded on the offending
-        # package's load_errors; the validator does not mutate state.
+        entry = RegisteredPackage(
+            manifest=manifest,
+            chat_tool_names=registered_names,
+            template_names=template_names,
+            artifact_counts=artifact_counts,
+            load_errors=errors,
+            gated_chat_tool_names=gated_names,
+        )
+        with self._lock:
+            self._packages[manifest.name] = entry
+        artifact_summary = (
+            ", ".join(
+                f"{n} {k}" for k, n in artifact_counts.items() if n
+            )
+            or "no D24 artifacts"
+        )
+        if gated_names:
+            logger.warning(
+                "Package %r: %d write-capable chat tool(s) GATED "
+                "(requires operator opt-in; not registered): %s",
+                manifest.name, len(gated_names),
+                ", ".join(gated_names),
+            )
+        # Surface each non-fatal load error individually at WARNING.
+        # Previously only the COUNT was logged in the summary below,
+        # which made the "N non-fatal error(s)" message opaque -- an
+        # operator could see "7 errors" with no way to tell what they
+        # were without instrumenting the code.  Logging them here keeps
+        # them observable in the daemon journal.
+        for _err in errors:
+            logger.warning(
+                "Package %r: non-fatal load error: %s",
+                manifest.name, _err,
+            )
+        logger.info(
+            "Loaded capability package %r v%s from %s "
+            "(%d chat tool(s)%s; %s%s)",
+            manifest.name,
+            manifest.version,
+            manifest.source_path,
+            len(registered_names),
+            f", {len(gated_names)} gated (operator opt-in required)"
+            if gated_names else "",
+            artifact_summary,
+            f"; {len(errors)} non-fatal error(s)" if errors else "",
+        )
+        return entry
+
+    def cross_validate_tools(self) -> None:
+        """Validate the merged chat-tool set across every loaded package.
+
+        ``register_extension_tool`` already validates each tool
+        individually, but running ``validate_tool_defs`` over the
+        whole loaded set catches any remaining inconsistencies that
+        only emerge across packages — including collisions that
+        somehow slipped past the per-tool collision check.  Errors
+        here are logged and recorded on the offending package's
+        ``load_errors``; the validator does not mutate tool state, and
+        an error already recorded is not appended twice (so repeated
+        calls — e.g. a live reload after startup — stay idempotent).
+        """
         try:
             from ..chat_tool_loader import _loaded_tools
             from ..chat_tool_registry import validate_tool_defs
@@ -813,37 +802,171 @@ class PackageRegistry:
             validation_errors = validate_tool_defs(
                 all_tools, write_chat_tools_allowed=True,
             )
-            if validation_errors:
-                for verr in validation_errors:
-                    logger.error(
-                        "Cross-package tool validation: %s", verr,
+            if not validation_errors:
+                return
+            for verr in validation_errors:
+                logger.error(
+                    "Cross-package tool validation: %s", verr,
+                )
+            # Annotate every package whose tool name appears in an
+            # error string.  This is best-effort: validate_tool_defs
+            # error strings include the offending tool name in
+            # quotes, so we match by substring.
+            with self._lock:
+                for pkg_name, pkg in list(self._packages.items()):
+                    relevant = tuple(
+                        ve for ve in validation_errors
+                        if any(
+                            f"{tn!r}" in ve
+                            for tn in pkg.chat_tool_names
+                        )
+                        and ve not in pkg.load_errors
                     )
-                # Annotate every package whose tool name appears in an
-                # error string.  This is best-effort: validate_tool_defs
-                # error strings include the offending tool name in
-                # quotes, so we match by substring.
-                with self._lock:
-                    for pkg_name, pkg in list(self._packages.items()):
-                        relevant = [
-                            ve for ve in validation_errors
-                            if any(
-                                f"{tn!r}" in ve
-                                for tn in pkg.chat_tool_names
-                            )
-                        ]
-                        if relevant:
-                            self._packages[pkg_name] = RegisteredPackage(
-                                manifest=pkg.manifest,
-                                chat_tool_names=pkg.chat_tool_names,
-                                template_names=pkg.template_names,
-                                artifact_counts=pkg.artifact_counts,
-                                load_errors=pkg.load_errors + tuple(relevant),
-                                gated_chat_tool_names=pkg.gated_chat_tool_names,
-                            )
+                    if relevant:
+                        self._packages[pkg_name] = RegisteredPackage(
+                            manifest=pkg.manifest,
+                            chat_tool_names=pkg.chat_tool_names,
+                            template_names=pkg.template_names,
+                            artifact_counts=pkg.artifact_counts,
+                            load_errors=pkg.load_errors + relevant,
+                            gated_chat_tool_names=pkg.gated_chat_tool_names,
+                        )
         except Exception:  # pragma: no cover — defensive
             logger.exception(
                 "Cross-package validate_tool_defs raised; ignoring",
             )
+
+    def note_duplicate(
+        self, manifest: PackageManifest, manifest_path: Path,
+    ) -> str:
+        """Record a second package claiming an already-loaded name.
+
+        Annotates the ALREADY-loaded package with a ``load_errors``
+        entry so the collision is observable via ``list_packages``,
+        and returns the message.  Without this, a malicious local
+        clone discovered AFTER a legitimate package would be silently
+        dropped.  We don't refuse to start; we log + record.
+        """
+        err_msg = (
+            f"Duplicate package name {manifest.name!r}: a "
+            f"package with this name was already loaded from "
+            f"a different path.  This second occurrence at "
+            f"{manifest_path} was skipped."
+        )
+        logger.error(
+            "Capability package %r at %s collides with an "
+            "already-loaded package; skipping",
+            manifest.name, manifest_path,
+        )
+        with self._lock:
+            existing = self._packages.get(manifest.name)
+            if existing is not None and err_msg not in existing.load_errors:
+                self._packages[manifest.name] = RegisteredPackage(
+                    manifest=existing.manifest,
+                    chat_tool_names=existing.chat_tool_names,
+                    template_names=existing.template_names,
+                    artifact_counts=existing.artifact_counts,
+                    load_errors=existing.load_errors + (err_msg,),
+                    gated_chat_tool_names=existing.gated_chat_tool_names,
+                )
+        return err_msg
+
+    def loaded_from_same_path(
+        self, manifest: PackageManifest,
+    ) -> bool:
+        """True if this exact package directory is already registered.
+
+        Re-discovering the directory a loaded package came from is a
+        no-op re-scan (startup running twice, or a live reload), NOT a
+        duplicate-name collision — only a *different* directory
+        claiming a loaded name is.
+        """
+        with self._lock:
+            existing = self._packages.get(manifest.name)
+        if existing is None:
+            return False
+        try:
+            return (
+                Path(existing.manifest.source_path).resolve()
+                == Path(manifest.source_path).resolve()
+            )
+        except OSError:  # pragma: no cover — defensive
+            return False
+
+    def discover_and_register(
+        self,
+        search_paths: list[Path] | None = None,
+        *,
+        db_conn=None,
+    ) -> list[RegisteredPackage]:
+        """Discover packages on the search paths and register their artifacts.
+
+        Idempotent in the sense that calling twice produces no
+        duplicate registrations: a package whose name is already loaded
+        from the same directory is skipped (with a debug log).  This is
+        the COLD-START path; to pick up a package installed into a
+        live process see
+        :func:`carpenter.packages.reload.reload_packages`, and note
+        that a package already imported in this process cannot be
+        re-imported without a restart (``sys.modules`` caching).
+
+        Args:
+            search_paths: Override the default search paths.  ``None``
+                uses :func:`default_search_paths`.
+            db_conn: Optional SQLite connection for hash-verification
+                of installed packages (D24 SD6).  When provided, every
+                package discovered under an install path has its
+                recorded hash compared to a fresh recomputation; on
+                mismatch the package is logged-and-skipped.  When
+                None, hash verification is skipped (e.g. tests that
+                don't initialise the DB).
+
+        Returns:
+            List of :class:`RegisteredPackage` actually loaded by this
+            call (excludes packages already loaded from a prior call
+            and excludes packages that failed validation).
+        """
+        search_paths, install_paths = self.resolve_search_paths(search_paths)
+        with self._lock:
+            self._search_paths = list(search_paths)
+
+        manifest_pairs = self._discover_manifests(
+            search_paths, install_paths=install_paths,
+        )
+        if not manifest_pairs:
+            logger.info(
+                "No capability packages discovered on search paths: %s",
+                [str(p) for p in search_paths],
+            )
+            return []
+
+        loaded: list[RegisteredPackage] = []
+
+        for manifest_path, is_install in manifest_pairs:
+            manifest, skip_reason = self.prepare_manifest(
+                manifest_path, is_install=is_install, db_conn=db_conn,
+            )
+            if manifest is None or skip_reason is not None:
+                continue
+
+            # D24 stage 3b: back-compat shim removed.  Every loaded
+            # package must come from an install path; non-install paths
+            # may still be passed in by tests for fixture flexibility,
+            # but a non-install path is no longer special-cased.
+            if self.get(manifest.name) is not None:
+                if not self.loaded_from_same_path(manifest):
+                    self.note_duplicate(manifest, manifest_path)
+                else:
+                    logger.debug(
+                        "Capability package %r already loaded from %s; "
+                        "skipping re-registration",
+                        manifest.name, manifest_path,
+                    )
+                continue
+
+            loaded.append(self.register_package(manifest, db_conn=db_conn))
+
+        self.cross_validate_tools()
 
         if loaded:
             logger.info(

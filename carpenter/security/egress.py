@@ -27,6 +27,17 @@ the JUDGE value allowlists (``security.domain_allowlist``,
 cross a trust boundary, not whether a host is reachable.  See "Allowlists"
 in docs/security-model.md.
 
+A caller must also make sure the request really goes to the host that
+was checked.  Two things route around it silently: an HTTP redirect
+(re-check every hop with :func:`check_redirect`, as
+``tool_backends/web.py`` and the package fetchers do) and a proxy in the
+process environment — ``HTTP_PROXY``, ``HTTPS_PROXY``, ``ALL_PROXY`` —
+which most clients honour by default and which makes the address
+inspection below meaningless.  Clients on a gated path therefore disable
+environment trust (``trust_env=False`` for httpx; for the git fetcher, a
+pool manager it builds itself rather than dulwich's proxy-reading
+default).
+
 The check resolves the hostname and inspects every address it resolves
 to, so numeric forms such as ``http://2130706433/`` are caught.  It is
 not a defence against DNS rebinding: the HTTP client resolves the name

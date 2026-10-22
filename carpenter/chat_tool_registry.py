@@ -40,6 +40,25 @@ PLATFORM_TOOLS = frozenset({
     # API budget circuit breaker control: clearing a tripped breaker or
     # raising a limit mutates safety-critical platform state.
     "budget_control",
+    # Asks the operator to approve a package install on a one-time link.
+    # Installs nothing itself, but writes platform state (a quarantine
+    # directory and a request row), so it cannot sit at the chat
+    # boundary.  Chat-only: refused to arc agents (CHAT_ONLY_TOOLS).
+    # A platform-boundary tool whose name is missing from this set makes
+    # tool loading raise at startup, so this entry and the seed module
+    # config_seed/chat_tools/packages_install_request.py must stay
+    # together.
+    "request_package_install",
+    # Lists what a configured package source offers.  Read-only - it
+    # reads manifests and runs no package code - but the listing it
+    # caches under ``{base_dir}/cache/`` is a platform write, and a
+    # chat-boundary tool may not write at all.  Ships in the same seed
+    # module as ``request_package_install``, so this entry and that file
+    # must stay together too.  Deliberately NOT in ``CHAT_ONLY_TOOLS``:
+    # an arc may read it, because its only input is an alias the
+    # operator configured and the listing TTL bounds the network it can
+    # cause.
+    "list_available_packages",
 })
 
 # Operator-only tools.  Core requires a human to confirm every call to one
@@ -51,6 +70,31 @@ OPERATOR_ONLY_TOOLS = frozenset({
     "budget_control",
     "install_package",
     "uninstall_package",
+})
+
+# Chat-only tools.  The mirror image of OPERATOR_ONLY_TOOLS: these are
+# refused to ARC agents and allowed to the chat agent, whatever the
+# (user-owned) tool module declares.  Core is the enforcement point for
+# the same reason it is there — a chat tool module can lag behind the
+# seed or lose a flag, and a security property that lives only in a
+# user-editable file is not a security property.
+#
+# A chat-only tool is one whose whole safety argument is "a human is
+# reading this, in the conversation it was asked for".  An arc agent runs
+# unattended and may be acting on content a third party wrote (an email it
+# read, a web page, a KB entry), so letting one reach such a tool is how
+# a prompt injection gets a hand on the platform.
+#
+# These are NOT in OPERATOR_ONLY_TOOLS and must not be: that set is
+# dropped for EVERY agent when no confirmation handler is registered
+# (``invocation._select_chat_tools``), and none is registered on this
+# platform — so putting a chat tool there would make it unreachable.
+CHAT_ONLY_TOOLS = frozenset({
+    # Asks the operator to approve a package install on a one-time link
+    # and installs nothing by itself.  The link is sent back into the
+    # conversation that asked, which is only meaningful when a human is
+    # in it.
+    "request_package_install",
 })
 
 # Where the operator does the same thing without the chat agent.

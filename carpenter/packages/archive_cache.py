@@ -11,9 +11,14 @@ Design
 ------
 * Each package version's pristine tree is stored as a deterministic
   gzipped tar archive in a local cache under
-  ``{base_dir}/cache/package-archives/<name>/<version>.tar.gz``.  This
-  cache lives under ``base_dir``, **not** on the root filesystem, which
-  may be slow flash storage.
+  ``{base_dir}/cache/package-archives/<name>/<source_id>/<version>.tar.gz``
+  (and, for archives written before the ``source_id`` level existed,
+  ``<name>/<version>.tar.gz``, which is still read).  This cache lives
+  under ``base_dir``, **not** on the root filesystem, which may be slow
+  flash storage.  A package's whole ``<name>/`` subtree is reclaimed on
+  uninstall (:func:`reclaim_package_archives`), so the cache cannot grow
+  without bound across installs, re-installs and upgrades of packages
+  that are no longer installed.
 * The remote host that supplies an archive (a GitHub release asset,
   etc.) is **untrusted storage**.  The trust anchor is the local root
   hash already recorded in ``installed_packages.hash`` and computed by
@@ -54,8 +59,10 @@ __all__ = [
     "ArchiveCacheError",
     "ArchiveVerificationError",
     "ArchiveFetcher",
+    "archive_candidates",
     "archive_tree",
     "cache_dir",
+    "reclaim_package_archives",
     "store_archive",
     "load_pristine_tree",
 ]
@@ -197,32 +204,312 @@ def cache_dir() -> Path:
     return root
 
 
-def _archive_path(name: str, version: str) -> Path:
-    """Cache path for a package version's archive: ``<name>/<version>.tar.gz``."""
-    return cache_dir() / name / f"{version}.tar.gz"
+#: Infix for an archive that was moved aside rather than overwritten:
+#: ``<version>.superseded-<root hash prefix>.tar.gz``.  See
+#: :func:`store_archive`.
+_SUPERSEDED_INFIX = ".superseded-"
 
 
-def store_archive(name: str, version: str, source_dir: Path) -> Path:
+def _package_cache_dir(name: str, source_id: str | None = None) -> Path:
+    """Return the cache directory for a package, per layout.
+
+    ``<cache>/<name>/<source_id>/`` is the CURRENT layout; the
+    ``source_id``-less ``<cache>/<name>/`` is the OLD one, still read.
+    Neither is created here.
+    """
+    root = cache_dir() / name
+    return root / source_id if source_id else root
+
+
+def _archive_path(
+    name: str, version: str, source_id: str | None = None,
+) -> Path:
+    """Cache path for a package version's archive.
+
+    ``<name>/<source_id>/<version>.tar.gz`` when the logical source is
+    known, else the original ``<name>/<version>.tar.gz``.
+
+    The ``source_id`` level exists because ``(name, version)`` is NOT an
+    identity: a package name is not globally unique, so two remotes
+    publishing ``demo@1.0.0`` would otherwise share one cache entry and
+    each overwrite the other's pristine tree (brief traps #2/#4).
+    ``sources.source_id`` discriminates them.  It is OPTIONAL so every
+    pre-existing caller — and every archive written before this layout —
+    keeps working: see :func:`archive_candidates`.
+    """
+    return _package_cache_dir(name, source_id) / f"{version}.tar.gz"
+
+
+def archive_candidates(
+    name: str, version: str, *, source_id: str | None = None,
+) -> tuple[Path, ...]:
+    """Return every cached archive that might hold ``name@version``.
+
+    In lookup order:
+
+    1. the current layout's archive (``<name>/<source_id>/<version>``),
+       when ``source_id`` is given,
+    2. the old layout's archive (``<name>/<version>``), so an archive
+       written before the ``source_id`` level is still found,
+    3. any archive moved aside by :func:`store_archive` because its
+       version string was re-published with different bytes, newest
+       name-sorted first, in both layouts.
+
+    Order is a hint only: :func:`load_pristine_tree` verifies each
+    candidate against the expected root hash and returns the first that
+    matches, so a wrong-but-present candidate is skipped rather than
+    served.
+    """
+    dirs: list[Path] = []
+    if source_id:
+        dirs.append(_package_cache_dir(name, source_id))
+    dirs.append(_package_cache_dir(name, None))
+
+    out: list[Path] = []
+    for d in dirs:
+        primary = d / f"{version}.tar.gz"
+        if primary.is_file():
+            out.append(primary)
+    for d in dirs:
+        if not d.is_dir():
+            continue
+        out.extend(sorted(
+            p for p in d.glob(f"{version}{_SUPERSEDED_INFIX}*.tar.gz")
+            if p.is_file()
+        ))
+    # dict.fromkeys de-duplicates while keeping order (source_id and
+    # old-layout dirs coincide when source_id is empty).
+    return tuple(dict.fromkeys(out))
+
+
+def _archive_root_hash(archive_path: Path) -> str:
+    """Return the root hash of the tree ``archive_path`` expands to."""
+    tmp_root = Path(tempfile.mkdtemp(prefix="carpenter-archive-hash-"))
+    try:
+        with tarfile.open(str(archive_path), mode="r:*") as tar:
+            _safe_extract(tar, tmp_root)
+        return compute_package_hash(tmp_root)
+    finally:
+        shutil.rmtree(tmp_root, ignore_errors=True)
+
+
+def _preserve_superseded(dest: Path, new_root_hash: str) -> None:
+    """Move ``dest`` aside if it holds a DIFFERENT tree to the new one.
+
+    ``version`` is a free-form string with no ordering, so a remote can
+    re-publish the same version string with different bytes (brief trap
+    #16).  Overwriting the cached archive in that case destroys the
+    ``shipped_old`` anchor the three-way reconcile needs for the
+    version that is installed RIGHT NOW — the upgrade engine's only way
+    to tell an operator's edit from an upstream change.  So the old
+    archive is renamed to ``<version>.superseded-<hash12>.tar.gz``
+    instead of being overwritten, and stays findable through
+    :func:`archive_candidates` (which verifies by hash, so the name is
+    only a label).
+
+    Best-effort: a failure here is logged and the caller proceeds, the
+    same posture install already takes toward the cache as a whole.  An
+    identical archive is left alone — rewriting the same bytes is not a
+    loss.
+    """
+    try:
+        existing_hash = _archive_root_hash(dest)
+    except Exception:  # noqa: BLE001 — unreadable/corrupt: nothing to keep
+        logger.warning(
+            "Could not read the cached archive at %s to check whether it "
+            "holds a different tree; it will be replaced", dest,
+            exc_info=True,
+        )
+        return
+    if existing_hash == new_root_hash:
+        return
+    aside = dest.with_name(
+        f"{dest.name[:-len('.tar.gz')]}"
+        f"{_SUPERSEDED_INFIX}{existing_hash[:12]}.tar.gz"
+    )
+    try:
+        os.replace(str(dest), str(aside))
+    except OSError:
+        logger.warning(
+            "Could not preserve the superseded archive %s as %s; the "
+            "pristine tree for that version will be lost", dest, aside,
+            exc_info=True,
+        )
+        return
+    logger.warning(
+        "Archive for %s already held a different tree (%s...); preserved "
+        "it as %s before storing %s...",
+        dest.name, existing_hash[:12], aside.name, new_root_hash[:12],
+    )
+
+
+def store_archive(
+    name: str,
+    version: str,
+    source_dir: Path,
+    *,
+    source_id: str | None = None,
+) -> Path:
     """Archive a package's pristine tree into the cache.
 
-    Writes ``<cache>/<name>/<version>.tar.gz`` and returns its path.
-    This is what the install flow would call to capture a pristine
-    snapshot — but it is intentionally NOT wired into install in this PR.
+    Writes ``<cache>/<name>/<source_id>/<version>.tar.gz`` (or the old
+    ``<cache>/<name>/<version>.tar.gz`` when no ``source_id`` is known)
+    and returns its path.  Called by the install flow to capture the
+    pristine snapshot an upgrade reconciles against.
+
+    If an archive is already there holding DIFFERENT bytes, it is moved
+    aside rather than overwritten (see :func:`_preserve_superseded`).
 
     Args:
         name: Package name.
         version: Package version string.
         source_dir: The package directory to snapshot.
+        source_id: Stable id of the logical source these bytes came
+            from (``sources.source_id``).  Omitted — the default — uses
+            the old, source-blind layout.
 
     Returns:
         Path to the stored archive.
     """
-    dest = _archive_path(name, version)
-    archive_tree(Path(source_dir), dest)
+    dest = _archive_path(name, version, source_id)
+    source_dir = Path(source_dir)
+    if dest.is_file():
+        _preserve_superseded(dest, compute_package_hash(source_dir))
+    archive_tree(source_dir, dest)
     logger.info(
         "Stored pristine archive for %s@%s at %s", name, version, dest,
     )
     return dest
+
+
+# ── cache reclamation ───────────────────────────────────────────────
+
+
+def _reclaim_target(name: str, root: Path) -> Path:
+    """Return the cache directory to delete for ``name``, or refuse.
+
+    Fail-closed allowlist in the style of :func:`_safe_extract` and
+    :func:`carpenter.packages.reconcile_apply._validate_rel_path` — the
+    caller is handing us a ``shutil.rmtree`` target, so nothing is
+    accepted that is not provably the package's own cache directory:
+
+    * an empty/whitespace name is refused,
+    * an absolute name, or one carrying a path separator, a drive
+      letter or a ``.``/``..`` component, is refused — a package name is
+      one path component, never a path,
+    * the resolved target must be a PROPER immediate subdirectory of the
+      resolved cache root: never the root itself, never above it, never
+      nested deeper,
+    * the target must not itself be a symlink, so a planted link cannot
+      redirect the delete out of the cache.  (``shutil.rmtree`` never
+      follows a symlinked *member*, so links inside the tree are removed
+      as links and their targets are left alone.)
+
+    Raises:
+        ArchiveCacheError: on any violation, BEFORE anything is deleted.
+    """
+    if not name or not name.strip():
+        raise ArchiveCacheError(
+            f"unsafe package name for cache reclaim (empty): {name!r}",
+        )
+    if name.startswith("/") or os.path.isabs(name):
+        raise ArchiveCacheError(
+            f"unsafe package name for cache reclaim (absolute): {name!r}",
+        )
+    # Reject backslash-absolute / drive-letter style too, since
+    # os.path.isabs is platform-dependent.
+    if name.startswith("\\") or (len(name) >= 2 and name[1] == ":"):
+        raise ArchiveCacheError(
+            f"unsafe package name for cache reclaim (absolute): {name!r}",
+        )
+    if "/" in name or "\\" in name or name in (".", ".."):
+        raise ArchiveCacheError(
+            f"unsafe package name for cache reclaim (not a single path "
+            f"component): {name!r}",
+        )
+
+    root_resolved = root.resolve()
+    candidate = root / name
+    if candidate.is_symlink():
+        raise ArchiveCacheError(
+            f"refusing to reclaim the cache for {name!r}: "
+            f"{candidate} is a symlink",
+        )
+    target = candidate.resolve()
+    if target == root_resolved or not _is_within(root_resolved, target):
+        raise ArchiveCacheError(
+            f"refusing to reclaim the cache for {name!r}: {target} is "
+            f"not a subdirectory of the cache root {root_resolved}",
+        )
+    if target.parent != root_resolved:
+        raise ArchiveCacheError(
+            f"refusing to reclaim the cache for {name!r}: {target} is "
+            f"not an immediate child of the cache root {root_resolved}",
+        )
+    return target
+
+
+def reclaim_package_archives(name: str) -> tuple[Path, ...]:
+    """Delete every cached pristine archive belonging to ``name``.
+
+    Removes ``<cache>/<name>/`` whole, so it reclaims every version and
+    every ``source_id`` the package ever had, the ``superseded-*`` copies
+    :func:`store_archive` moved aside, and the old source-blind
+    ``<cache>/<name>/<version>.tar.gz`` layout, leaving no empty
+    directories behind.  No other package's cache is touched: the delete
+    is scoped to one immediate child of the cache root, vetted by
+    :func:`_reclaim_target`.
+
+    Called from :func:`carpenter.packages.installer.uninstall_package`.
+    An archive is a *derived* artifact — a re-install re-materialises it
+    from the fetched tree — so there is nothing to keep once the install
+    record is gone, and keeping it is how the cache grew without bound
+    across installs, re-installs and upgrades of packages that are no
+    longer installed.
+
+    Idempotent: a missing cache directory (or a missing cache root) is a
+    no-op returning ``()``, not an error.
+
+    Args:
+        name: Package name.  Must be a single path component.
+
+    Returns:
+        The archive paths that were removed, sorted.  Informational: the
+        directory itself is gone either way.
+
+    Raises:
+        ArchiveCacheError: the name or the resolved path failed the
+            safety guard, or the delete failed.  Callers treat this as
+            best-effort — see :func:`uninstall_package`.
+    """
+    root = cache_dir()
+    target = _reclaim_target(name, root)
+    if not target.is_dir():
+        return ()
+
+    # Inventory the archives before the delete, for the caller's report.
+    # os.walk does not follow directory symlinks by default, matching
+    # what shutil.rmtree will actually traverse.
+    removed: list[Path] = []
+    for dirpath, _dirnames, filenames in os.walk(target):
+        for filename in filenames:
+            path = Path(dirpath) / filename
+            if filename.endswith(".tar.gz") and not path.is_symlink():
+                removed.append(path)
+
+    try:
+        shutil.rmtree(target)
+    except OSError as exc:
+        raise ArchiveCacheError(
+            f"could not reclaim the archive cache for {name!r} at "
+            f"{target}: {exc}",
+        ) from exc
+
+    logger.info(
+        "Reclaimed %d cached pristine archive(s) for %r from %s",
+        len(removed), name, target,
+    )
+    return tuple(sorted(removed))
 
 
 # ── safe extraction ─────────────────────────────────────────────────
@@ -237,7 +524,9 @@ def _is_within(base: Path, target: Path) -> bool:
         return False
 
 
-def _safe_extract(tar: tarfile.TarFile, dest: Path) -> None:
+def _safe_extract(
+    tar: tarfile.TarFile, dest: Path, members=None,
+) -> None:
     """Extract ``tar`` into ``dest``, rejecting any unsafe member.
 
     Rejected: absolute member paths, paths with ``..`` that escape
@@ -245,9 +534,20 @@ def _safe_extract(tar: tarfile.TarFile, dest: Path) -> None:
     member (devices, fifos, etc.).  This is a fail-closed allowlist:
     anything not explicitly a plain file or directory inside ``dest`` is
     refused.
+
+    Args:
+        tar: The open archive.
+        dest: Directory to extract into.
+        members: The members to extract, when the caller has already
+            walked the index under its own resource caps (the package
+            fetcher does, so that an archive declaring millions of
+            members is refused before the index is materialised).  The
+            default walks the archive itself — lazily, never through
+            ``getmembers()``, for the same reason.
     """
     dest = dest.resolve()
-    for member in tar.getmembers():
+    vetted: list[tarfile.TarInfo] = []
+    for member in (tar if members is None else members):
         member_name = member.name
         # Reject absolute paths outright.
         if member_name.startswith("/") or os.path.isabs(member_name):
@@ -265,15 +565,17 @@ def _safe_extract(tar: tarfile.TarFile, dest: Path) -> None:
             raise ArchiveVerificationError(
                 f"unsafe archive member (path escape): {member_name!r}",
             )
+        vetted.append(member)
     # All members vetted; extract.  (Members were validated above, so the
     # bandit B202 tarfile-extractall concern is addressed by the guard.)
-    tar.extractall(dest)  # noqa: S202
+    tar.extractall(dest, members=vetted)  # noqa: S202
 
 
 def _expand_to_tree(archive_path: Path) -> dict[str, bytes]:
     """Expand an archive into a ``path -> bytes`` mapping (safely).
 
-    Uses a temp dir honouring ``TMPDIR`` (e.g. ``/dev/shm``), extracts
+    Uses a temp dir honouring ``TMPDIR`` (disk-backed for preference: an
+    expanded tree can be large), extracts
     with :func:`_safe_extract`, then reads each regular file back as
     bytes keyed by its POSIX relative path.  The temp dir is always
     cleaned up.
@@ -345,16 +647,19 @@ def load_pristine_tree(
     expected_root_hash: str,
     *,
     fetcher: "ArchiveFetcher | None" = None,
+    source_id: str | None = None,
 ) -> dict[str, bytes]:
     """Return a package version's pristine tree as ``path -> bytes``.
 
     Resolution order:
 
-    1. **Local cache hit** — if ``<cache>/<name>/<version>.tar.gz`` exists,
-       expand it and verify it recomputes to ``expected_root_hash``.
-    2. **Fetch** — if missing and a ``fetcher`` is supplied, call
-       ``fetcher.fetch(name, version)`` to obtain a downloaded archive,
-       place it in the cache, then expand + verify.
+    1. **Local cache hit** — every candidate
+       :func:`archive_candidates` offers (current layout, old layout,
+       superseded copies) is expanded and verified against
+       ``expected_root_hash``; the first match is returned.
+    2. **Fetch** — if there is no candidate at all and a ``fetcher`` is
+       supplied, call ``fetcher.fetch(name, version)`` to obtain a
+       downloaded archive, place it in the cache, then expand + verify.
     3. **Fail** — if neither yields a hash-matching tree, raise.
 
     The returned mapping is suitable for feeding
@@ -369,25 +674,45 @@ def load_pristine_tree(
             ``installed_packages.hash``) the expanded tree must match.
         fetcher: Optional :class:`ArchiveFetcher` used only on a cache
             miss.
+        source_id: Stable id of the logical source (
+            ``sources.source_id``) whose copy of this version is
+            wanted.  Omitted, only the old source-blind layout is read.
 
     Returns:
         The pristine tree as ``{posix_rel_path: bytes}``.
 
     Raises:
-        ArchiveVerificationError: an available archive failed hash
-            verification.
+        ArchiveVerificationError: archives exist for this version but
+            none expands to ``expected_root_hash``.
         ArchiveCacheError: no archive is available (cache miss + no
             fetcher, or the fetcher produced nothing usable).
     """
-    cached = _archive_path(name, version)
-    if cached.is_file():
-        # A cached archive that fails verification is fatal: it means the
-        # cache is corrupt or tampered, and we must never serve its bytes.
-        return _verify_archive_tree(cached, expected_root_hash)
+    candidates = archive_candidates(name, version, source_id=source_id)
+    problems: list[str] = []
+    for candidate in candidates:
+        try:
+            return _verify_archive_tree(candidate, expected_root_hash)
+        except ArchiveCacheError as exc:
+            # Not fatal per candidate: a superseded copy or an
+            # old-layout archive from a different source legitimately
+            # fails to match.  Fatal only if NOTHING matches, below.
+            problems.append(f"{candidate.name}: {exc}")
+
+    if candidates:
+        # Archives for this version exist but none is the tree we were
+        # promised.  Never serve unverified bytes, and never silently
+        # re-fetch over them: the cache is corrupt, tampered, or this
+        # version string was re-published with different bytes.
+        raise ArchiveVerificationError(
+            f"{len(candidates)} cached archive(s) for {name}@{version} "
+            f"but none expands to the expected tree hash "
+            f"{expected_root_hash[:12]}...: " + "; ".join(problems),
+        )
 
     if fetcher is None:
         raise ArchiveCacheError(
-            f"no cached archive for {name}@{version} at {cached} and no "
+            f"no cached archive for {name}@{version} at "
+            f"{_archive_path(name, version, source_id)} and no "
             f"fetcher provided",
         )
 
@@ -403,6 +728,7 @@ def load_pristine_tree(
     # bad remote can never poison the cache.
     tree = _verify_archive_tree(fetched, expected_root_hash)
 
+    cached = _archive_path(name, version, source_id)
     cached.parent.mkdir(parents=True, exist_ok=True)
     try:
         shutil.copyfile(str(fetched), str(cached))

@@ -96,6 +96,7 @@ from .registry import (
     get_registry,
     discover_and_register,
     default_search_paths,
+    configured_search_paths,
 )
 from .security import (
     PackageSecurityError,
@@ -129,19 +130,78 @@ from .handler_registry import (
     PackageHandlerRegistry,
     get_handler_registry,
 )
+from .sources import (
+    ConfiguredSource,
+    SourceSpec,
+    SourceSpecError,
+    configured_sources,
+    describe,
+    parse_source,
+    redact,
+    source_id,
+)
+from .discover import (
+    DiscoveryError,
+    RemotePackage,
+    SourceListing,
+    list_remote_packages,
+    list_source_aliases,
+)
+from .fetch import (
+    FetchError,
+    FetchLimits,
+    FetchResult,
+    Fetcher,
+    fetch_source,
+    register_fetcher,
+    staging_root_dir,
+)
+# Importing these registers their fetchers with the dispatcher, which is
+# the only way a remote ``kind`` becomes fetchable.  Import order does not
+# matter, but dropping either import silently disables that kind.
+from .fetch_git import GitFetcher
+from .fetch_archive import ArchiveUrlFetcher
+from .static_preview import (
+    StaticPreview,
+    StaticToolInfo,
+    inspect_package_chat_tools,
+    write_consent_required,
+)
+from .pending_install import (
+    PendingInstall,
+    PendingInstallError,
+    PendingInstallStateError,
+    ensure_pending_install_table,
+)
+from .reload import (
+    PackageLoadOutcome,
+    reload_packages,
+)
+from .update import (
+    UpdateError,
+    UpdatePlan,
+    UpdateResult,
+    apply_update,
+    cleanup_plan,
+    plan_update,
+)
 from .archive_cache import (
     ArchiveCacheError,
     ArchiveFetcher,
     ArchiveVerificationError,
+    archive_candidates,
     archive_tree,
     cache_dir,
     load_pristine_tree,
+    reclaim_package_archives,
     store_archive,
 )
 
 __all__ = [
     "ArcTemplateRef",
+    "ArchiveUrlFetcher",
     "EgressGrant",
+    "GitFetcher",
     "EnvCredentialRef",
     "JudgeHandlerRef",
     "KbArticleRef",
@@ -156,6 +216,13 @@ __all__ = [
     "get_registry",
     "discover_and_register",
     "default_search_paths",
+    "configured_search_paths",
+    "PackageLoadOutcome",
+    "reload_packages",
+    "PendingInstall",
+    "PendingInstallError",
+    "PendingInstallStateError",
+    "ensure_pending_install_table",
     "PackageSecurityError",
     "validate_manifest_security",
     "InstallError",
@@ -173,6 +240,10 @@ __all__ = [
     "list_blocking_arcs",
     "uninstall_package",
     "verify_install",
+    "StaticPreview",
+    "StaticToolInfo",
+    "inspect_package_chat_tools",
+    "write_consent_required",
     "CapabilityContext",
     "CapabilityError",
     "CapabilityRegistry",
@@ -180,11 +251,39 @@ __all__ = [
     "get_capability_registry",
     "PackageHandlerRegistry",
     "get_handler_registry",
+    "ConfiguredSource",
+    "SourceSpec",
+    "SourceSpecError",
+    "configured_sources",
+    "describe",
+    "parse_source",
+    "redact",
+    "source_id",
+    "DiscoveryError",
+    "RemotePackage",
+    "SourceListing",
+    "list_remote_packages",
+    "list_source_aliases",
+    "FetchError",
+    "FetchLimits",
+    "FetchResult",
+    "Fetcher",
+    "fetch_source",
+    "register_fetcher",
+    "staging_root_dir",
+    "UpdateError",
+    "UpdatePlan",
+    "UpdateResult",
+    "apply_update",
+    "cleanup_plan",
+    "plan_update",
     "ArchiveCacheError",
     "ArchiveFetcher",
     "ArchiveVerificationError",
+    "archive_candidates",
     "archive_tree",
     "cache_dir",
     "load_pristine_tree",
+    "reclaim_package_archives",
     "store_archive",
 ]

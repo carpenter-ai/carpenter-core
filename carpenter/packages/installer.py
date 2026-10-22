@@ -125,10 +125,19 @@ class InstallResult:
 
 @dataclass(frozen=True)
 class UninstallResult:
-    """Outcome of a successful uninstall."""
+    """Outcome of a successful uninstall.
+
+    ``reclaimed_archives`` lists the cached pristine archives the
+    uninstall deleted (see
+    :func:`carpenter.packages.archive_cache.reclaim_package_archives`).
+    Empty both when there were none and when reclaiming failed — the
+    failure is logged, never raised, so it cannot leave a package
+    installed.
+    """
 
     name: str
     removed_path: Path
+    reclaimed_archives: tuple[Path, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -146,6 +155,31 @@ class VerifyResult:
     actual_hash: str | None
     install_path: Path
     message: str
+
+
+# ── Install destination ─────────────────────────────────────────────
+
+
+def default_install_dest(name: str) -> Path:
+    """Return the install destination for a package: ``<base>/packages/<name>``.
+
+    ``base_dir`` from the platform config when it is set, falling back to
+    the conventional ``~/carpenter`` layout otherwise (D24 SD2).  This is
+    the ONE definition of the destination: every entry point (the
+    operator CLI, the install chat tool) resolves through it, because two
+    copies of this convention once disagreed — the chat tool hardcoded
+    ``~/carpenter/packages/<name>`` while the CLI honoured ``base_dir``,
+    so a deployment with a relocated ``base_dir`` had the chat tool
+    install where the registry does not look.
+    """
+    try:
+        from .. import config
+        base_dir = config.CONFIG.get("base_dir")
+    except Exception:  # noqa: BLE001 — config may be unavailable
+        base_dir = None
+    if base_dir:
+        return Path(base_dir) / "packages" / name
+    return Path(os.path.expanduser(f"~/carpenter/packages/{name}"))
 
 
 # ── Hashing ──────────────────────────────────────────────────────────
@@ -262,7 +296,57 @@ CREATE TABLE IF NOT EXISTS installed_packages (
     -- state: the registry reads this flag per package and only registers
     -- the write-capable chat tools when it is 1.  Default 0 (gated off).
     -- This is SEPARATE from platform_capabilities_json (egress trust).
-    write_chat_tools_allowed INTEGER NOT NULL DEFAULT 0
+    write_chat_tools_allowed INTEGER NOT NULL DEFAULT 0,
+    -- Source provenance: WHERE these bytes came from, as opposed to
+    -- ``source_path`` (which stays what it always was — the local
+    -- directory the bytes were copied from, see its comment above).
+    -- All seven are NULL for a row written before provenance existed,
+    -- or by a caller that supplied none; they are never NULL together
+    -- with a value, so NULL means "provenance unknown" and an empty
+    -- string means "not applicable to this kind of source".
+    --
+    -- ``source_kind``: "local" | "git" | "archive".
+    source_kind TEXT,
+    -- ``source_url``: canonical source URL, stored REDACTED — a
+    -- credential is never persisted (see ``sources.redact``).  Empty
+    -- for a local source.
+    source_url TEXT,
+    -- ``source_ref``: the git branch / tag / commit the operator asked
+    -- for, verbatim.  Empty when none was given.
+    source_ref TEXT,
+    -- ``source_resolved``: what was ACTUALLY fetched — the git commit
+    -- sha40 or the archive's sha256.  This is the provenance anchor: it
+    -- pins the bytes in a way a mutable branch name cannot.  Empty
+    -- string for a local install (the operator's own tree is the
+    -- anchor; there is nothing to pin).
+    source_resolved TEXT,
+    -- ``source_subdir``: POSIX relative path of the package root inside
+    -- the fetched tree (a monorepo).  Empty when the tree root is the
+    -- package.
+    source_subdir TEXT,
+    -- ``source_id``: stable 16-hex id of the LOGICAL source (kind +
+    -- canonical location + subdir, excluding ref and digest).  Two
+    -- remotes publishing the same package name get different ids, so
+    -- this is what tells "the same package, updated" from "a different
+    -- package that happens to share a name" — something ``hash`` (pure
+    -- content) and ``name`` (not globally unique) cannot express.
+    source_id TEXT,
+    -- ``fetched_at``: UTC ISO-8601 time the recorded bytes were
+    -- obtained for this install.
+    fetched_at TEXT,
+    -- ``shipped_hash``: root hash of the PRISTINE tree this version
+    -- shipped, which is NOT always ``hash``.  A plain install copies
+    -- the shipped tree verbatim, so the two are equal; a reconciled
+    -- upgrade installs the shipped tree MERGED with the operator's
+    -- local edits, so ``hash`` describes the merged tree on disk while
+    -- this column still describes what upstream shipped.  The upgrade
+    -- engine needs the latter as its ``shipped_old`` anchor: anchoring
+    -- on the merged tree would make surviving operator edits look like
+    -- part of the shipped version, and the next upgrade would overwrite
+    -- them without reporting a conflict.  NULL for a row written before
+    -- this column existed, which reads as "equal to ``hash``" — true of
+    -- every install that predates reconciled upgrades.
+    shipped_hash TEXT
 );
 """
 
@@ -278,6 +362,26 @@ CREATE TABLE IF NOT EXISTS installed_packages_templates (
 CREATE INDEX IF NOT EXISTS idx_installed_packages_templates_template
     ON installed_packages_templates(template_name);
 """
+
+
+#: Source-provenance columns, in the order they appear in the DDL.  Used
+#: by the column-presence migration and by the row readers so the three
+#: never drift apart.
+#: Root hash of the pristine tree the installed version shipped.  Kept
+#: as a named constant for the same reason as
+#: :data:`_PROVENANCE_COLUMNS`: the DDL, the migration and the row
+#: readers must not drift apart.  See the column's DDL comment.
+_SHIPPED_HASH_COLUMN = "shipped_hash"
+
+_PROVENANCE_COLUMNS = (
+    "source_kind",
+    "source_url",
+    "source_ref",
+    "source_resolved",
+    "source_subdir",
+    "source_id",
+    "fetched_at",
+)
 
 
 def ensure_installer_tables(conn: sqlite3.Connection) -> None:
@@ -312,6 +416,35 @@ def ensure_installer_tables(conn: sqlite3.Connection) -> None:
             "ALTER TABLE installed_packages "
             "ADD COLUMN write_chat_tools_allowed INTEGER NOT NULL DEFAULT 0",
         )
+    # Source-provenance migration: older DBs lack the source_* / fetched_at
+    # columns.  All nullable with no default, so an existing row keeps
+    # reading as "provenance unknown" rather than claiming a local source
+    # it was never recorded with.
+    for column in _PROVENANCE_COLUMNS:
+        if column not in cols:
+            conn.execute(
+                f"ALTER TABLE installed_packages ADD COLUMN {column} TEXT",
+            )
+
+    # ── pristine-tree hash migration (reconciled upgrades) ──────────
+    # Older DBs lack ``shipped_hash``.  Nullable with no default: NULL
+    # reads as "the shipped tree is what is on disk", which is exactly
+    # true for every install written before reconciled upgrades
+    # existed.
+    if _SHIPPED_HASH_COLUMN not in cols:
+        conn.execute(
+            "ALTER TABLE installed_packages "
+            f"ADD COLUMN {_SHIPPED_HASH_COLUMN} TEXT",
+        )
+    # ── end pristine-tree hash migration ────────────────────────────
+
+    # Chat-requested installs: the pending-request record the two-phase
+    # request -> operator approval -> install flow is built on.  It lives
+    # here rather than in ``schema.sql`` for the same reason
+    # ``installed_packages`` does: this function is the one path both the
+    # migration and every test that needs the installer tables take.
+    from .pending_install import ensure_pending_install_table
+    ensure_pending_install_table(conn)
     conn.commit()
 
 
@@ -331,6 +464,116 @@ def _capability_to_dict(cap: PlatformCapabilityRef) -> dict:
     }
 
 
+def _source_id_of(provenance) -> str | None:
+    """Return ``sources.source_id(provenance)``, or ``None`` if unknown.
+
+    The one place that turns an optional
+    :class:`carpenter.packages.sources.SourceSpec` into the id the
+    archive cache keys on, so the row's ``source_id`` column and the
+    cache's directory name can never disagree.
+    """
+    if provenance is None:
+        return None
+    try:
+        from .sources import source_id as _sid
+        return _sid(provenance)
+    except Exception:  # noqa: BLE001 — a bad spec must not fail an install
+        return None
+
+
+def _provenance_values(
+    provenance,
+    *,
+    resolved: str,
+    fetched_at: str,
+    carry_over: dict | None,
+) -> tuple:
+    """Return the seven provenance column values for an install row.
+
+    Three cases, in precedence order:
+
+    1. ``provenance`` is a
+       :class:`carpenter.packages.sources.SourceSpec` — describe it.
+       The URL is stored REDACTED; a field that does not apply to the
+       kind is stored as an empty string.
+    2. ``provenance`` is ``None`` but ``carry_over`` is a prior install
+       record — keep what that row already had.  This is what stops a
+       re-record that happens to know nothing about the source (the
+       reconcile path) from silently erasing provenance.
+    3. Neither — all seven are NULL, i.e. "provenance unknown", which is
+       exactly how a row written before these columns existed reads.
+    """
+    if provenance is not None:
+        from .sources import redact, source_id as _source_id
+        return (
+            provenance.kind,
+            redact(provenance.url) if provenance.url else "",
+            provenance.ref or "",
+            resolved or "",
+            provenance.subdir or "",
+            _source_id(provenance),
+            fetched_at,
+        )
+    if carry_over is not None:
+        return tuple(carry_over.get(col) for col in _PROVENANCE_COLUMNS)
+    return (None,) * len(_PROVENANCE_COLUMNS)
+
+
+def record_source_provenance(
+    conn: sqlite3.Connection,
+    name: str,
+    *,
+    provenance,
+    resolved: str,
+    fetched_at: str | None = None,
+) -> bool:
+    """Rewrite ONLY the provenance columns of an existing install row.
+
+    For the one case that moves where a package is followed from
+    without changing a byte of it: an update told to follow a different
+    ref whose tree turns out to be the one already installed.  Nothing
+    is installed, so there is no new ``version``, ``hash`` or
+    ``installed_at`` to record — but the row must still say which ref
+    the operator asked to follow, or it would keep pointing at the old
+    one and the next update would quietly go back there.
+
+    The seven columns are written through the same
+    :func:`_provenance_values` the install path uses, with the existing
+    row as the carry-over, so a field the spec does not define is kept
+    rather than blanked.
+
+    Args:
+        conn: Open SQLite connection; the caller owns the transaction.
+        name: Installed package name.
+        provenance: The :class:`~carpenter.packages.sources.SourceSpec`
+            to record.  Its URL is stored redacted, as everywhere else.
+        resolved: What pins the bytes — git commit sha40 / archive
+            sha256.
+        fetched_at: Timestamp to record; now, by default.
+
+    Returns:
+        True when a row was updated, False when the package is not
+        installed (nothing is written).
+    """
+    record = get_install_record(conn, name)
+    if record is None:
+        return False
+    values = _provenance_values(
+        provenance,
+        resolved=resolved,
+        fetched_at=(
+            fetched_at or datetime.now(timezone.utc).isoformat()
+        ),
+        carry_over=record,
+    )
+    assignments = ", ".join(f"{col} = ?" for col in _PROVENANCE_COLUMNS)
+    conn.execute(
+        f"UPDATE installed_packages SET {assignments} WHERE name = ?",
+        (*values, name),
+    )
+    return True
+
+
 def _record_install(
     conn: sqlite3.Connection,
     *,
@@ -341,8 +584,30 @@ def _record_install(
     installed_at: str,
     granted_capabilities: tuple[PlatformCapabilityRef, ...] = (),
     write_chat_tools_allowed: bool = False,
+    provenance=None,
+    resolved: str = "",
+    provenance_carry_over: dict | None = None,
+    shipped_hash: str | None = None,
 ) -> None:
     """Write the install row + templates rows.
+
+    ``provenance`` is an optional
+    :class:`carpenter.packages.sources.SourceSpec` describing where the
+    bytes came from, and ``resolved`` the thing that pins them (git
+    commit sha40 / archive sha256; empty for a local source).  Omitting
+    both records NULL provenance — or, when
+    ``provenance_carry_over`` is a prior install record, that row's
+    provenance unchanged.  ``source_path`` keeps its original meaning
+    either way: the local directory the bytes were copied from.
+
+    ``shipped_hash`` is the root hash of the PRISTINE tree this version
+    shipped.  Pass ``pkg_hash`` when the install materialises the
+    shipped tree verbatim (which is what ``install_package`` does), and
+    the shipped tree's own hash when what lands on disk is a merge of
+    it with the operator's edits (the reconciled-upgrade path).
+    ``None`` carries the prior row's value over when
+    ``provenance_carry_over`` is given, else records NULL — which reads
+    as "the same as ``hash``".
 
     The caller owns the transaction.  When invoked inside
     :func:`carpenter.db.db_transaction`, that wrapper commits on
@@ -360,12 +625,23 @@ def _record_install(
     capabilities_payload = _json.dumps([
         _capability_to_dict(c) for c in granted_capabilities
     ])
+    provenance_values = _provenance_values(
+        provenance,
+        resolved=resolved,
+        fetched_at=installed_at,
+        carry_over=provenance_carry_over,
+    )
+    if shipped_hash is None and provenance_carry_over is not None:
+        carried = provenance_carry_over.get(_SHIPPED_HASH_COLUMN)
+        shipped_hash = carried if isinstance(carried, str) else None
     conn.execute(
         "INSERT OR REPLACE INTO installed_packages "
         "(name, version, hash, source_path, install_path, installed_at, "
         "allowlist_proposals_json, platform_capabilities_json, "
-        "write_chat_tools_allowed) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "write_chat_tools_allowed, " + ", ".join(_PROVENANCE_COLUMNS)
+        + f", {_SHIPPED_HASH_COLUMN}) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?"
+        + ", ?" * len(_PROVENANCE_COLUMNS) + ", ?)",
         (
             manifest.name,
             manifest.version,
@@ -376,6 +652,8 @@ def _record_install(
             proposals_payload,
             capabilities_payload,
             1 if write_chat_tools_allowed else 0,
+            *provenance_values,
+            shipped_hash,
         ),
     )
     # Refresh the templates join table for this package.
@@ -468,49 +746,47 @@ def _delete_install_record(conn: sqlite3.Connection, name: str) -> None:
     )
 
 
+#: The fixed column list both row readers select, in dict order.
+_RECORD_COLUMNS = (
+    "name", "version", "hash", "source_path", "install_path", "installed_at",
+    "allowlist_proposals_json", "platform_capabilities_json",
+    "write_chat_tools_allowed",
+) + _PROVENANCE_COLUMNS + (_SHIPPED_HASH_COLUMN,)
+
+_RECORD_SELECT = (
+    "SELECT " + ", ".join(_RECORD_COLUMNS) + " FROM installed_packages"
+)
+
+
+def _row_to_record(row) -> dict:
+    """Map a ``_RECORD_SELECT`` row to the install-record dict.
+
+    Provenance columns pass through as-is: ``None`` means the row
+    predates provenance (or was written without any), which a caller can
+    tell apart from an empty string meaning "not applicable to this
+    source kind".
+    """
+    record = dict(zip(_RECORD_COLUMNS, row))
+    record["write_chat_tools_allowed"] = bool(
+        record["write_chat_tools_allowed"],
+    )
+    return record
+
+
 def get_install_record(
     conn: sqlite3.Connection, name: str,
 ) -> dict | None:
     row = conn.execute(
-        "SELECT name, version, hash, source_path, install_path, "
-        "installed_at, allowlist_proposals_json, platform_capabilities_json, "
-        "write_chat_tools_allowed "
-        "FROM installed_packages WHERE name = ?",
-        (name,),
+        _RECORD_SELECT + " WHERE name = ?", (name,),
     ).fetchone()
     if row is None:
         return None
-    return {
-        "name": row[0],
-        "version": row[1],
-        "hash": row[2],
-        "source_path": row[3],
-        "install_path": row[4],
-        "installed_at": row[5],
-        "allowlist_proposals_json": row[6],
-        "platform_capabilities_json": row[7],
-        "write_chat_tools_allowed": bool(row[8]),
-    }
+    return _row_to_record(row)
 
 
 def list_install_records(conn: sqlite3.Connection) -> list[dict]:
-    rows = conn.execute(
-        "SELECT name, version, hash, source_path, install_path, "
-        "installed_at, allowlist_proposals_json, platform_capabilities_json, "
-        "write_chat_tools_allowed "
-        "FROM installed_packages ORDER BY name"
-    ).fetchall()
-    return [
-        {
-            "name": r[0], "version": r[1], "hash": r[2],
-            "source_path": r[3], "install_path": r[4],
-            "installed_at": r[5],
-            "allowlist_proposals_json": r[6],
-            "platform_capabilities_json": r[7],
-            "write_chat_tools_allowed": bool(r[8]),
-        }
-        for r in rows
-    ]
+    rows = conn.execute(_RECORD_SELECT + " ORDER BY name").fetchall()
+    return [_row_to_record(r) for r in rows]
 
 
 def list_granted_capabilities(
@@ -573,6 +849,20 @@ def classify_package_chat_tools(
     manifest: PackageManifest,
 ) -> tuple[list[dict], list[dict]]:
     """Inspect a manifest's chat-tool modules and split tools by capability.
+
+    .. warning::
+
+       This **imports the package's python**, which runs its
+       module-level code.  It is therefore only safe for a tree the
+       operator has already consented to installing.  Do NOT call it to
+       build a pre-consent preview: for a source the operator has not
+       yet agreed to trust (anything fetched from a remote, in
+       particular) importing the tree to describe it executes
+       attacker-supplied code before the prompt that was supposed to
+       authorise it.  Use
+       :func:`carpenter.packages.static_preview.inspect_package_chat_tools`
+       there — it reads the same declarations with an AST parse and
+       reports what it cannot read instead of guessing.
 
     Imports each declared chat-tool module (package-aware, the same path
     the registry uses) and collects ``@chat_tool``-decorated callables,
@@ -1037,7 +1327,13 @@ def _trigger_disabled_by_config(package_name: str, trigger_name: str) -> bool:
     packages_cfg = get_config("packages", {}) or {}
     if not isinstance(packages_cfg, dict):
         return False
-    triggers_cfg = (packages_cfg.get(package_name) or {}).get("triggers") or {}
+    # Every key under ``packages`` is a package name, but an operator can
+    # still put a non-mapping under one (and the source registry lived here
+    # briefly), so a malformed entry must not make this lookup explode.
+    pkg_cfg = packages_cfg.get(package_name)
+    if not isinstance(pkg_cfg, dict):
+        return False
+    triggers_cfg = pkg_cfg.get("triggers") or {}
     if not isinstance(triggers_cfg, dict):
         return False
     trigger_cfg = triggers_cfg.get(trigger_name) or {}
@@ -1457,12 +1753,17 @@ def install_package(
     capability_input_fn=None,
     capability_prompt_stream=None,
     allow_write_chat_tools: bool = False,
+    provenance=None,
+    resolved: str = "",
 ) -> InstallResult:
     """Validate, hash, and install a capability package.
 
     Args:
         source_path: Path to the source package directory (the parent
-            of ``manifest.yaml``).
+            of ``manifest.yaml``).  Always a LOCAL directory: a remote
+            source is fetched into a quarantine directory first (see
+            :mod:`carpenter.packages.fetch`) and that directory is what
+            arrives here.
         dest_path: Where to materialize the installed copy
             (``~/carpenter/packages/<name>/`` in production).  The
             directory is created if missing; if it exists it is
@@ -1476,6 +1777,15 @@ def install_package(
             only on explicit operator consent (CLI ``--allow-write-chat-
             tools`` or interactive prompt).  This is SEPARATE from the
             platform-capability egress grant (``capability_input_fn``).
+        provenance: Optional
+            :class:`carpenter.packages.sources.SourceSpec` describing
+            where ``source_path``'s bytes came from.  Recorded in the
+            install row's ``source_*`` columns (URL redacted).  Omitted
+            — the default — records NULL provenance, which is how every
+            install behaved before these columns existed.
+        resolved: What pins the fetched bytes: a git commit sha40 or an
+            archive sha256.  Empty for a local source.  Only meaningful
+            alongside ``provenance``.
 
     Returns:
         :class:`InstallResult` with the recorded hash + paths.
@@ -1574,6 +1884,18 @@ def install_package(
         installed_at=installed_at,
         granted_capabilities=granted_installed_caps,
         write_chat_tools_allowed=allow_write_chat_tools,
+        # Deliberately NO carry-over from ``prior_record`` here: a
+        # re-install can legitimately come from a different source than
+        # the one recorded, so inheriting the old row's provenance would
+        # mis-record where these bytes came from.  A caller that knows
+        # the source says so; silence means "unknown".
+        provenance=provenance,
+        resolved=resolved,
+        # An install materialises the source tree verbatim, so the
+        # pristine tree it shipped and the tree now on disk are the
+        # same bytes and the same hash.  (A reconciled upgrade is the
+        # case where they differ.)
+        shipped_hash=pkg_hash,
     )
 
     # B-full: merge the proposed allowlist additions into the platform's
@@ -1621,6 +1943,11 @@ def install_package(
         from . import archive_cache
         cached_path = archive_cache.store_archive(
             installed_manifest.name, installed_manifest.version, dest_path,
+            # Key the snapshot by the LOGICAL source when we know it, so
+            # two remotes publishing the same name@version do not
+            # overwrite each other's pristine tree.  Unknown provenance
+            # keeps the original source-blind path.
+            source_id=_source_id_of(provenance),
         )
         logger.debug(
             "Cached pristine archive for %r v%s at %s",
@@ -1819,6 +2146,32 @@ def uninstall_package(
     if install_path.exists():
         shutil.rmtree(install_path)
 
+    # Reclaim the package's pristine-archive cache
+    # (``{base_dir}/cache/package-archives/<name>/``).  Install writes one
+    # archive per (source_id, version) as the reconcile anchor; without
+    # this the cache grew without bound, keeping a full copy of the tree
+    # of every version of every package that is no longer installed.
+    #
+    # Unconditional, including under ``archive_state=True``: an archive is
+    # a DERIVED artifact that a re-install re-materialises from the
+    # fetched tree, and with the install record gone there is no
+    # ``installed_packages.hash`` left to verify one against, so a kept
+    # archive is unreachable by ``load_pristine_tree`` anyway.
+    #
+    # BEST-EFFORT, exactly as install treats the cache: a stuck cache
+    # file is not a reason to leave a package installed, so a failure is
+    # logged and the uninstall carries on.
+    reclaimed: tuple[Path, ...] = ()
+    try:
+        from .archive_cache import reclaim_package_archives
+        reclaimed = reclaim_package_archives(name)
+    except Exception:  # noqa: BLE001 — cache reclaim is best-effort
+        logger.warning(
+            "Could not reclaim the cached pristine archive(s) for %r; "
+            "they will have to be removed by hand", name,
+            exc_info=True,
+        )
+
     # B-full: remove the package's KB folder + re-index.
     _uninstall_kb_articles(name, conn=conn)
 
@@ -1868,9 +2221,12 @@ def uninstall_package(
         pass
 
     logger.info(
-        "Uninstalled capability package %r (path %s)", name, install_path,
+        "Uninstalled capability package %r (path %s, %d cached archive(s) "
+        "reclaimed)", name, install_path, len(reclaimed),
     )
-    return UninstallResult(name=name, removed_path=install_path)
+    return UninstallResult(
+        name=name, removed_path=install_path, reclaimed_archives=reclaimed,
+    )
 
 
 def verify_install(
