@@ -1134,6 +1134,99 @@ def _migrate_health_notify_state(conn: sqlite3.Connection, tables: set) -> None:
     conn.commit()
 
 
+# Row shape written by preset seeding: a named, selector-based policy with no
+# per-call override.  Used both as the partial index's WHERE clause and as the
+# filter for the de-duplication below, so the two cannot drift apart.
+_PRESET_POLICY_PREDICATE = (
+    "name IS NOT NULL AND policy_json IS NOT NULL "
+    "AND model IS NULL AND agent_role IS NULL "
+    "AND temperature IS NULL AND max_tokens IS NULL"
+)
+
+
+def _migrate_dedupe_model_policy_presets(conn: sqlite3.Connection, tables: set) -> None:
+    """Collapse duplicate model-policy preset rows, then constrain the table.
+
+    The built-in model-policy presets are re-seeded on every start with
+    ``INSERT OR IGNORE``, but ``model_policies`` carried no unique constraint
+    and no index of any kind.  ``OR IGNORE`` only suppresses a *constraint*
+    violation, so with nothing to conflict on each start appended another copy
+    of every preset: a table that grew without bound, and that no reader
+    noticed because a lookup by name takes the first row it finds.
+
+    De-duplication is by ``(name, policy_json)`` among rows carrying no
+    per-call override -- byte-identical re-seeds, nothing else.  The lowest id
+    in each group survives, so anything already pointing at it keeps working,
+    and ``arcs.model_policy_id`` pointers into the rows being removed are
+    moved to the survivor first (``model_policy_id`` is not a declared foreign
+    key, so the database would not stop the delete from orphaning them).  Rows
+    whose policy body differs are left alone: they are not re-seeds, and an
+    arc referencing one means it.
+
+    Idempotent and additive: a second run finds no duplicate groups, and the
+    index is created with ``IF NOT EXISTS``.
+    """
+    if not conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='model_policies'"
+    ).fetchone():
+        return
+
+    groups = conn.execute(
+        "SELECT name, policy_json, MIN(id) FROM model_policies "
+        f"WHERE {_PRESET_POLICY_PREDICATE} "
+        "GROUP BY name, policy_json HAVING COUNT(*) > 1"
+    ).fetchall()
+
+    if groups:
+        arc_cols = {row[1] for row in conn.execute("PRAGMA table_info(arcs)").fetchall()}
+        can_repoint = "model_policy_id" in arc_cols
+        removed = 0
+        repointed = 0
+        for name, policy_json, keep_id in groups:
+            doomed = [
+                row[0]
+                for row in conn.execute(
+                    "SELECT id FROM model_policies "
+                    f"WHERE {_PRESET_POLICY_PREDICATE} "
+                    "AND name = ? AND policy_json = ? AND id <> ?",
+                    (name, policy_json, keep_id),
+                ).fetchall()
+            ]
+            if not doomed:
+                continue
+            placeholders = ",".join("?" * len(doomed))
+            if can_repoint:
+                cursor = conn.execute(
+                    "UPDATE arcs SET model_policy_id = ? "
+                    f"WHERE model_policy_id IN ({placeholders})",
+                    (keep_id, *doomed),
+                )
+                repointed += max(cursor.rowcount, 0)
+            cursor = conn.execute(
+                f"DELETE FROM model_policies WHERE id IN ({placeholders})", doomed
+            )
+            removed += max(cursor.rowcount, 0)
+        conn.commit()
+        if removed:
+            logger.info(
+                "Collapsed %d duplicate model_policies preset row(s) over %d "
+                "preset(s); repointed %d arc(s) at the surviving row",
+                removed, len(groups), repointed,
+            )
+
+    try:
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_model_policies_preset "
+            "ON model_policies(name, policy_json) "
+            f"WHERE {_PRESET_POLICY_PREDICATE}"
+        )
+        conn.commit()
+    except sqlite3.Error as _exc:
+        # Without the index, seeding merely stays as duplicative as it was;
+        # that is not a reason to refuse to start.
+        logger.exception("Failed to create idx_model_policies_preset")
+
+
 def run_migrations(conn: sqlite3.Connection) -> None:
     """Run all data migrations for existing databases.
 
@@ -1182,3 +1275,5 @@ def run_migrations(conn: sqlite3.Connection) -> None:
     _migrate_arc_origin(conn, tables)
     _migrate_budget_breaker(conn, tables)
     _migrate_health_notify_state(conn, tables)
+    # Must run after _migrate_model_selection (creates model_policies).
+    _migrate_dedupe_model_policy_presets(conn, tables)

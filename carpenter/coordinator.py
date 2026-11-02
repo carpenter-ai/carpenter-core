@@ -56,18 +56,30 @@ class Coordinator:
             logger.warning("Templates directory not found: %s", templates_dir)
 
     def _ensure_model_policy_presets(self) -> None:
-        """Insert model policy presets into DB if they don't already exist."""
+        """Seed the model policy presets, leaving one row per preset.
+
+        ``INSERT OR IGNORE`` conflicts on the partial unique index over named
+        selector policies (``idx_model_policies_preset``), so a restart
+        inserts nothing and reuses the rows already there. Every preset
+        carries constraints, so ``to_policy_json`` returns a body rather than
+        NULL, which is what puts the seeded row inside that index.
+        """
         from .core.models.selector import get_presets
         from .db import get_db, db_transaction
         with db_transaction() as db:
             try:
-                for name, policy in get_presets().items():
-                    # Insert if doesn't exist (ON CONFLICT DO NOTHING)
-                    db.execute(
+                presets = get_presets()
+                inserted = 0
+                for name, policy in presets.items():
+                    cursor = db.execute(
                         "INSERT OR IGNORE INTO model_policies (name, policy_json) VALUES (?, ?)",
                         (name, policy.to_policy_json())
                     )
-                logger.info("Model policy presets ensured in database")
+                    inserted += max(cursor.rowcount, 0)
+                logger.info(
+                    "Model policy presets seeded: %d inserted, %d already present",
+                    inserted, len(presets) - inserted,
+                )
             except (sqlite3.Error, ValueError, TypeError) as _exc:
                 logger.exception("Failed to ensure model policy presets")
 

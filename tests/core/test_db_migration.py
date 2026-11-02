@@ -6,7 +6,10 @@ import sqlite3
 import pytest
 
 from carpenter.db import get_db, init_db
-from carpenter.db_migrations import _migrate_arc_step_role
+from carpenter.db_migrations import (
+    _migrate_arc_step_role,
+    _migrate_dedupe_model_policy_presets,
+)
 
 
 class TestModelCallsProviderMigration:
@@ -232,4 +235,247 @@ class TestArcStepRoleMigration:
 
         rows = conn.execute("SELECT step_role FROM arcs").fetchall()
         assert all(row["step_role"] is None for row in rows)
+        conn.close()
+
+
+# ── model_policies preset de-duplication ──────────────────────────
+
+
+def _legacy_policy_db(tmp_path, filename="legacy_policies.db"):
+    """model_policies as it was before the partial unique index existed."""
+    conn = sqlite3.connect(str(tmp_path / filename))
+    conn.row_factory = sqlite3.Row
+    conn.executescript("""
+        CREATE TABLE model_policies (
+            id INTEGER PRIMARY KEY,
+            name TEXT,
+            model TEXT,
+            agent_role TEXT,
+            temperature REAL,
+            max_tokens INTEGER,
+            policy_json TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE arcs (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            model_policy_id INTEGER
+        );
+    """)
+    return conn
+
+
+def _body(name):
+    return json.dumps({"constraints": {"min_quality": 2}, "preference": [0.3, 0.4, 0.3], "n": name})
+
+
+def _reseed(conn, names, times):
+    """Simulate `times` platform starts seeding `names` with no index present."""
+    for _ in range(times):
+        for name in names:
+            conn.execute(
+                "INSERT OR IGNORE INTO model_policies (name, policy_json) VALUES (?, ?)",
+                (name, _body(name)),
+            )
+    conn.commit()
+
+
+class TestModelPolicyPresetDedupe:
+    """Preset rows accumulated one copy per start before the index existed."""
+
+    def test_preset_index_present_after_init(self):
+        """init_db leaves the partial unique index on model_policies."""
+        db = get_db()
+        try:
+            indexes = {
+                row[1] for row in db.execute("PRAGMA index_list('model_policies')").fetchall()
+            }
+        finally:
+            db.close()
+        assert "idx_model_policies_preset" in indexes
+
+    def test_reseeding_without_the_index_duplicates(self, tmp_path):
+        """The bug itself: OR IGNORE has nothing to conflict on."""
+        conn = _legacy_policy_db(tmp_path)
+        _reseed(conn, ["fast-chat", "caretaker"], 5)
+        assert conn.execute("SELECT COUNT(*) FROM model_policies").fetchone()[0] == 10
+        conn.close()
+
+    def test_collapses_duplicates_to_the_lowest_id(self, tmp_path):
+        """One row survives per preset, and it is the lowest id."""
+        conn = _legacy_policy_db(tmp_path)
+        _reseed(conn, ["fast-chat", "caretaker"], 5)
+        lowest = {
+            row["name"]: row["keep"]
+            for row in conn.execute(
+                "SELECT name, MIN(id) AS keep FROM model_policies GROUP BY name"
+            ).fetchall()
+        }
+
+        _migrate_dedupe_model_policy_presets(conn, {"model_policies", "arcs"})
+
+        rows = conn.execute("SELECT id, name FROM model_policies ORDER BY id").fetchall()
+        assert len(rows) == 2
+        assert {row["name"]: row["id"] for row in rows} == lowest
+        conn.close()
+
+    def test_repoints_arcs_at_the_surviving_row(self, tmp_path):
+        """An arc pointing at a duplicate is moved, not orphaned.
+
+        model_policy_id is not a declared foreign key, so nothing in the
+        database would have stopped the delete from orphaning it.
+        """
+        conn = _legacy_policy_db(tmp_path)
+        _reseed(conn, ["fast-chat"], 4)
+        ids = [row["id"] for row in conn.execute(
+            "SELECT id FROM model_policies ORDER BY id"
+        ).fetchall()]
+        conn.execute(
+            "INSERT INTO arcs (id, name, model_policy_id) VALUES (1, 'a', ?)", (ids[-1],)
+        )
+        conn.execute(
+            "INSERT INTO arcs (id, name, model_policy_id) VALUES (2, 'b', ?)", (ids[0],)
+        )
+        conn.execute("INSERT INTO arcs (id, name, model_policy_id) VALUES (3, 'c', NULL)")
+        conn.commit()
+
+        _migrate_dedupe_model_policy_presets(conn, {"model_policies", "arcs"})
+
+        pointers = [row["model_policy_id"] for row in conn.execute(
+            "SELECT model_policy_id FROM arcs ORDER BY id"
+        ).fetchall()]
+        assert pointers == [ids[0], ids[0], None]
+        conn.close()
+
+    def test_safe_to_run_twice(self, tmp_path):
+        """Second run is a no-op and does not raise."""
+        conn = _legacy_policy_db(tmp_path)
+        _reseed(conn, ["fast-chat", "caretaker"], 3)
+
+        _migrate_dedupe_model_policy_presets(conn, {"model_policies", "arcs"})
+        after_first = conn.execute(
+            "SELECT id, name, policy_json FROM model_policies ORDER BY id"
+        ).fetchall()
+        _migrate_dedupe_model_policy_presets(conn, {"model_policies", "arcs"})
+        after_second = conn.execute(
+            "SELECT id, name, policy_json FROM model_policies ORDER BY id"
+        ).fetchall()
+
+        assert [tuple(row) for row in after_first] == [tuple(row) for row in after_second]
+        conn.close()
+
+    def test_database_without_duplicates_is_untouched(self, tmp_path):
+        """A clean database keeps every row and still gains the index."""
+        conn = _legacy_policy_db(tmp_path)
+        _reseed(conn, ["fast-chat", "caretaker", "careful-coding"], 1)
+        before = [tuple(row) for row in conn.execute(
+            "SELECT id, name, policy_json FROM model_policies ORDER BY id"
+        ).fetchall()]
+
+        _migrate_dedupe_model_policy_presets(conn, {"model_policies", "arcs"})
+
+        after = [tuple(row) for row in conn.execute(
+            "SELECT id, name, policy_json FROM model_policies ORDER BY id"
+        ).fetchall()]
+        assert before == after
+        indexes = {row[1] for row in conn.execute(
+            "PRAGMA index_list('model_policies')"
+        ).fetchall()}
+        assert "idx_model_policies_preset" in indexes
+        conn.close()
+
+    def test_index_blocks_a_later_reseed(self, tmp_path):
+        """After the migration, OR IGNORE has a constraint to conflict on."""
+        conn = _legacy_policy_db(tmp_path)
+        _reseed(conn, ["fast-chat"], 6)
+        _migrate_dedupe_model_policy_presets(conn, {"model_policies", "arcs"})
+
+        _reseed(conn, ["fast-chat"], 10)
+
+        assert conn.execute("SELECT COUNT(*) FROM model_policies").fetchone()[0] == 1
+        conn.close()
+
+    def test_distinct_policy_bodies_survive(self, tmp_path):
+        """Same name, different body: not a re-seed, so both rows stay."""
+        conn = _legacy_policy_db(tmp_path)
+        conn.execute(
+            "INSERT INTO model_policies (name, policy_json) VALUES ('fast-chat', ?)",
+            (json.dumps({"preference": [0.3, 0.4, 0.3]}),),
+        )
+        conn.execute(
+            "INSERT INTO model_policies (name, policy_json) VALUES ('fast-chat', ?)",
+            (json.dumps({"preference": [0.9, 0.1, 0.0]}),),
+        )
+        conn.commit()
+
+        _migrate_dedupe_model_policy_presets(conn, {"model_policies", "arcs"})
+
+        assert conn.execute("SELECT COUNT(*) FROM model_policies").fetchone()[0] == 2
+        conn.close()
+
+    def test_pinned_and_overriding_rows_survive(self, tmp_path):
+        """Rows outside the preset shape are never collapsed."""
+        conn = _legacy_policy_db(tmp_path)
+        body = _body("fast-chat")
+        # Hard-pinned rows: policy_json NULL, name repeated.
+        for model in ("prov:a", "prov:b"):
+            conn.execute(
+                "INSERT INTO model_policies (name, model) VALUES ('fast-chat', ?)", (model,)
+            )
+        # Named selector policies carrying a per-call override.
+        conn.execute(
+            "INSERT INTO model_policies (name, model, policy_json) "
+            "VALUES ('fast-chat', 'prov:a', ?)", (body,)
+        )
+        conn.execute(
+            "INSERT INTO model_policies (name, agent_role, policy_json) "
+            "VALUES ('fast-chat', 'coder', ?)", (body,)
+        )
+        conn.execute(
+            "INSERT INTO model_policies (name, temperature, policy_json) "
+            "VALUES ('fast-chat', 0.2, ?)", (body,)
+        )
+        conn.execute(
+            "INSERT INTO model_policies (name, max_tokens, policy_json) "
+            "VALUES ('fast-chat', 4096, ?)", (body,)
+        )
+        conn.commit()
+        before = conn.execute("SELECT COUNT(*) FROM model_policies").fetchone()[0]
+
+        _migrate_dedupe_model_policy_presets(conn, {"model_policies", "arcs"})
+
+        assert conn.execute("SELECT COUNT(*) FROM model_policies").fetchone()[0] == before
+        conn.close()
+
+    def test_noop_when_table_absent(self, tmp_path):
+        """A database with no model_policies table is left alone."""
+        conn = sqlite3.connect(str(tmp_path / "empty.db"))
+        conn.row_factory = sqlite3.Row
+        _migrate_dedupe_model_policy_presets(conn, set())  # must not raise
+        assert conn.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table'"
+        ).fetchone()[0] == 0
+        conn.close()
+
+    def test_dedupe_without_an_arcs_table(self, tmp_path):
+        """De-duplication still runs when there are no arcs to repoint."""
+        conn = sqlite3.connect(str(tmp_path / "no_arcs.db"))
+        conn.row_factory = sqlite3.Row
+        conn.executescript("""
+            CREATE TABLE model_policies (
+                id INTEGER PRIMARY KEY,
+                name TEXT,
+                model TEXT,
+                agent_role TEXT,
+                temperature REAL,
+                max_tokens INTEGER,
+                policy_json TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        _reseed(conn, ["fast-chat"], 3)
+
+        _migrate_dedupe_model_policy_presets(conn, {"model_policies"})
+
+        assert conn.execute("SELECT COUNT(*) FROM model_policies").fetchone()[0] == 1
         conn.close()
