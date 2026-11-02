@@ -49,6 +49,22 @@ override individual fields via the `model_presets` config key.
 Preference vectors are weights on the (cost, quality, speed) score axes;
 they sum to 1.0 by convention.
 
+### Seeding, and why one row per preset
+
+The presets are re-seeded on every platform start with `INSERT OR IGNORE`.
+What makes that idempotent is `idx_model_policies_preset`, a partial unique
+index on `(name, policy_json)` covering only *named selector policies with
+no per-call override* — the exact row shape seeding writes. Before it
+existed, `OR IGNORE` had no constraint to conflict on, so each start
+appended another copy of every preset and the table grew without bound.
+
+Rows outside that shape are deliberately left unconstrained: a hard pin
+(`policy_json` NULL) may reuse a preset's name, and a row carrying a
+`model`, `agent_role`, `temperature` or `max_tokens` override is
+deduplicated by `arc_manager.get_or_create_model_policy`'s own lookup on
+those columns. Policy rows are immutable records that arcs point at, so an
+edited preset body is a new row rather than an overwrite of the old one.
+
 ---
 
 ## Dispatch-time resolution

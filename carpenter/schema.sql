@@ -395,6 +395,28 @@ CREATE TABLE IF NOT EXISTS model_policies (
     policy_json TEXT,              -- {"constraints": {...}, "preference": [...]}
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+-- Preset seeding is idempotent only because of this index.  The coordinator
+-- re-seeds the built-in presets with INSERT OR IGNORE on every start, and
+-- OR IGNORE ignores a *constraint* violation -- with nothing to conflict on
+-- it appended a fresh copy of every preset per start, growing without bound.
+--
+-- The index covers exactly the row shape that seeding writes: a named,
+-- selector-based policy with no per-call overrides.  Rows created by
+-- arc_manager.get_or_create_model_policy() are deliberately left outside it:
+-- hard-pinned rows (policy_json NULL) must be free to repeat a name, and
+-- rows that carry a model/agent_role/temperature/max_tokens override are
+-- deduplicated by that function's own SELECT on those columns.  Keying on
+-- (name, policy_json) rather than name alone keeps that function's plain
+-- INSERT unable to collide: it has already selected on every column in the
+-- key's WHERE clause, so a conflicting row would have been found and reused.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_model_policies_preset
+    ON model_policies(name, policy_json)
+    WHERE name IS NOT NULL
+      AND policy_json IS NOT NULL
+      AND model IS NULL
+      AND agent_role IS NULL
+      AND temperature IS NULL
+      AND max_tokens IS NULL;
 
 -- Review keys: Fernet symmetric keys for encrypted untrusted output
 CREATE TABLE IF NOT EXISTS review_keys (

@@ -332,3 +332,146 @@ def test_enforce_min_tier_rejects():
         template_manager._enforce_min_tier("haiku", "high")
     with pytest.raises(ValueError, match="below the required model_min_tier"):
         template_manager._enforce_min_tier("sonnet", "high")
+
+
+# ── Preset seeding idempotence ───────────────────────────────────
+#
+# The presets are re-seeded on every platform start with INSERT OR IGNORE.
+# That is only idempotent because of the partial unique index over named
+# selector policies; without it, OR IGNORE had no constraint to conflict on
+# and every start appended another copy of every preset.
+
+
+def _preset_rows(name=None):
+    """Count model_policies rows, optionally for one preset name."""
+    db = get_db()
+    try:
+        if name is None:
+            return db.execute("SELECT COUNT(*) FROM model_policies").fetchone()[0]
+        return db.execute(
+            "SELECT COUNT(*) FROM model_policies WHERE name = ?", (name,)
+        ).fetchone()[0]
+    finally:
+        db.close()
+
+
+def _seed_presets():
+    from carpenter.coordinator import Coordinator
+
+    Coordinator()._ensure_model_policy_presets()
+
+
+def test_preset_seeding_inserts_each_preset_once():
+    """Seeding leaves exactly one row per preset name."""
+    from carpenter.core.models.selector import get_presets
+
+    _seed_presets()
+    names = set(get_presets())
+    assert _preset_rows() == len(names)
+    for name in names:
+        assert _preset_rows(name) == 1
+
+
+def test_preset_seeding_twice_adds_nothing():
+    """A second seeding pass (i.e. a restart) inserts no rows."""
+    from carpenter.core.models.selector import get_presets
+
+    _seed_presets()
+    before = _preset_rows()
+    _seed_presets()
+    _seed_presets()
+    assert _preset_rows() == before == len(get_presets())
+
+
+def test_pinned_policy_rows_may_repeat_a_name():
+    """Hard-pinned rows (policy_json NULL) are outside the index.
+
+    get_or_create_model_policy deduplicates those itself, on
+    (model, agent_role, temperature, max_tokens) — the name is free to
+    repeat, so the index must not constrain it.
+    """
+    _seed_presets()
+    id1 = arc_manager.get_or_create_model_policy(
+        model="anthropic:claude-sonnet-4-6", name="careful-coding",
+    )
+    id2 = arc_manager.get_or_create_model_policy(
+        model="anthropic:claude-haiku-4-5", name="careful-coding",
+    )
+    assert id1 != id2
+    db = get_db()
+    try:
+        rows = db.execute(
+            "SELECT COUNT(*) FROM model_policies "
+            "WHERE name = 'careful-coding' AND policy_json IS NULL"
+        ).fetchone()[0]
+    finally:
+        db.close()
+    assert rows == 2
+
+
+def test_template_step_resolution_reuses_the_seeded_preset_row():
+    """Resolving a preset for a template step returns the seeded row's id.
+
+    This is how an arc comes to reference a preset row: the resolved id is
+    stored as arcs.model_policy_id. It is why the de-duplication migration
+    repoints arcs instead of simply deleting the extra rows.
+    """
+    from carpenter.core.models.selector import get_presets
+
+    _seed_presets()
+    preset = get_presets()["careful-coding"]
+    seeded_id = arc_manager.get_policy_id_by_name("careful-coding")
+    resolved = arc_manager.get_or_create_model_policy(
+        model=preset.model,
+        agent_role=preset.agent_role,
+        temperature=preset.temperature,
+        max_tokens=preset.max_tokens,
+        policy_json=preset.to_policy_json(),
+        name="careful-coding",
+    )
+    assert resolved == seeded_id
+    assert _preset_rows("careful-coding") == 1
+
+
+def test_named_selector_policy_with_an_override_is_insertable():
+    """A named selector policy that pins a model is outside the index.
+
+    A name-only index would turn this plain INSERT into an IntegrityError
+    once the same preset name had been seeded — reachable through a
+    ``model_presets`` config override, which puts a model on a preset.
+    """
+    from carpenter.core.models.selector import get_presets
+
+    _seed_presets()
+    body = get_presets()["careful-coding"].to_policy_json()
+    pinned = arc_manager.get_or_create_model_policy(
+        model="anthropic:claude-opus-4-7",
+        policy_json=body,
+        name="careful-coding",
+    )
+    assert pinned != arc_manager.get_policy_id_by_name("careful-coding")
+    # and it deduplicates on a repeat
+    assert pinned == arc_manager.get_or_create_model_policy(
+        model="anthropic:claude-opus-4-7",
+        policy_json=body,
+        name="careful-coding",
+    )
+
+
+def test_changed_preset_body_adds_a_row_instead_of_failing():
+    """A preset whose body changed gets a second row, not an IntegrityError.
+
+    Policy rows are immutable records that arcs point at, so a changed body
+    cannot overwrite the old row. The index keys on (name, policy_json) so
+    this stays an insert rather than a conflict.
+    """
+    _seed_presets()
+    changed = json.dumps({"constraints": {"min_quality": 5}, "preference": [0.0, 1.0, 0.0]})
+    new_id = arc_manager.get_or_create_model_policy(policy_json=changed, name="careful-coding")
+    assert new_id != arc_manager.get_policy_id_by_name("careful-coding")
+    assert _preset_rows("careful-coding") == 2
+    # Still deduplicated on a repeat of the same body.
+    assert new_id == arc_manager.get_or_create_model_policy(
+        policy_json=changed, name="careful-coding",
+    )
+    assert _preset_rows("careful-coding") == 2
