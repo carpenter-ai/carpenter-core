@@ -22,3 +22,6 @@ launch.sh
 
 # Claude Code worktrees live here; never commit one.
 .claude/worktrees/
+
+# macOS Finder metadata
+.DS_Store
